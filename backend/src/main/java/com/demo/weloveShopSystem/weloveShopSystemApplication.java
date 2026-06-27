@@ -1,4 +1,4 @@
-package com.demo.weloveShopAgt;
+package com.demo.weloveShopSystem;
 
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
@@ -9,7 +9,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 @SpringBootApplication
 @EnableAsync
 @EnableScheduling
-@MapperScan("com.demo.weloveShopAgt.mapper")
+@MapperScan("com.demo.weloveShopSystem.mapper")
 public class weloveShopSystemApplication {
 
     public static void main(String[] args) {
