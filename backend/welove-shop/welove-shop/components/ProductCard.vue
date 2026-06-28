@@ -1,21 +1,24 @@
-﻿<template>
+<template>
   <view class="product-card" @tap="$emit('click')">
     <view class="image-wrap">
-      <image v-if="product.imageUrl" class="image" :src="product.imageUrl" mode="aspectFill" />
+      <image v-if="imageUrl" class="image" :src="imageUrl" mode="aspectFill" />
       <view v-else class="image placeholder">
         <uni-icons type="image" size="28" color="#98a2b3" />
       </view>
       <view class="tag">精选</view>
+      <view class="favorite" :class="{ active: favorite }" @tap.stop="$emit('favorite', product)">
+        <uni-icons type="heart-filled" size="18" :color="favorite ? '#f97316' : '#ffffff'" />
+      </view>
     </view>
     <view class="content">
-      <text class="name">{{ product.title || '未命名商品' }}</text>
+      <text class="name">{{ title }}</text>
       <view class="meta-row">
-        <text class="brand">{{ product.brand || product.subCategory || '好物' }}</text>
-        <text class="rating">{{ product.rating || 0 }} 分</text>
+        <text class="brand">{{ product.brand || product.subCategory || product.categoryName || '好物' }}</text>
+        <text class="rating">{{ rating }} 分</text>
       </view>
       <view class="row">
-        <text class="price">¥{{ Number(product.basePrice || 0).toFixed(2) }}</text>
-        <text class="sales">{{ product.salesCount || 0 }} 人买过</text>
+        <text class="price">¥{{ price }}</text>
+        <text class="sales">{{ product.salesCount || product.sales || 0 }} 人买过</text>
       </view>
     </view>
   </view>
@@ -25,9 +28,24 @@
 export default {
   name: 'ProductCard',
   props: {
-    product: { type: Object, default: () => ({}) }
+    product: { type: Object, default: () => ({}) },
+    favorite: { type: Boolean, default: false }
   },
-  emits: ['click']
+  emits: ['click', 'favorite'],
+  computed: {
+    imageUrl() {
+      return this.product.imageUrl || this.product.productImage || this.product.cover || ''
+    },
+    title() {
+      return this.product.title || this.product.name || '未命名商品'
+    },
+    price() {
+      return Number(this.product.basePrice || this.product.price || 0).toFixed(2)
+    },
+    rating() {
+      return Number(this.product.rating || 0).toFixed(1)
+    }
+  }
 }
 </script>
 
@@ -62,6 +80,21 @@ export default {
   font-size: 20rpx;
   font-weight: 700;
 }
+.favorite {
+  position: absolute;
+  right: 14rpx;
+  top: 14rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 58rpx;
+  height: 58rpx;
+  border-radius: 50%;
+  background: rgba(15, 23, 42, 0.42);
+}
+.favorite.active {
+  background: rgba(255, 247, 237, 0.96);
+}
 .content {
   padding: 18rpx;
 }
@@ -84,9 +117,13 @@ export default {
 }
 .brand,
 .rating {
+  overflow: hidden;
   color: #667085;
   font-size: 22rpx;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+.brand { max-width: 180rpx; }
 .row {
   display: flex;
   align-items: flex-end;

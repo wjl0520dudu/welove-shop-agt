@@ -3,7 +3,8 @@
     {
       "path": "pages/product-list/product-list",
       "style": {
-        "navigationBarTitleText": "商品"
+        "navigationBarTitleText": "商品",
+        "enablePullDownRefresh": true
       }
     },
     {

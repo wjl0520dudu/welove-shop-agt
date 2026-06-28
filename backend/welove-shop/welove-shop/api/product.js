@@ -1,4 +1,4 @@
-﻿import request from '../utils/request'
+import request from '../utils/request'
 
 export function getProductList(params = {}) {
   return request({ url: '/api/product/list', method: 'GET', data: params })
@@ -18,11 +18,15 @@ export function getProductFaqs(id) {
 export function getProductImages(id) {
   return request({ url: `/api/product/${id}/images`, method: 'GET' })
 }
-export function searchProducts(keyword, limit = 20) {
-  return request({ url: '/api/product/search', method: 'GET', data: { keyword, limit } })
+export function searchProducts(keywordOrParams, limit = 20) {
+  const data = typeof keywordOrParams === 'object'
+    ? keywordOrParams
+    : { keyword: keywordOrParams, limit }
+  return request({ url: '/api/product/search', method: 'GET', data })
 }
-export function getHotProducts(limit = 10) {
-  return request({ url: '/api/product/hot', method: 'GET', data: { limit } })
+export function getHotProducts(params = 10) {
+  const data = typeof params === 'object' ? params : { limit: params }
+  return request({ url: '/api/product/hot', method: 'GET', data })
 }
 export function submitReview(productId, rating, content) {
   return request({ url: `/api/product/${productId}/reviews`, method: 'POST', data: { rating, content }, header: { 'content-type': 'application/x-www-form-urlencoded' } })
