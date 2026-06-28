@@ -7,7 +7,7 @@ spring:
     name: weloveShopAgt
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:shop_agent_db}?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:welove_shop_db}?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
     username: ${DB_USER:root}
     password: ${DB_PASSWORD:123456}
   http:
@@ -60,12 +60,12 @@ logging:
 
 # JWT 配置
 jwt:
-  secret: ${JWT_SECRET:shopagent-x-jwt-secret-key-must-be-at-least-32-characters-for-hs256-algorithm}
+  secret: ${JWT_SECRET:weloveShop-jwt-secret-key-must-be-at-least-32-characters-for-hs256-algorithm}
   expiration: ${JWT_EXPIRATION:3600000}
   refresh-expiration: ${JWT_REFRESH_EXPIRATION:86400000}
 
 upload:
-  dir: ${UPLOAD_DIR:E:/Python_qb/DEmo/ShopAgent-X/uploads}
+  dir: ${UPLOAD_DIR:E:/Python_qb/DEmo/weloveShop/uploads}
   temp-dir: ${UPLOAD_TEMP_DIR:D:/aiknowledge/temp}
 
 # 静态资源配置（已移至 WebConfig.java 中通过 addResourceHandlers 配置）
