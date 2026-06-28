@@ -94,6 +94,7 @@ import { getProductList, searchProducts } from '../../api/product'
 import { getCategories } from '../../api/category'
 import { addFavorite, removeFavorite, getFavoriteList } from '../../api/recommend'
 import { isLoggedIn } from '../../utils/auth'
+import { toLogin } from '../../utils/routeGuard'
 
 export default {
   components: { ProductCard, EmptyState },
@@ -200,14 +201,18 @@ export default {
     },
     normalizePage(data) {
       if (Array.isArray(data)) {
-        return { records: data, current: this.page, pages: this.page, total: data.length }
+        return {
+          records: data,
+          current: this.page,
+          pages: data.length >= this.size ? this.page + 1 : this.page,
+          total: data.length
+        }
       }
-      return {
-        records: data?.records || [],
-        current: Number(data?.current || this.page),
-        pages: Number(data?.pages || 1),
-        total: Number(data?.total || 0)
-      }
+      const records = data?.records || data?.list || data?.items || []
+      const current = Number(data?.current || data?.page || this.page)
+      const total = Number(data?.total || records.length || 0)
+      const pages = Number(data?.pages || data?.totalPages || (total ? Math.ceil(total / this.size) : current))
+      return { records, current, pages, total }
     },
     async loadProducts(reset = false) {
       if (this.loading || this.loadingMore) return
@@ -232,9 +237,10 @@ export default {
 
         const data = await getProductList(this.buildQueryParams())
         const pageData = this.normalizePage(data)
-        this.products = reset ? pageData.records : this.products.concat(pageData.records)
+        const records = pageData.records || []
+        this.products = reset ? records : this.products.concat(records)
         this.page = pageData.current + 1
-        this.hasMore = pageData.current < pageData.pages
+        this.hasMore = records.length > 0 && pageData.current < pageData.pages
       } catch (error) {
         uni.showToast({ title: '商品加载失败', icon: 'none' })
       } finally {
@@ -277,7 +283,7 @@ export default {
       const productId = product?.id
       if (!productId) return
       if (!isLoggedIn()) {
-        uni.navigateTo({ url: '/pages/login/login' })
+        toLogin('/pages/product-list/product-list')
         return
       }
 

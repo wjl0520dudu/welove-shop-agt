@@ -116,6 +116,7 @@ import { getProductDetail, getProductSkus, getProductReviews, getProductFaqs, ge
 import { addCart } from '../../api/cart'
 import { addFavorite, removeFavorite, getFavoriteList, recordBrowse } from '../../api/recommend'
 import { isLoggedIn } from '../../utils/auth'
+import { toLogin } from '../../utils/routeGuard'
 import cartStore from '../../store/cart'
 
 export default {
@@ -229,7 +230,7 @@ export default {
     },
     async toggleFavorite() {
       if (!isLoggedIn()) {
-        uni.navigateTo({ url: '/pages/login/login' })
+        toLogin(`/pages/product-detail/product-detail?id=${this.productId}`)
         return
       }
       const previous = this.isFavorite
@@ -259,7 +260,7 @@ export default {
     async runAction(sku) {
       if (this.pendingAction === 'select') return
       if (!isLoggedIn()) {
-        uni.navigateTo({ url: '/pages/login/login' })
+        toLogin(`/pages/product-detail/product-detail?id=${this.productId}`)
         return
       }
       if (this.pendingAction === 'cart') {

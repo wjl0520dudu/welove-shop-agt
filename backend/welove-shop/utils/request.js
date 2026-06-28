@@ -2,6 +2,7 @@ import { clearAuth, getRefreshToken, getToken, setRefreshToken, setStoredUser, s
 
 const BASE_URL = 'http://localhost:8888'
 let refreshingPromise = null
+let loginNavigating = false
 
 function normalizeUrl(url) {
   if (/^https?:\/\//.test(url)) return url
@@ -58,12 +59,24 @@ async function refreshAccessToken() {
   return false
 }
 
-function redirectToLogin() {
+function currentPagePath() {
   const pages = getCurrentPages()
-  const current = pages.length ? `/${pages[pages.length - 1].route}` : ''
-  const query = current ? `?redirect=${encodeURIComponent(current)}` : ''
+  return pages.length ? `/${pages[pages.length - 1].route}` : ''
+}
+
+function redirectToLogin() {
+  const current = currentPagePath()
+  if (current === '/pages/login/login' || current === '/pages/login-code/login-code') return
   clearAuth()
-  uni.navigateTo({ url: `/pages/login/login${query}` })
+  if (loginNavigating) return
+  loginNavigating = true
+  const query = current ? `?redirect=${encodeURIComponent(current)}` : ''
+  uni.navigateTo({
+    url: `/pages/login/login${query}`,
+    complete() {
+      setTimeout(() => { loginNavigating = false }, 300)
+    }
+  })
 }
 
 export async function request(options) {

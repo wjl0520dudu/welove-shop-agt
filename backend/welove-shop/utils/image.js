@@ -1,4 +1,5 @@
 const BASE_URL = 'http://localhost:8888'
+const FILE_NAME_PATTERN = /^[^/]+\.(png|jpe?g|webp|gif|bmp|svg)$/i
 
 function encodePath(url) {
   return url.split('/').map((segment) => {
@@ -11,13 +12,25 @@ function encodePath(url) {
   }).join('/')
 }
 
+function normalizeAbsoluteUrl(url) {
+  return url
+    .replace('localhost:8080', 'localhost:8888')
+    .replace('127.0.0.1:8080', '127.0.0.1:8888')
+}
+
 export function buildImageUrl(url) {
   if (!url) return ''
   const raw = String(url).trim()
   if (!raw) return ''
-  if (/^data:image\//.test(raw)) return raw
-  if (/^https?:\/\//.test(raw)) return encodePath(raw.replace('localhost:8080', 'localhost:8888'))
-  const path = raw.startsWith('/') ? raw : `/product-images/${raw}`
+  if (/^data:image\//.test(raw) || /^blob:/.test(raw)) return raw
+  if (/^https?:\/\//.test(raw)) return encodePath(normalizeAbsoluteUrl(raw))
+
+  const path = raw.startsWith('/')
+    ? raw
+    : FILE_NAME_PATTERN.test(raw)
+      ? `/product-images/${raw}`
+      : `/${raw}`
+
   return encodePath(`${BASE_URL}${path}`)
 }
 

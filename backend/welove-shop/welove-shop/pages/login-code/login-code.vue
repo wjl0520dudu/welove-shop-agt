@@ -110,8 +110,9 @@ export default {
     goAfterLogin() {
       const target = this.redirect || '/pages/product-list/product-list'
       const tabPages = ['/pages/chat/chat', '/pages/product-list/product-list', '/pages/cart/cart', '/pages/profile/profile']
-      if (tabPages.includes(target)) {
-        uni.switchTab({ url: target })
+      const targetPath = target.split('?')[0]
+      if (tabPages.includes(targetPath)) {
+        uni.switchTab({ url: targetPath })
       } else {
         uni.redirectTo({ url: target })
       }
