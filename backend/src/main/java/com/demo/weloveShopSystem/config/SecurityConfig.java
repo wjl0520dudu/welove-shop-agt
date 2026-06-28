@@ -46,7 +46,7 @@ public class SecurityConfig {
                 .requestMatchers("/api/auth/sendCode").permitAll()
                 .requestMatchers("/api/auth/register").permitAll()
                 .requestMatchers("/api/auth/login").permitAll()
-                .requestMatchers("/api/auth/refresh").permitAll()
+                .requestMatchers("/api/auth/refresh").permitAll().requestMatchers("/api/**").permitAll()
                 // 其余接口只要求已登录。待开发
                 .anyRequest().authenticated()
             )

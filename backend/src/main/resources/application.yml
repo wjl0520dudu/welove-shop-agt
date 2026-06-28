@@ -3,6 +3,8 @@ server:
   base-url: ${SERVER_BASE_URL:http://localhost:${SERVER_PORT:8888}}
 
 spring:
+  profiles:
+    active: dev
   application:
     name: weloveShopAgt
   datasource:
