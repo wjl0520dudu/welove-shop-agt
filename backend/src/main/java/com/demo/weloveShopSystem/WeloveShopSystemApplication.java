@@ -10,10 +10,10 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 @EnableAsync
 @EnableScheduling
 @MapperScan("com.demo.weloveShopSystem.mapper")
-public class weloveShopSystemApplication {
+public class WeloveShopSystemApplication {
 
     public static void main(String[] args) {
-        SpringApplication.run(weloveShopSystemApplication.class, args);
+        SpringApplication.run(WeloveShopSystemApplication.class, args);
     }
 
 }
