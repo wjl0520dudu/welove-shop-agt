@@ -50,11 +50,23 @@ export default {
     }
   },
   onShow() {
-    userStore.restore()
-    this.user = userStore.state.user
-    this.loggedIn = userStore.isLoggedIn()
+    this.refreshLocalUser()
+    if (this.loggedIn) this.loadProfile()
   },
   methods: {
+    refreshLocalUser() {
+      userStore.restore()
+      this.user = userStore.state.user
+      this.loggedIn = userStore.isLoggedIn()
+    },
+    async loadProfile() {
+      try {
+        await userStore.loadProfile()
+        this.refreshLocalUser()
+      } catch (error) {
+        this.refreshLocalUser()
+      }
+    },
     goLogin() { uni.navigateTo({ url: '/pages/login/login' }) },
     go(url) {
       if (!requireLogin(url)) return

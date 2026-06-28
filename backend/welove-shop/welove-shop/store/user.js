@@ -1,10 +1,23 @@
-﻿import { login as loginApi, getProfile } from '../api/auth'
+import { login as loginApi, getProfile } from '../api/auth'
 import { clearAuth, getRefreshToken, getStoredUser, getToken, setRefreshToken, setStoredUser, setToken } from '../utils/auth'
 
 const state = {
   token: '',
   refreshToken: '',
   user: null
+}
+
+function readToken(data = {}) {
+  return data.token || data.accessToken || ''
+}
+
+function applyAuth(data = {}) {
+  state.token = readToken(data)
+  state.refreshToken = data.refreshToken || ''
+  state.user = data.user || null
+  setToken(state.token)
+  setRefreshToken(state.refreshToken)
+  setStoredUser(state.user)
 }
 
 export default {
@@ -19,12 +32,7 @@ export default {
   },
   async login(payload) {
     const data = await loginApi(payload)
-    state.token = data.token
-    state.refreshToken = data.refreshToken
-    state.user = data.user || null
-    setToken(state.token)
-    setRefreshToken(state.refreshToken)
-    setStoredUser(state.user)
+    applyAuth(data)
     return data
   },
   async loadProfile() {

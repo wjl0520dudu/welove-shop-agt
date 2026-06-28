@@ -1,4 +1,4 @@
-import { clearAuth, getRefreshToken, getToken, setRefreshToken, setToken } from './auth'
+import { clearAuth, getRefreshToken, getToken, setRefreshToken, setStoredUser, setToken } from './auth'
 
 const BASE_URL = 'http://localhost:8888'
 let refreshingPromise = null
@@ -26,6 +26,10 @@ function toFormData(data = {}) {
     .join('&')
 }
 
+function readToken(data = {}) {
+  return data.token || data.accessToken || ''
+}
+
 async function refreshAccessToken() {
   const refreshToken = getRefreshToken()
   if (!refreshToken) return false
@@ -42,9 +46,13 @@ async function refreshAccessToken() {
 
   const response = await refreshingPromise
   const body = response.data
-  if (response.statusCode === 200 && body?.code === 200 && body.data?.token) {
-    setToken(body.data.token)
-    if (body.data.refreshToken) setRefreshToken(body.data.refreshToken)
+  const data = body?.data || {}
+  const token = readToken(data)
+
+  if (response.statusCode === 200 && body?.code === 200 && token) {
+    setToken(token)
+    if (data.refreshToken) setRefreshToken(data.refreshToken)
+    if (data.user) setStoredUser(data.user)
     return true
   }
   return false
@@ -81,19 +89,19 @@ export async function request(options) {
     const refreshed = await refreshAccessToken()
     if (refreshed) return request(options)
     redirectToLogin()
-    throw new Error('登录已过期，请重新登录')
+    throw new Error('Login expired, please sign in again')
   }
 
   const body = response.data
   if (response.statusCode < 200 || response.statusCode >= 300) {
-    const message = body?.message || `请求失败：${response.statusCode}`
+    const message = body?.message || `Request failed: ${response.statusCode}`
     uni.showToast({ title: message, icon: 'none' })
     throw new Error(message)
   }
 
   if (body && Object.prototype.hasOwnProperty.call(body, 'code')) {
     if (body.code === 200 || body.code === 0) return body.data
-    const message = body.message || '请求失败'
+    const message = body.message || 'Request failed'
     uni.showToast({ title: message, icon: 'none' })
     throw new Error(message)
   }

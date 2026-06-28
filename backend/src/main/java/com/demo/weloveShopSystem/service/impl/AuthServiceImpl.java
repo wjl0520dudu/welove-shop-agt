@@ -77,6 +77,36 @@ public class AuthServiceImpl implements AuthService {
         return generateTokenResponse(user);
     }
 
+    @Override
+    public User getUserById(Long userId) {
+        User user = userMapper.selectById(userId);
+        if (user == null) {
+            throw new BusinessException(ErrorCode.USER_NOT_FOUND);
+        }
+        return user;
+    }
+
+    @Override
+    public Map<String, Object> refreshToken(String token) {
+        if (token.startsWith("Bearer ")) {
+            token = token.substring(7);
+        }
+
+        try {
+            if (jwtUtil.validateToken(token)) {
+                String userIdStr = jwtUtil.getSubject(token);
+                Long userId = Long.parseLong(userIdStr);
+                User user = userMapper.selectById(userId);
+                if (user != null) {
+                    return generateTokenResponse(user);
+                }
+            }
+        } catch (Exception e) {
+            log.error("Token refresh failed: {}", e.getMessage());
+        }
+        throw new BusinessException(ErrorCode.INVALID_TOKEN);
+    }
+
     private User createUser(String phone) {
         User user = new User();
         user.setPhone(phone);
@@ -111,4 +141,5 @@ public class AuthServiceImpl implements AuthService {
         response.put("tokenType", "Bearer");
         return response;
     }
+
 }

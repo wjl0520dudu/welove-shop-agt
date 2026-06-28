@@ -1,5 +1,7 @@
 package com.demo.weloveShopSystem.service;
 
+import com.demo.weloveShopSystem.entity.User;
+
 import java.util.Map;
 
 /**
@@ -21,4 +23,10 @@ public interface AuthService {
      * @return 登录结果
      */
     Map<String, Object> login(String phone, String code);
+
+    /** 根据用户 ID 查询用户信息。 */
+    User getUserById(Long userId);
+
+    /** 根据刷新 token 换取新的访问 token。 */
+    Map<String, Object> refreshToken(String token);
 }
