@@ -77,7 +77,8 @@
     {
       "path": "pages/address-list/address-list",
       "style": {
-        "navigationBarTitleText": "地址管理"
+        "navigationBarTitleText": "地址管理",
+        "enablePullDownRefresh": true
       }
     },
     {

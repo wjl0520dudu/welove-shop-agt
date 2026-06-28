@@ -1,20 +1,21 @@
 <template>
-  <view class="page">
-    <view class="page-body">
-      <view class="section">
-        <text class="title">编辑地址</text>
-        <text class="subtitle">登录后可新增或编辑收货地址。</text>
-      </view>
-    </view>
+  <view class="page edit-page">
+    <scroll-view scroll-y class="form-scroll">
+      <view class="form-section"><text class="label">收货人</text><input class="field" v-model.trim="form.receiverName" placeholder="请输入收货人姓名" maxlength="30" /></view>
+      <view class="form-section"><text class="label">手机号</text><input class="field" v-model.trim="form.phone" placeholder="请输入手机号" type="number" maxlength="11" /></view>
+      <view class="region-row"><view class="region-item"><text class="label">省</text><input class="field compact" v-model.trim="form.province" placeholder="省" maxlength="20" /></view><view class="region-item"><text class="label">市</text><input class="field compact" v-model.trim="form.city" placeholder="市" maxlength="20" /></view><view class="region-item"><text class="label">区/县</text><input class="field compact" v-model.trim="form.district" placeholder="区/县" maxlength="20" /></view></view>
+      <view class="form-section"><text class="label">详细地址</text><textarea class="textarea" v-model.trim="form.detail" placeholder="请输入详细地址，如街道、门牌号" maxlength="120" /></view>
+      <view class="default-row"><view><text class="default-title">设为默认地址</text><text class="default-desc">结算时优先使用该地址</text></view><switch :checked="Boolean(form.isDefault)" color="#14b8a6" @change="onDefaultChange" /></view>
+      <button class="save-btn" :disabled="submitting" @tap="submit">{{ submitting ? '保存中...' : '保存' }}</button>
+    </scroll-view>
   </view>
 </template>
-
 <script>
+import { addAddress, getAddressList, updateAddress } from '../../api/address'
 import { requireLogin } from '../../utils/routeGuard'
-
-export default {
-  onLoad() {
-    requireLogin('/pages/address-edit/address-edit')
-  }
-}
+const emptyForm = () => ({ id: null, receiverName: '', phone: '', province: '', city: '', district: '', detail: '', isDefault: 0 })
+export default { data() { return { editId: null, form: emptyForm(), submitting: false } }, onLoad(options = {}) { if (!requireLogin('/pages/address-edit/address-edit')) return; this.editId = options.id ? Number(options.id) : null; if (this.editId) { uni.setNavigationBarTitle({ title: '编辑地址' }); this.loadForEdit() } else { uni.setNavigationBarTitle({ title: '新增地址' }) } }, methods: { async loadForEdit() { try { const list = await getAddressList(); const item = Array.isArray(list) ? list.find(address => Number(address.id) === this.editId) : null; if (!item) { uni.showToast({ title: '地址不存在', icon: 'none' }); setTimeout(() => uni.navigateBack(), 500); return } this.form = { id: item.id, receiverName: item.receiverName || '', phone: item.phone || '', province: item.province || '', city: item.city || '', district: item.district || '', detail: item.detail || '', isDefault: item.isDefault === 1 || item.isDefault === true ? 1 : 0 } } catch (error) { uni.showToast({ title: '地址加载失败', icon: 'none' }) } }, onDefaultChange(event) { this.form.isDefault = event.detail.value ? 1 : 0 }, validate() { if (!this.form.receiverName) return '请输入收货人姓名'; if (!/^1\d{10}$/.test(this.form.phone)) return '请输入正确手机号'; if (!this.form.province || !this.form.city || !this.form.district) return '请填写省市区'; if (!this.form.detail) return '请输入详细地址'; return '' }, async submit() { const message = this.validate(); if (message) { uni.showToast({ title: message, icon: 'none' }); return } this.submitting = true; try { const payload = { ...this.form }; if (this.editId) await updateAddress(payload); else await addAddress(payload); uni.showToast({ title: '已保存', icon: 'none' }); setTimeout(() => uni.navigateBack(), 350) } catch (error) { uni.showToast({ title: '保存失败', icon: 'none' }) } finally { this.submitting = false } } } }
 </script>
+<style scoped>
+.edit-page{min-height:100vh;padding:20rpx 22rpx 40rpx}.form-scroll{height:calc(100vh - 40rpx)}.form-section,.default-row,.region-item{border-radius:22rpx;background:#fff;box-shadow:0 10rpx 28rpx rgba(15,118,110,.05)}.form-section{margin-bottom:18rpx;padding:22rpx 24rpx}.label{display:block;margin-bottom:12rpx;color:#344054;font-size:25rpx;font-weight:800}.field,.textarea{width:100%;color:#1f2937;font-size:29rpx}.field{height:58rpx}.field.compact{height:52rpx;font-size:27rpx}.textarea{min-height:128rpx;line-height:1.45}.region-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14rpx;margin-bottom:18rpx}.region-item{min-width:0;padding:20rpx 18rpx}.default-row{display:flex;align-items:center;justify-content:space-between;gap:20rpx;margin-bottom:34rpx;padding:24rpx}.default-title,.default-desc{display:block}.default-title{color:#1f2937;font-size:29rpx;font-weight:900}.default-desc{margin-top:6rpx;color:#667085;font-size:24rpx}.save-btn{height:86rpx;border-radius:22rpx;background:#14b8a6;color:#fff;font-size:31rpx;font-weight:900;line-height:86rpx;box-shadow:0 12rpx 28rpx rgba(20,184,166,.22)}.save-btn[disabled]{background:#98a2b3;color:#fff}
+</style>
