@@ -12,7 +12,8 @@ export default {
     return state.count
   },
   async loadCart() {
-    state.items = await getCartList()
+    const data = await getCartList()
+    state.items = Array.isArray(data) ? data : (data?.records || data?.items || data?.list || [])
     state.count = state.items.reduce((sum, item) => sum + Number(item.quantity || 0), 0)
     return state.items
   },

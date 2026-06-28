@@ -32,7 +32,7 @@
               </view>
 
               <view class="thumb" @tap="goProduct(item)">
-                <image v-if="item.productImage || item.imageUrl" :src="item.productImage || item.imageUrl" mode="aspectFill" />
+                <image v-if="itemImage(item)" :src="itemImage(item)" mode="aspectFill" />
                 <uni-icons v-else type="image" size="26" color="#98a2b3" />
               </view>
 
@@ -86,13 +86,15 @@
 <script>
 import EmptyState from '../../components/EmptyState.vue'
 import cartStore from '../../store/cart'
+import { removeCart, removeCartById, updateQuantity } from '../../api/cart'
 import { requireLoginFromProtectedTab } from '../../utils/routeGuard'
 
 export default {
   components: { EmptyState },
   data() {
     return {
-      items: this.createMockItems(),
+      items: [],
+      loading: false,
       selectedMap: {},
       manageMode: false,
       swipeOptions: [
@@ -111,44 +113,38 @@ export default {
   },
   onShow() {
     if (!requireLoginFromProtectedTab('/pages/cart/cart')) return
-    if (!this.items.length) this.items = this.createMockItems()
-    this.initSelection()
+    this.loadCartItems()
+  },
+  onPullDownRefresh() {
+    this.loadCartItems().finally(() => uni.stopPullDownRefresh())
   },
   methods: {
-    createMockItems() {
-      return [
-        {
-          id: 'mock-1',
-          productId: 1,
-          productTitle: 'Vidda 海信电视 65 英寸 R65 144Hz 高刷 4K 护眼电视',
-          skuText: '65英寸 / 推荐观距2米 / 官方标配',
-          price: 1869.15,
-          quantity: 1,
-          imageUrl: ''
-        },
-        {
-          id: 'mock-2',
-          productId: 2,
-          productTitle: '百草园搬家打包袋 行李袋编织袋 大容量收纳袋',
-          skuText: '蓝色 / 2个装 / 加厚款',
-          price: 24.90,
-          quantity: 2,
-          imageUrl: ''
-        },
-        {
-          id: 'mock-3',
-          productId: 3,
-          productTitle: 'BIAZE 毕亚兹 Type-C 数据线 快充耐用编织线',
-          skuText: '1.5米 / 灰色 / 单条装',
-          price: 19.90,
-          quantity: 1,
-          imageUrl: ''
-        }
-      ]
+    async loadCartItems() {
+      this.loading = true
+      try {
+        const list = await cartStore.loadCart()
+        this.items = Array.isArray(list) ? list : []
+        this.initSelection()
+      } catch (error) {
+        this.items = []
+        this.selectedMap = {}
+        uni.showToast({ title: '购物车加载失败', icon: 'none' })
+      } finally {
+        this.loading = false
+      }
     },
-    itemKey(item) { return item.id || `${item.productId || item.product?.id || 'p'}-${item.skuId || 'default'}` },
-    itemPrice(item) { return Number(item.price || item.productPrice || item.basePrice || item.product?.basePrice || 0) },
-    itemProductId(item) { return item.productId || item.product?.id || item.id },
+    itemKey(item) { return item.cartItemId || item.cartId || item.id || `${item.productId || item.product?.id || 'p'}-${item.skuId || 'default'}` },
+    itemPrice(item) { return Number(item.price || item.productPrice || item.skuPrice || item.basePrice || item.product?.basePrice || item.product?.price || 0) },
+    itemTitle(item) { return item.productTitle || item.title || item.productName || item.product?.title || item.product?.name || '购物车商品' },
+    itemImage(item) { return item.productImage || item.imageUrl || item.product?.imageUrl || item.product?.productImage || '' },
+    itemSkuText(item) {
+      const value = item.skuProperties || item.skuText || item.skuName || item.sku?.properties
+      if (!value) return '默认规格'
+      if (typeof value === 'string') return value
+      return Object.keys(value).map((key) => `${key}: ${value[key]}`).join('  ') || '默认规格'
+    },
+    itemProductId(item) { return item.productId || item.product?.id || item.product?.productId },
+    itemCartId(item) { return item.cartItemId || item.cartId || item.id },
     initSelection() {
       const next = {}
       this.items.forEach((item) => {
@@ -173,31 +169,58 @@ export default {
     toggleManage() {
       this.manageMode = !this.manageMode
     },
-    removeLocal(item) {
-      const key = this.itemKey(item)
-      this.items = this.items.filter((entry) => this.itemKey(entry) !== key)
-      const next = { ...this.selectedMap }
-      delete next[key]
-      this.selectedMap = next
-      cartStore.state.items = this.items
-      uni.showToast({ title: '已删除', icon: 'none' })
+    async removeRemote(item) {
+      try {
+        const cartItemId = this.itemCartId(item)
+        if (cartItemId) await removeCartById(cartItemId)
+        else await removeCart(this.itemProductId(item), Number(item.quantity || 1))
+        await this.loadCartItems()
+        uni.showToast({ title: '已删除', icon: 'none' })
+      } catch (error) {
+        uni.showToast({ title: '删除失败', icon: 'none' })
+      }
     },
     onSwipeClick(event, item) {
-      this.removeLocal(item)
+      this.removeRemote(item)
     },
-    deleteSelected() {
+    async deleteSelected() {
       if (!this.selectedCount) {
         uni.showToast({ title: '请选择要删除的商品', icon: 'none' })
         return
       }
-      const selectedKeys = this.items.filter((item) => this.isSelected(item)).map((item) => this.itemKey(item))
-      this.items = this.items.filter((item) => !selectedKeys.includes(this.itemKey(item)))
-      this.selectedMap = {}
-      cartStore.state.items = this.items
-      uni.showToast({ title: '已删除选中商品', icon: 'none' })
+      const selected = this.items.filter((item) => this.isSelected(item))
+      try {
+        await Promise.all(selected.map((item) => {
+          const cartItemId = this.itemCartId(item)
+          return cartItemId ? removeCartById(cartItemId) : removeCart(this.itemProductId(item), Number(item.quantity || 1))
+        }))
+        this.selectedMap = {}
+        await this.loadCartItems()
+        uni.showToast({ title: '已删除选中商品', icon: 'none' })
+      } catch (error) {
+        uni.showToast({ title: '删除失败', icon: 'none' })
+      }
     },
-    minus(item) { uni.showToast({ title: '数量修改后续接入', icon: 'none' }) },
-    plus(item) { uni.showToast({ title: '数量修改后续接入', icon: 'none' }) },
+    async minus(item) {
+      const quantity = Number(item.quantity || 1)
+      if (quantity <= 1) {
+        await this.removeRemote(item)
+        return
+      }
+      await this.changeQuantity(item, quantity - 1)
+    },
+    async plus(item) {
+      const quantity = Number(item.quantity || 1)
+      await this.changeQuantity(item, quantity + 1)
+    },
+    async changeQuantity(item, quantity) {
+      try {
+        await updateQuantity(this.itemProductId(item), quantity)
+        await this.loadCartItems()
+      } catch (error) {
+        uni.showToast({ title: '数量修改失败', icon: 'none' })
+      }
+    },
     goProduct(item) {
       const id = this.itemProductId(item)
       if (id) uni.navigateTo({ url: `/pages/product-detail/product-detail?id=${id}` })

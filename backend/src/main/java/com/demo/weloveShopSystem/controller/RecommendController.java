@@ -2,7 +2,9 @@ package com.demo.weloveShopSystem.controller;
 
 
 import com.demo.weloveShopSystem.common.Result;
+import com.demo.weloveShopSystem.entity.UserBrowseHistory;
 import com.demo.weloveShopSystem.entity.UserFavorite;
+import com.demo.weloveShopSystem.service.UserBrowseHistoryService;
 import com.demo.weloveShopSystem.service.UserFavoriteService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -19,12 +21,34 @@ import java.util.List;
 public class RecommendController {
 
     private final UserFavoriteService userFavoriteService;
+    private final UserBrowseHistoryService userBrowseHistoryService;
 
     /** 从 Spring Security 上下文获取当前登录用户 ID。 */
     private Long getCurrentUserId() {
         return Long.parseLong(SecurityContextHolder.getContext().getAuthentication().getName());
     }
 
+    /** 记录商品浏览行为。 */
+    @PostMapping("/browse")
+    public Result<Void> recordBrowse(@RequestBody UserBrowseHistory history) {
+        history.setUserId(getCurrentUserId());
+        userBrowseHistoryService.saveOrUpdate(history);
+        return Result.success(null);
+    }
+
+    /** 添加商品收藏。 */
+    @PostMapping("/favorite/add")
+    public Result<Void> addFavorite(@RequestParam Long productId) {
+        userFavoriteService.addFavorite(getCurrentUserId(), productId);
+        return Result.success(null);
+    }
+
+    /** 取消商品收藏。 */
+    @PostMapping("/favorite/remove")
+    public Result<Void> removeFavorite(@RequestParam Long productId) {
+        userFavoriteService.removeFavorite(getCurrentUserId(), productId);
+        return Result.success(null);
+    }
 
     /** 查询当前用户收藏列表。 */
     @GetMapping("/favorite/list")

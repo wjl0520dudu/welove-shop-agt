@@ -28,6 +28,9 @@ export function getHotProducts(params = 10) {
   const data = typeof params === 'object' ? params : { limit: params }
   return request({ url: '/api/product/hot', method: 'GET', data })
 }
-export function submitReview(productId, rating, content) {
-  return request({ url: `/api/product/${productId}/reviews`, method: 'POST', data: { rating, content }, header: { 'content-type': 'application/x-www-form-urlencoded' } })
+export function submitReview(productId, dataOrRating, content) {
+  const data = typeof dataOrRating === 'object'
+    ? dataOrRating
+    : { rating: dataOrRating, content }
+  return request({ url: `/api/product/${productId}/reviews`, method: 'POST', data, header: { 'content-type': 'application/x-www-form-urlencoded' } })
 }

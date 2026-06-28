@@ -2,10 +2,9 @@ package com.demo.weloveShopSystem.controller;
 
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.demo.weloveShopSystem.common.Result;
-import com.demo.weloveShopSystem.entity.Product;
-import com.demo.weloveShopSystem.service.ProductService;
+import com.demo.weloveShopSystem.entity.*;
+import com.demo.weloveShopSystem.service.*;
 import lombok.RequiredArgsConstructor;
-import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -21,6 +20,10 @@ import java.util.Map;
 public class ProductController {
 
     private final ProductService productService;
+    private final ProductSkuService productSkuService;
+    private final ProductImageService productImageService;
+    private final ProductReviewService productReviewService;
+    private final ProductFaqService productFaqService;
 
     /** 分页查询商品列表，可按分类和排序字段筛选。 */
     @GetMapping("/list")
@@ -46,5 +49,48 @@ public class ProductController {
     @GetMapping("/hot")
     public Result<List<Product>> hot(@RequestParam(defaultValue = "10") int limit) {
         return Result.success(productService.getHotProducts(limit));
+    }
+
+    /** 查询商品详情，包含 SKU、图片、评价和 FAQ。 */
+    @GetMapping("/{id}")
+    public Result<Map<String, Object>> detail(@PathVariable Long id) {
+        Product product = productService.getById(id);
+        if (product == null) {
+            return Result.error("商品不存在");
+        }
+
+        Map<String, Object> detail = new HashMap<>();
+        detail.put("product", product);
+        detail.put("skus", productSkuService.listByProductId(id));
+        detail.put("images", productImageService.listByProductId(id));
+        detail.put("reviews", productReviewService.listByProductId(id, 10));
+        detail.put("faqs", productFaqService.listByProductId(id));
+        return Result.success(detail);
+    }
+
+    /** 查询商品 SKU 列表。 */
+    @GetMapping("/{id}/skus")
+    public Result<List<ProductSku>> skus(@PathVariable Long id) {
+        return Result.success(productSkuService.listByProductId(id));
+    }
+
+    /** 查询商品评价列表。 */
+    @GetMapping("/{id}/reviews")
+    public Result<List<ProductReview>> reviews(
+            @PathVariable Long id,
+            @RequestParam(defaultValue = "10") int limit) {
+        return Result.success(productReviewService.listByProductId(id, limit));
+    }
+
+    /** 查询商品常见问答。 */
+    @GetMapping("/{id}/faqs")
+    public Result<List<ProductFaq>> faqs(@PathVariable Long id) {
+        return Result.success(productFaqService.listByProductId(id));
+    }
+
+    /** 查询商品图片列表。 */
+    @GetMapping("/{id}/images")
+    public Result<List<ProductImage>> images(@PathVariable Long id) {
+        return Result.success(productImageService.listByProductId(id));
     }
 }
