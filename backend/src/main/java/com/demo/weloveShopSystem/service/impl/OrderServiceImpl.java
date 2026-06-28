@@ -208,7 +208,7 @@ public class OrderServiceImpl implements OrderService {
         if (order == null || !order.getUserId().equals(userId)) {
             throw new RuntimeException("订单不存在");
         }
-        if (order.getStatus() != 2) {
+        if (order.getStatus() != 1 && order.getStatus() != 2) {
             throw new RuntimeException("订单状态不允许确认收货");
         }
         order.setStatus(3); // 已完成

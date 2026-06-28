@@ -10,7 +10,7 @@
       <view class="section-card"><text class="section-title">订单信息</text><view class="info-row"><text>订单号</text><text>{{ order.orderNo || order.id }}</text></view><view class="info-row"><text>创建时间</text><text>{{ dateText(order.createTime) }}</text></view><view v-if="order.payTime" class="info-row"><text>支付时间</text><text>{{ dateText(order.payTime) }}</text></view><view v-if="order.deliveryTime" class="info-row"><text>发货时间</text><text>{{ dateText(order.deliveryTime) }}</text></view><view v-if="order.receiveTime" class="info-row"><text>收货时间</text><text>{{ dateText(order.receiveTime) }}</text></view><view v-if="order.remark" class="info-row"><text>备注</text><text>{{ order.remark }}</text></view></view>
       <view class="bottom-spacer"></view>
     </scroll-view>
-    <view v-if="order" class="action-bar"><button v-if="order.status === 0" class="outline-btn" @tap="confirmCancel">取消订单</button><button v-if="order.status === 0" class="primary-btn" @tap="pay">立即支付</button><button v-if="order.status === 2" class="primary-btn" @tap="confirmReceive">确认收货</button><button v-if="order.status === 3 || order.status === 4" class="danger-btn" @tap="confirmDelete">删除订单</button></view>
+    <view v-if="order" class="action-bar"><button v-if="order.status === 0" class="outline-btn" @tap="confirmCancel">取消订单</button><button v-if="order.status === 0" class="primary-btn" @tap="pay">立即支付</button><button v-if="order.status === 1 || order.status === 2" class="primary-btn" @tap="confirmReceive">确认收货</button><button v-if="order.status === 3 || order.status === 4" class="danger-btn" @tap="confirmDelete">删除订单</button></view>
   </view>
 </template>
 <script>

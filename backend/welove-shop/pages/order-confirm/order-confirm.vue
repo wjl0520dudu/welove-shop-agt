@@ -51,7 +51,7 @@
       </view>
 
       <view class="remark-card">
-        <text class="section-title">商品信息</text>
+        <text class="section-title">订单备注</text>
         <textarea class="remark" v-model.trim="remark" placeholder="选填，有什么要交代的" maxlength="120" />
       </view>
 
@@ -77,7 +77,7 @@
 
 <script>
 import { getAddressList } from '../../api/address'
-import { getCartList } from '../../api/cart'
+import { getCartList, removeCartById } from '../../api/cart'
 import { createOrder } from '../../api/order'
 import { getProductDetail, getProductSkus } from '../../api/product'
 import { formatMoney } from '../../utils/format'
@@ -235,6 +235,10 @@ export default {
       if (!this.checkoutItems.length) return '请选择要购买的商品'
       return ''
     },
+    async cleanupCheckedCartItems() {
+      if (this.source !== 'cart' || !this.cartItemIds.length) return
+      await Promise.allSettled(this.cartItemIds.map(id => removeCartById(id)))
+    },
     async submit() {
       const message = this.validate()
       if (message) {
@@ -251,6 +255,7 @@ export default {
           receiverPhone: this.receiverPhone
         })
         uni.showToast({ title: '订单已创建', icon: 'none' })
+        await this.cleanupCheckedCartItems()
         cartStore.refreshCount().catch(() => {})
         const orderId = order?.id || order?.orderId
         setTimeout(() => {
