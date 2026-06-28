@@ -35,4 +35,63 @@ public class OrderController {
         }
     }
 
+    /** 分页查询当前用户订单列表。 */
+    @GetMapping("/list")
+    public Result<IPage<OrderVO>> listOrders(
+            @RequestParam(required = false) Integer status,
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "10") int size) {
+        return Result.success(orderService.listOrders(getCurrentUserId(), status, page, size));
+    }
+
+    /** 查询当前用户订单详情。 */
+    @GetMapping("/{id}")
+    public Result<OrderVO> getOrderDetail(@PathVariable Long id) {
+        try {
+            return Result.success(orderService.getOrderDetail(getCurrentUserId(), id));
+        } catch (RuntimeException e) {
+            return Result.error(e.getMessage());
+        }
+    }
+
+    /** 支付订单。 */
+    @PutMapping("/{id}/pay")
+    public Result<OrderVO> payOrder(@PathVariable Long id) {
+        try {
+            return Result.success(orderService.payOrder(getCurrentUserId(), id));
+        } catch (RuntimeException e) {
+            return Result.error(e.getMessage());
+        }
+    }
+
+    /** 取消订单。 */
+    @PutMapping("/{id}/cancel")
+    public Result<OrderVO> cancelOrder(@PathVariable Long id) {
+        try {
+            return Result.success(orderService.cancelOrder(getCurrentUserId(), id));
+        } catch (RuntimeException e) {
+            return Result.error(e.getMessage());
+        }
+    }
+
+    /** 确认收货。 */
+    @PutMapping("/{id}/receive")
+    public Result<OrderVO> confirmReceive(@PathVariable Long id) {
+        try {
+            return Result.success(orderService.confirmReceive(getCurrentUserId(), id));
+        } catch (RuntimeException e) {
+            return Result.error(e.getMessage());
+        }
+    }
+
+    /** 删除订单。 */
+    @DeleteMapping("/{id}")
+    public Result<String> deleteOrder(@PathVariable Long id) {
+        try {
+            orderService.deleteOrder(getCurrentUserId(), id);
+            return Result.success("订单已删除");
+        } catch (RuntimeException e) {
+            return Result.error(e.getMessage());
+        }
+    }
 }
