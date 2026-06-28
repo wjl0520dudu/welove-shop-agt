@@ -11,9 +11,9 @@
 
     <view v-else-if="product" class="detail">
       <view class="image-section">
-        <swiper v-if="displayImages.length" class="swiper" circular :indicator-dots="displayImages.length > 1" indicator-color="rgba(255,255,255,0.55)" indicator-active-color="#14b8a6">
-          <swiper-item v-for="(item, index) in displayImages" :key="index">
-            <image class="hero" :src="item" mode="aspectFit" />
+        <swiper v-if="visibleImages.length" class="swiper" circular :indicator-dots="visibleImages.length > 1" indicator-color="rgba(255,255,255,0.55)" indicator-active-color="#14b8a6">
+          <swiper-item v-for="(item, index) in visibleImages" :key="index">
+            <image class="hero" :src="item" mode="aspectFit" @error="markImageFailed(item)" />
           </swiper-item>
         </swiper>
         <view v-else class="hero placeholder">
@@ -110,6 +110,8 @@
 <script>
 import EmptyState from '../../components/EmptyState.vue'
 import ProductSkuSheet from '../../components/ProductSkuSheet.vue'
+import { formatMoney } from '../../utils/format'
+import { buildImageUrl, pickProductImage } from '../../utils/image'
 import { getProductDetail, getProductSkus, getProductReviews, getProductFaqs, getProductImages } from '../../api/product'
 import { addCart } from '../../api/cart'
 import { addFavorite, removeFavorite, getFavoriteList, recordBrowse } from '../../api/recommend'
@@ -132,6 +134,7 @@ export default {
       pendingAction: 'select',
       loading: false,
       error: '',
+      imageErrorMap: {},
       loadText: {
         contentdown: '加载更多',
         contentrefresh: '正在加载...',
@@ -141,12 +144,15 @@ export default {
   },
   computed: {
     displayImages() {
-      const list = this.images.map(item => item.imageUrl || item.url).filter(Boolean)
-      const main = this.product?.imageUrl || this.product?.productImage || ''
+      const list = this.images.map(item => buildImageUrl(item.imageUrl || item.url)).filter(Boolean)
+      const main = buildImageUrl(pickProductImage(this.product || {}))
       return Array.from(new Set([main, ...list].filter(Boolean)))
     },
+    visibleImages() {
+      return this.displayImages.filter(item => !this.imageErrorMap[item])
+    },
     currentPrice() {
-      return Number(this.selectedSku?.price || this.product?.basePrice || this.product?.price || 0).toFixed(2)
+      return formatMoney(this.selectedSku?.price || this.product?.basePrice || this.product?.price || 0)
     },
     rating() {
       return Number(this.product?.rating || 0).toFixed(1)
@@ -231,6 +237,7 @@ export default {
       try {
         if (previous) await removeFavorite(this.productId)
         else await addFavorite(this.productId)
+        await this.loadFavoriteState()
       } catch (error) {
         this.isFavorite = previous
         uni.showToast({ title: '收藏操作失败', icon: 'none' })
@@ -273,6 +280,9 @@ export default {
     goBuyNow(sku) {
       const skuParam = sku?.id ? `&skuId=${sku.id}` : ''
       uni.navigateTo({ url: `/pages/order-confirm/order-confirm?productId=${this.productId}${skuParam}` })
+    },
+    markImageFailed(url) {
+      this.imageErrorMap = { ...this.imageErrorMap, [url]: true }
     },
     formatSku(sku) {
       const properties = sku?.properties || {}

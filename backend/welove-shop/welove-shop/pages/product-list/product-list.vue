@@ -55,6 +55,11 @@
       <uni-load-more status="loading" :contentText="loadText" />
     </view>
 
+    <view v-else-if="errorMessage && !products.length" class="state-wrap">
+      <EmptyState title="商品加载失败" :description="errorMessage" />
+      <button class="retry" @tap="refresh">重新加载</button>
+    </view>
+
     <view v-else-if="products.length" class="grid">
       <ProductCard
         v-for="item in products"
@@ -106,6 +111,7 @@ export default {
       hasMore: true,
       loading: false,
       loadingMore: false,
+      errorMessage: '',
       showBackTop: false,
       sortOptions: [
         { key: 'sales', label: '销量' },
@@ -215,6 +221,7 @@ export default {
       }
 
       try {
+        this.errorMessage = ''
         const word = this.keyword.trim()
         if (word) {
           const data = await searchProducts({ keyword: word, limit: this.size })
@@ -236,6 +243,7 @@ export default {
       }
     },
     async refresh() {
+      this.errorMessage = ''
       await this.loadCategories()
       await this.loadFavoriteList()
       await this.loadProducts(true)
@@ -280,6 +288,7 @@ export default {
       try {
         if (wasFavorite) await removeFavorite(productId)
         else await addFavorite(productId)
+        await this.loadFavoriteList()
       } catch (error) {
         this.favoriteMap = { ...this.favoriteMap, [productId]: wasFavorite }
         if (!wasFavorite) delete this.favoriteMap[productId]
@@ -386,6 +395,15 @@ export default {
 .state-wrap,
 .load-more {
   padding: 30rpx 0;
+}
+.retry {
+  width: 240rpx;
+  height: 72rpx;
+  margin: 12rpx auto 0;
+  border-radius: 999rpx;
+  background: #14b8a6;
+  color: #ffffff;
+  font-size: 27rpx;
 }
 .back-top {
   position: fixed;

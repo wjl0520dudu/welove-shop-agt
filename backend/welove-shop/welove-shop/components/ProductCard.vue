@@ -1,7 +1,7 @@
 <template>
   <view class="product-card" @tap="$emit('click')">
     <view class="image-wrap">
-      <image v-if="imageUrl" class="image" :src="imageUrl" mode="aspectFill" />
+      <image v-if="imageUrl && !imageFailed" class="image" :src="imageUrl" mode="aspectFill" @error="imageFailed = true" />
       <view v-else class="image placeholder">
         <uni-icons type="image" size="28" color="#98a2b3" />
       </view>
@@ -25,6 +25,9 @@
 </template>
 
 <script>
+import { formatMoney } from '../utils/format'
+import { buildImageUrl, pickProductImage } from '../utils/image'
+
 export default {
   name: 'ProductCard',
   props: {
@@ -32,15 +35,21 @@ export default {
     favorite: { type: Boolean, default: false }
   },
   emits: ['click', 'favorite'],
+  data() {
+    return { imageFailed: false }
+  },
+  watch: {
+    product() { this.imageFailed = false }
+  },
   computed: {
     imageUrl() {
-      return this.product.imageUrl || this.product.productImage || this.product.cover || ''
+      return buildImageUrl(pickProductImage(this.product))
     },
     title() {
       return this.product.title || this.product.name || '未命名商品'
     },
     price() {
-      return Number(this.product.basePrice || this.product.price || 0).toFixed(2)
+      return formatMoney(this.product.basePrice || this.product.price || 0)
     },
     rating() {
       return Number(this.product.rating || 0).toFixed(1)
