@@ -1,0 +1,9 @@
+.idea
+/backend/.idea/
+/backend/android/
+/backend/nginx-1.18.0/
+/backend/target/
+/backend/db/
+/backend/docs/
+/backend/src/main/resources/application-dev.yml
+/backend/src/main/java/com/demo/weloveShopSystem/controller/TestController.java
