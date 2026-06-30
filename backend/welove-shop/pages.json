@@ -91,13 +91,15 @@
     {
       "path": "pages/favorite/favorite",
       "style": {
-        "navigationBarTitleText": "我的收藏"
+        "navigationBarTitleText": "我的收藏",
+        "enablePullDownRefresh": true
       }
     },
     {
       "path": "pages/browse-history/browse-history",
       "style": {
-        "navigationBarTitleText": "浏览历史"
+        "navigationBarTitleText": "浏览历史",
+        "enablePullDownRefresh": true
       }
     },
     {

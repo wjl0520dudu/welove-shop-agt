@@ -4,6 +4,7 @@ package com.demo.weloveShopSystem.controller;
 import com.demo.weloveShopSystem.common.Result;
 import com.demo.weloveShopSystem.entity.UserBrowseHistory;
 import com.demo.weloveShopSystem.entity.UserFavorite;
+import com.demo.weloveShopSystem.service.RecommendationLogService;
 import com.demo.weloveShopSystem.service.UserBrowseHistoryService;
 import com.demo.weloveShopSystem.service.UserFavoriteService;
 import lombok.RequiredArgsConstructor;
@@ -22,6 +23,7 @@ public class RecommendController {
 
     private final UserFavoriteService userFavoriteService;
     private final UserBrowseHistoryService userBrowseHistoryService;
+    private final RecommendationLogService recommendationLogService;
 
     /** 从 Spring Security 上下文获取当前登录用户 ID。 */
     private Long getCurrentUserId() {
@@ -56,4 +58,24 @@ public class RecommendController {
         return Result.success(userFavoriteService.listByUserId(getCurrentUserId()));
     }
 
+    /** 提交推荐反馈。 */
+    @PostMapping("/feedback")
+    public Result<Void> feedback(@RequestParam Long id, @RequestParam Integer feedback) {
+        recommendationLogService.updateFeedback(id, feedback);
+        return Result.success(null);
+    }
+
+
+    /** 查询当前用户浏览历史。 */
+    @GetMapping("/browse/history")
+    public Result<List<UserBrowseHistory>> browseHistory() {
+        return Result.success(userBrowseHistoryService.listByUserId(getCurrentUserId()));
+    }
+
+    /** 删除当前用户的某条浏览历史。 */
+    @DeleteMapping("/browse/history/{id}")
+    public Result<String> deleteHistory(@PathVariable Long id) {
+        userBrowseHistoryService.deleteHistory(getCurrentUserId(), id);
+        return Result.success("已删除");
+    }
 }
