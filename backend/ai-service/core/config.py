@@ -1,8 +1,10 @@
 import os
 import logging
 from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(ENV_FILE, override=True)
 
 class Config:
     # 加载环境变量
@@ -21,6 +23,14 @@ class Config:
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
     MILVUS_URL = os.getenv("MILVUS_URL", "http://127.0.0.1:19530")
     MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "my_rag_collection")
+
+    # 4.MySQL 配置，用于导购推荐查询真实商品数据
+    DB_HOST = os.getenv("DB_HOST", "localhost")
+    DB_PORT = int(os.getenv("DB_PORT", "3306"))
+    DB_NAME = os.getenv("DB_NAME", "welove_shop_db")
+    DB_USER = os.getenv("DB_USER", "root")
+    DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+    DB_CHARSET = os.getenv("DB_CHARSET", "utf8mb4")
 
 config = Config()
 logger = logging.getLogger("ai-service")

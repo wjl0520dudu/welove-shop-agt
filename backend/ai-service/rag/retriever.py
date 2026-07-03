@@ -53,7 +53,7 @@ class Retriever:
         else:
             results = self.vector_store.search(request)
 
-        # TODO: 后续加 rerank、score normalization、business score。
+        results = sorted(results, key=lambda item: item.score or 0, reverse=True)
 
         return RetrievalOutput(
             plan=plan,
