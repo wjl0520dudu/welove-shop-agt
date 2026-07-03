@@ -48,7 +48,10 @@ class Retriever:
             filter=metadata_filter,
             search_mode=plan.search_mode,
         )
-        results = self.vector_store.hybrid_search(request)
+        if plan.search_mode == "hybrid" and hasattr(self.vector_store, "hybrid_search"):
+            results = self.vector_store.hybrid_search(request)
+        else:
+            results = self.vector_store.search(request)
 
         # TODO: 后续加 rerank、score normalization、business score。
 
@@ -60,4 +63,4 @@ class Retriever:
         )
 
 
-# retriever = Retriever()
+retriever = Retriever()

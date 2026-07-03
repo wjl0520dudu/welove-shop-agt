@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from langchain_core.tools import tool
 
-from rag import retriever
 from rag.models import RetrievalPlan
+from rag.retriever import retriever
 
 
 @tool(

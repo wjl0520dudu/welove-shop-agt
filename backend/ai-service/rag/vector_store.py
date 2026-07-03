@@ -5,6 +5,7 @@ from typing import Any, List, Optional
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 
+from core.config import config
 from rag.models import DocumentChunk, MetadataFilter, SearchRequest, SearchResult
 
 from pymilvus import (
@@ -21,15 +22,10 @@ from pymilvus import (
 
 def get_embeddings():
     return OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai-proxy.org/v1"),
-        api_key=os.getenv("OPENAI_API_KEY", "sk-ZwGM6SW5SaUkjLn219uF8Jcb22H4rKipOwpqDTwMeYOvBUu8"),
+        model=config.EMBEDDING_MODEL,
+        base_url=config.OPENAI_BASE_URL,
+        api_key=config.OPENAI_API_KEY,
     )
-    # return OpenAIEmbeddings(
-    #     model="Xorbits/bge-m3",
-    #     base_url=os.getenv("OPENAI_BASE_URL", "https://ms-ens-2fb01c9e-ff93.api-inference.modelscope.cn/v1"),
-    #     api_key=os.getenv("OPENAI_API_KEY", "ms-14743223-8ddc-4989-8abf-e6eeb5b97d6e"),
-    # )
 
 
 def build_metadata_filter(plan) -> MetadataFilter:
@@ -100,9 +96,9 @@ SCALAR_FIELDS = [
 
 class MilvusVectorStore:
     def __init__(self, collection_name: str | None = None):
-        self.collection_name = collection_name or "my_rag_collection"
+        self.collection_name = collection_name or config.MILVUS_COLLECTION
         self.embeddings = get_embeddings()
-        self.milvus_url = os.getenv("MILVUS_URL", "http://192.168.150.102:19530")
+        self.milvus_url = config.MILVUS_URL
         self.store: MilvusClient | None = None
         self._embedding_dim: int | None = None
         self._connect()

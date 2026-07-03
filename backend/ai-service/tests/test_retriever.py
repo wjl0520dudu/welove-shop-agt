@@ -51,8 +51,8 @@ class TestBuildKnowledgeContext:
             SearchResult(content="Goodbye", metadata=ChunkMetadata(title="", source="d2.txt"), score=0.7),
         ]
         ctx = build_knowledge_context(results)
-        assert "[zi liao 1]" in ctx and "Doc1" in ctx and "Hello world" in ctx
-        assert "[zi liao 2]" in ctx and "d2.txt" in ctx and "Goodbye" in ctx
+        assert "[资料1]" in ctx and "Doc1" in ctx and "Hello world" in ctx
+        assert "[资料2]" in ctx and "d2.txt" in ctx and "Goodbye" in ctx
 
     def test_empty_results(self):
         assert build_knowledge_context([]) == ""
@@ -95,9 +95,10 @@ class TestRetriever:
 
     def test_retrieve_with_minimal_plan(self):
         mock_store = MagicMock()
-        mock_store.hybrid_search.return_value = []
+        mock_store.search.return_value = []
         r = Retriever(vector_store=mock_store)
         output = r.retrieve(RetrievalPlan(query="数据库"))
         assert output.results == [] and output.sources == [] and output.knowledge_context == ""
-        req = mock_store.hybrid_search.call_args[0][0]
+        mock_store.search.assert_called_once()
+        req = mock_store.search.call_args[0][0]
         assert req.filter.category_ids is None and req.filter.product_id is None

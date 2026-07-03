@@ -1,21 +1,26 @@
-import dashscope
+import os
 from http import HTTPStatus
 
-# 1. 填入你自己的百炼API Key
-dashscope.api_key = "sk-ws-H.RXEMIIM.3TxO.MEQCIFAloE-SL77yOwFE1H0NIvCm9IODj8b6QIJ4cM7ehjYhAiAZqSJykdx9Ey0ZSJYTYDel-RMo07Hmi4730c0R3o3y2w"
+import pytest
 
-input_texts = "帅啊啊啊啊啊啊啊啊啊啊1234567890"
 
-resp = dashscope.TextEmbedding.call(
-    model="text-embedding-v4",
-    input=input_texts,
-    # 关键：开启同时返回稠密+稀疏向量
-    parameters={"output_type": "dense&sparse"}
+pytestmark = pytest.mark.skipif(
+    os.getenv("RUN_DASHSCOPE_TESTS") != "1",
+    reason="DashScope integration test requires RUN_DASHSCOPE_TESTS=1 and DASHSCOPE_API_KEY.",
 )
 
-# 判断请求是否成功
-if resp.status_code == HTTPStatus.OK:
-    print("稠密向量：", resp.output.embeddings[0]['dense_embedding'])
-    print("稀疏向量：", resp.output.embeddings[0]['sparse_embedding'])
-else:
-    print("调用失败：", resp.code, resp.message)
+
+def test_dashscope_embedding_returns_dense_and_sparse_vectors():
+    import dashscope
+
+    dashscope.api_key = os.getenv("DASHSCOPE_API_KEY", "")
+    response = dashscope.TextEmbedding.call(
+        model="text-embedding-v4",
+        input="向量检索测试",
+        parameters={"output_type": "dense&sparse"},
+    )
+
+    assert response.status_code == HTTPStatus.OK
+    embedding = response.output.embeddings[0]
+    assert embedding["dense_embedding"]
+    assert embedding["sparse_embedding"]

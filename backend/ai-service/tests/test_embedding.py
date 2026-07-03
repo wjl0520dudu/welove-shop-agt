@@ -1,11 +1,17 @@
 import os
 
-from langchain_openai import OpenAIEmbeddings
+import pytest
 
-em = OpenAIEmbeddings(
-        model="Xorbits/bge-m3",
-        base_url=os.getenv("OPENAI_BASE_URL", "https://ms-ens-2fb01c9e-ff93.api-inference.modelscope.cn/v1"),
-        api_key=os.getenv("OPENAI_API_KEY", "ms-14743223-8ddc-4989-8abf-e6eeb5b97d6e"),
-    )
 
-vec = em.embed_query("你好，世界")
+pytestmark = pytest.mark.skipif(
+    os.getenv("RUN_EMBEDDING_TESTS") != "1",
+    reason="Embedding integration test requires RUN_EMBEDDING_TESTS=1 and OPENAI_API_KEY.",
+)
+
+
+def test_embedding_provider_returns_vector():
+    from rag.vector_store import get_embeddings
+
+    vector = get_embeddings().embed_query("你好，世界")
+    assert isinstance(vector, list)
+    assert len(vector) > 0
