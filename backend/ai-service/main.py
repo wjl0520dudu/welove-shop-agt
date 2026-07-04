@@ -1,9 +1,11 @@
 from fastapi import FastAPI
 
+from api.assistant_routes import router as assistant_router
 from api.rag_routes import router as rag_router
 from api.shopping_routes import router as shopping_router
 
 app = FastAPI(title="ai-service")
+app.include_router(assistant_router)
 app.include_router(rag_router)
 app.include_router(shopping_router)
 
