@@ -117,10 +117,12 @@ class MilvusVectorStore:
     def _prepare_metadata(chunk: DocumentChunk) -> dict:
         m = chunk.metadata if hasattr(chunk, "metadata") else {}
         if hasattr(m, "dict"):
-            return m.dict()
+            d = m.dict()
         elif hasattr(m, "model_dump"):
-            return m.model_dump()
-        return m if isinstance(m, dict) else {}
+            d = m.model_dump()
+        else:
+            d = m if isinstance(m, dict) else {}
+        return {k: v for k, v in d.items() if v is not None}
 
     # ── connection + schema ─────────────────────────
     def _connect(self) -> None:

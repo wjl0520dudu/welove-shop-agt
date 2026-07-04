@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Literal
 
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 from langgraph.graph import END, START, StateGraph
 
@@ -37,7 +36,7 @@ INTENT_PROMPT = ChatPromptTemplate.from_messages(
 2. 不要编造品牌、预算、品类。
 3. 如果信息不足但仍可推荐，need_followup=false。
 4. 只有完全不知道用户想买什么时，need_followup=true。
-5. 只输出 JSON，不要输出 Markdown，不要输出解释文字。
+5. 如果当前模型不支持结构化输出，只输出 JSON，不要输出 Markdown，不要输出解释文字。
 
 JSON 字段：
 {{
@@ -190,22 +189,47 @@ class ShoppingRecommender:
                 "profile": state.get("profile", {}),
             }
         )
-        intent = self._parse_intent(raw_intent, state["question"])
+        intent = self._normalize_intent(raw_intent, state["question"])
         return {**state, "intent": intent}
 
-    def _parse_intent(self, raw_intent: str, question: str) -> ShoppingIntent:
-        """Parse model JSON output locally instead of using OpenAI parse API."""
+    def _normalize_intent(self, raw_intent, question: str) -> ShoppingIntent:
+        """把 structured output、dict 或旧 JSON 文本统一成 ShoppingIntent。"""
+
+        if isinstance(raw_intent, ShoppingIntent):
+            return raw_intent
+
+        if isinstance(raw_intent, dict):
+            try:
+                return ShoppingIntent(**raw_intent)
+            except Exception:
+                logger.exception("Intent dict validation failed, falling back to rule intent")
+                return self._fallback_intent(question)
+
+        return self._parse_intent_text(str(raw_intent), question)
+
+    def _parse_intent_text(self, raw_intent: str, question: str) -> ShoppingIntent:
+        """兼容旧模型输出 JSON 字符串的路径。"""
+
+        if hasattr(ShoppingIntent, "model_validate_json"):
+            try:
+                return ShoppingIntent.model_validate_json(raw_intent)
+            except Exception:
+                pass
 
         try:
+            import json
+
             data = json.loads(raw_intent)
-        except json.JSONDecodeError:
+        except Exception:
             match = re.search(r"\{[\s\S]*\}", raw_intent)
             if not match:
                 logger.warning("Intent JSON parse failed, falling back to rule intent: %s", raw_intent)
                 return self._fallback_intent(question)
             try:
+                import json
+
                 data = json.loads(match.group(0))
-            except json.JSONDecodeError:
+            except Exception:
                 logger.warning("Intent JSON block parse failed, falling back to rule intent: %s", raw_intent)
                 return self._fallback_intent(question)
 
@@ -297,6 +321,7 @@ class ShoppingRecommender:
     async def _build_response(self, state: ShoppingState) -> ShoppingState:
         """构造前端可用的商品卡片，并记录日志。"""
 
+        intent = state.get("intent")
         product_cards = [
             ProductCard(
                 product_id=item.product_id,
@@ -308,13 +333,12 @@ class ShoppingRecommender:
                 review_count=item.review_count or 0,
                 sales_count=item.sales_count or 0,
                 sub_category=item.sub_category or "",
-                reason=item.reason or "",
+                reason=item.reason or self._fallback_reason(item, intent),
             )
             for item in state.get("candidates", [])[:3]
         ]
 
         try:
-            intent = state.get("intent")
             await self.repository.log_recommendation(
                 user_id=state.get("user_id"),
                 session_id=state.get("session_id"),
@@ -328,6 +352,24 @@ class ShoppingRecommender:
 
         return {**state, "product_cards": product_cards}
 
+    @staticmethod
+    def _fallback_reason(item, intent) -> str:
+        if not intent:
+            return "来自当前商品库的候选商品"
+
+        reasons = []
+        searchable_text = " ".join(
+            [item.title or "", item.category or "", item.sub_category or "", item.tags or "", item.description or ""]
+        )
+        if intent.category and intent.category in searchable_text:
+            reasons.append(f"匹配{intent.category}")
+        if intent.budget_max is not None and item.price is not None and item.price <= intent.budget_max:
+            reasons.append(f"符合{intent.budget_max:g}元以内预算")
+        for preference in intent.preferences[:2]:
+            if preference and preference in searchable_text:
+                reasons.append(f"包含{preference}偏好")
+        return "，".join(reasons) or "来自当前商品库的候选商品"
+
 
 def shopping_state_to_result(state: ShoppingState) -> dict:
     """Convert internal LangGraph state to the stable API response adapter input."""
@@ -336,10 +378,13 @@ def shopping_state_to_result(state: ShoppingState) -> dict:
     for card in state.get("product_cards", []):
         product_cards.append(_dump_model(card))
 
+    intent = state.get("intent")
+    is_shopping_request = bool(intent and intent.is_shopping_request)
+
     return {
         "answer": state.get("answer", ""),
         "sources": [],
-        "task_type": "shopping" if product_cards else "unknown",
+        "task_type": "shopping" if is_shopping_request or product_cards else "unknown",
         "product_cards": product_cards,
         "has_sources": False,
         "error": False,

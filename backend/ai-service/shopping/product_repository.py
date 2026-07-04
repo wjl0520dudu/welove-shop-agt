@@ -30,6 +30,7 @@ class ProductRepository:
     ) -> List[ProductCandidate]:
         """根据结构化导购意图查询商品。"""
 
+        fetch_limit = max(limit, limit * 4)
         stmt = (
             select(ProductORM, CategoryORM.name.label("category_name"))
             .outerjoin(CategoryORM, ProductORM.category_id == CategoryORM.id)
@@ -57,11 +58,7 @@ class ProductRepository:
         if intent.budget_max is not None:
             stmt = stmt.where(ProductORM.base_price <= intent.budget_max)
 
-        soft_terms = [
-            term
-            for term in [intent.scenario, intent.target_user, *intent.preferences]
-            if term
-        ][:8]
+        soft_terms = self._soft_terms(intent)
         if soft_terms and not intent.category:
             stmt = stmt.where(or_(*[self._matches_product_text(term) for term in soft_terms]))
 
@@ -79,13 +76,14 @@ class ProductRepository:
             ProductORM.sales_count.desc(),
             ProductORM.rating.desc(),
             ProductORM.review_count.desc(),
-        ).limit(limit)
+        ).limit(fetch_limit)
 
         async with self.session_factory() as session:
             result = await session.execute(stmt)
             rows = result.all()
 
-        return [self._row_to_candidate(product, category_name) for product, category_name in rows]
+        candidates = [self._row_to_candidate(product, category_name) for product, category_name in rows]
+        return self._rank_candidates(candidates, intent)[:limit]
 
     @staticmethod
     def _matches_product_text(term: str):
@@ -116,6 +114,92 @@ class ProductRepository:
             sub_category=product.sub_category or "",
             tags=product.tags or "",
             description=product.description or "",
+        )
+
+    def _rank_candidates(
+        self,
+        candidates: List[ProductCandidate],
+        intent: ShoppingIntent,
+    ) -> List[ProductCandidate]:
+        """在数据库硬过滤后，用确定性软信号提升场景/偏好匹配度。"""
+
+        for candidate in candidates:
+            candidate.reason = self._build_reason(candidate, intent)
+
+        return sorted(
+            candidates,
+            key=lambda item: (
+                self._match_score(item, intent),
+                item.sales_count or 0,
+                item.rating or 0,
+                item.review_count or 0,
+            ),
+            reverse=True,
+        )
+
+    @classmethod
+    def _match_score(cls, candidate: ProductCandidate, intent: ShoppingIntent) -> int:
+        score = 0
+        text = cls._candidate_text(candidate)
+
+        weighted_terms = [
+            (intent.category, 4),
+            (intent.brand, 3),
+            (intent.scenario, 2),
+            (intent.target_user, 2),
+        ]
+        weighted_terms.extend((term, 2) for term in intent.preferences[:8])
+
+        for term, weight in weighted_terms:
+            if term and term in text:
+                score += weight
+
+        if intent.budget_min is not None and candidate.price is not None and candidate.price >= intent.budget_min:
+            score += 1
+        if intent.budget_max is not None and candidate.price is not None and candidate.price <= intent.budget_max:
+            score += 1
+
+        return score
+
+    @classmethod
+    def _build_reason(cls, candidate: ProductCandidate, intent: ShoppingIntent) -> str:
+        reasons = []
+        text = cls._candidate_text(candidate)
+
+        if intent.category and intent.category in text:
+            reasons.append(f"匹配{intent.category}")
+        if intent.brand and intent.brand in text:
+            reasons.append(f"匹配{intent.brand}品牌")
+        for term in [intent.scenario, intent.target_user, *intent.preferences]:
+            if term and term in text and len(reasons) < 3:
+                reasons.append(f"包含{term}偏好")
+
+        if intent.budget_max is not None and candidate.price is not None and candidate.price <= intent.budget_max and len(reasons) < 3:
+            reasons.append(f"符合{intent.budget_max:g}元以内预算")
+
+        return "，".join(reasons) or "来自当前商品库的候选商品"
+
+    @staticmethod
+    def _soft_terms(intent: ShoppingIntent) -> List[str]:
+        seen = set()
+        terms = []
+        for term in [intent.scenario, intent.target_user, *intent.preferences]:
+            if term and term not in seen:
+                seen.add(term)
+                terms.append(term)
+        return terms[:8]
+
+    @staticmethod
+    def _candidate_text(candidate: ProductCandidate) -> str:
+        return " ".join(
+            [
+                candidate.title or "",
+                candidate.brand or "",
+                candidate.category or "",
+                candidate.sub_category or "",
+                candidate.tags or "",
+                candidate.description or "",
+            ]
         )
 
     async def log_recommendation(
