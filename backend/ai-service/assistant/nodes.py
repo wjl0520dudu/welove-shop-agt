@@ -1,23 +1,29 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 import logging
+from uuid import uuid4
 from typing import Any, Callable, Dict, Optional
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.messages import AIMessage, HumanMessage
 from agents.state import AssistantState
-from agents.memory import remember_product_cards
+from agents.schemas import ChitchatResult
 from agents.prompts import CHITCHAT_PROMPT
 from shopping.agent import ShoppingAgent
 from knowledge.agent import KnowledgeAgent
 
 logger = logging.getLogger("ai-service.nodes")
 
+# 闲聊 agent 专用独立 checkpointer，与主图 checkpointer 完全隔离
+_chitchat_checkpointer = InMemorySaver()
+
 
 def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                knowledge_agent: Optional[KnowledgeAgent] = None) -> Dict[str, Callable]:
-    """生成节点函数字典。实例通过闭包持有，懒构造以避免无关分支触发数据库连接。"""
     _shopping_holder: Dict[str, Any] = {"agent": shopping_agent}
     _knowledge_holder: Dict[str, Any] = {"agent": knowledge_agent}
+    _chitchat_holder: Dict[str, Any] = {"agent": None}
 
     def get_shopping():
         if _shopping_holder["agent"] is None:
@@ -26,21 +32,20 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
 
     def get_knowledge():
         if _knowledge_holder["agent"] is None:
-            _knowledge_holder["agent"] = KnowledgeAgent()
+            _knowledge_holder["agent"] = KnowledgeAgent(llm)
         return _knowledge_holder["agent"]
 
-    _chitchat_chain: Dict[str, Any] = {"chain": None}
+    def _get_chitchat_agent():
+        if _chitchat_holder["agent"] is None:
+            _chitchat_holder["agent"] = create_agent(
+                model=llm,
+                checkpointer=_chitchat_checkpointer,
+                system_prompt=CHITCHAT_PROMPT,
+                response_format=ToolStrategy(ChitchatResult),
+            )
+        return _chitchat_holder["agent"]
 
-    def get_chitchat_chain():
-        if _chitchat_chain["chain"] is None:
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", CHITCHAT_PROMPT + "\n结合最近对话历史自然回应，简短友好。"),
-                ("human", "{question}"),
-            ])
-            _chitchat_chain["chain"] = prompt | llm | StrOutputParser()
-        return _chitchat_chain["chain"]
-
-    async def shopping_node(state: AssistantState) -> AssistantState:
+    async def shopping_node(state: AssistantState) -> dict:
         try:
             result = await get_shopping().run(
                 question=state.get("question", ""),
@@ -51,43 +56,111 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             )
         except Exception as e:
             logger.exception("shopping node failed")
-            return {**state, "answer": "导购 Agent 暂时不可用，请稍后再试。", "task_type": "shopping",
-                    "error": True, "error_code": "AI_SHOPPING_ERROR", "message": str(e)}
-        cards = result.get("product_cards") or []
-        if cards:
-            remember_product_cards(state.get("conversation_id"), state.get("user_id"), cards)
-        return _merge_result(state, result, task_type="shopping")
+            return {
+                "answer": "导购 Agent 暂时不可用，请稍后再试。",
+                "task_type": "shopping",
+                "error": True,
+                "error_code": "AI_SHOPPING_ERROR",
+                "message": str(e),
+                "messages": [AIMessage(content="导购 Agent 暂时不可用，请稍后再试。")],
+            }
+        return _merge_result(result, task_type="shopping",
+                             extra={"messages": [AIMessage(content=result.get("answer", ""))]})
 
-    async def knowledge_node(state: AssistantState) -> AssistantState:
+    async def knowledge_node(state: AssistantState) -> dict:
         try:
-            result = await get_knowledge().ask(
-                question=state.get("question", ""),
-                business_memory=state.get("business_memory", {}),
+            messages = _build_agent_messages(state)
+            result = await get_knowledge().run(
+                messages=messages,
+                conversation_id=state.get("conversation_id", ""),
             )
+            # ---- 置信度分流：confidence < 0.5 时引导用户补充信息 ----
+            confidence = result.get("confidence", 1.0)
+            if confidence < 0.5:
+                question = state.get("question", "")
+                clarify_msg = (
+                    f"关于「{question}」，我目前的信息不够充分，暂时无法给出准确回答。"
+                    f"你能再详细描述一下你的需求吗？比如你想了解哪个具体方面？"
+                )
+                return {
+                    "answer": clarify_msg,
+                    "task_type": "chitchat",
+                    "sources": result.get("sources", []),
+                    "messages": [AIMessage(content=clarify_msg)],
+                }
         except Exception as e:
             logger.exception("knowledge node failed")
-            return {**state, "answer": "知识检索暂时不可用，请稍后再试。", "task_type": "knowledge",
-                    "error": True, "error_code": "AI_RAG_ERROR", "message": str(e)}
-        return _merge_result(state, result, task_type="knowledge")
+            return {
+                "answer": "知识检索暂时不可用，请稍后再试。",
+                "task_type": "knowledge",
+                "error": True,
+                "error_code": "AI_RAG_ERROR",
+                "message": str(e),
+                "messages": [AIMessage(content="知识检索暂时不可用，请稍后再试。")],
+            }
+        return _merge_result(result, task_type="knowledge",
+                             extra={"messages": [AIMessage(content=result.get("answer", ""))]})
 
-    async def chitchat_node(state: AssistantState) -> AssistantState:
+    async def chitchat_node(state: AssistantState) -> dict:
         if llm is None:
-            return {**state, "answer": "AI 助手暂未配置，无法闲聊。", "task_type": "chitchat",
-                    "error": True, "error_code": "AI_LLM_NOT_CONFIGURED"}
+            return {
+                "answer": "AI 助手暂未配置，无法闲聊。",
+                "task_type": "chitchat",
+                "error": True,
+                "error_code": "AI_LLM_NOT_CONFIGURED",
+            }
         try:
-            chain = get_chitchat_chain()
-            answer = await chain.ainvoke({"question": state.get("question", "")})
+            messages = _build_agent_messages(state)
+            agent = _get_chitchat_agent()
+            result = await agent.ainvoke(
+                {"messages": messages},
+                config={"configurable": {"thread_id": str(uuid4())}},
+            )
+            structured = result.get("structured_response")
+            if structured is not None:
+                answer = structured.answer
+            else:
+                # fallback：从 messages 最后一条 AI 消息提取文本
+                last_ai = ""
+                for m in reversed(result.get("messages", [])):
+                    if isinstance(m, dict):
+                        mtype = m.get("type", "")
+                        if mtype == "ai" and m.get("content"):
+                            last_ai = str(m.get("content", ""))
+                            break
+                    else:
+                        mtype = getattr(m, "type", "")
+                        if mtype == "ai":
+                            content = getattr(m, "content", "")
+                            if isinstance(content, str) and content.strip():
+                                last_ai = content
+                                break
+                answer = last_ai or "嗯嗯，我在呢~"
         except Exception as e:
             logger.exception("chitchat node failed")
-            return {**state, "answer": "闲聊回复失败，请稍后再试。", "task_type": "chitchat",
-                    "error": True, "error_code": "AI_CHITCHAT_ERROR", "message": str(e)}
-        return {**state, "answer": answer, "task_type": "chitchat"}
+            return {
+                "answer": "闲聊回复失败，请稍后再试。",
+                "task_type": "chitchat",
+                "error": True,
+                "error_code": "AI_CHITCHAT_ERROR",
+                "message": str(e),
+                "messages": [AIMessage(content="闲聊回复失败，请稍后再试。")],
+            }
+        return {
+            "answer": answer,
+            "task_type": "chitchat",
+            "messages": [AIMessage(content=answer)],
+        }
 
-    async def unknown_node(state: AssistantState) -> AssistantState:
-        return {**state, "answer": "我可以帮你找商品、推荐，或回答商品知识问题，请告诉我你的需求。",
-                "task_type": "unknown"}
+    async def unknown_node(state: AssistantState) -> dict:
+        msg = "我可以帮你找商品、推荐，或回答商品知识问题，请告诉我你的需求。"
+        return {
+            "answer": msg,
+            "task_type": "unknown",
+            "messages": [AIMessage(content=msg)],
+        }
 
-    def format_response(state: AssistantState) -> AssistantState:
+    def format_response(state: AssistantState) -> dict:
         result = {
             "answer": state.get("answer", ""),
             "task_type": state.get("task_type") or state.get("route") or "unknown",
@@ -102,7 +175,7 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             "error_code": state.get("error_code"),
             "message": state.get("message"),
         }
-        return {**state, "result": result}
+        return {"result": result}
 
     return {
         "shopping_node": shopping_node,
@@ -113,8 +186,31 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
     }
 
 
-def _merge_result(state: AssistantState, result: Dict[str, Any], *, task_type: str) -> AssistantState:
-    merged = {**state}
+def _build_agent_messages(state: AssistantState) -> list:
+    """从共享 state 构建传给子 agent 的消息列表。
+
+    子 agent（knowledge/shopping/chitchat）通过 create_agent 运行，需要 {"messages": [...]} 格式。
+    这里从 state["messages"] 中提取，带上完整对话历史，实现多 agent 共享记忆。
+    """
+    messages = state.get("messages") or []
+    out = []
+    for m in messages:
+        if isinstance(m, dict):
+            out.append(m)
+            continue
+        mtype = getattr(m, "type", "")
+        content = getattr(m, "content", "")
+        if isinstance(content, str) and content.strip():
+            if mtype == "human":
+                out.append(HumanMessage(content=content))
+            elif mtype == "ai":
+                out.append(AIMessage(content=content))
+    return out
+
+
+def _merge_result(result: Dict[str, Any], *, task_type: str,
+                  extra: Dict[str, Any] = None) -> dict:
+    merged: Dict[str, Any] = {}
     for key in ("answer", "product_cards", "sources", "tool_calls", "error", "error_code", "message"):
         if key in result:
             merged[key] = result[key]
@@ -124,10 +220,13 @@ def _merge_result(state: AssistantState, result: Dict[str, Any], *, task_type: s
     merged.setdefault("sources", [])
     merged.setdefault("tool_calls", [])
     merged.setdefault("error", False)
+    if extra:
+        merged.update(extra)
     return merged
 
 
 def _history_messages(state: AssistantState) -> list:
+    """构建传给 ShoppingAgent 的历史消息列表（dict 格式）。"""
     messages = state.get("messages") or []
     out = []
     for m in messages:

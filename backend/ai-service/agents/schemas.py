@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
@@ -6,9 +7,12 @@ TaskType = Literal["shopping", "knowledge", "chitchat", "unknown", "cart"]
 
 
 class IntentDecision(BaseModel):
-    task_type: TaskType = Field(..., description="best route")
-    confidence: float = Field(0.0, ge=0.0, le=1.0)
-    reason: str = Field("")
+    task_type: TaskType = Field(
+        ...,
+        description="意图分类: shopping=搜索/推荐/比较具体商品, knowledge=了解知识/用法/成分/适合什么(即使提到商品名), chitchat=闲聊/问候/元问题(关于对话本身), unknown=无法判断",
+    )
+    confidence: float = Field(0.0, ge=0.0, le=1.0, description="分类置信度")
+    reason: str = Field("", description="分类理由")
 
 
 class AgentFinalResponse(BaseModel):
@@ -37,3 +41,21 @@ class AgentRequestContext(BaseModel):
     cart_item_id: Optional[int] = None
     quantity: int = 1
     business_memory: Dict[str, Any] = Field(default_factory=dict)
+
+
+class KnowledgeResult(BaseModel):
+    """知识 agent 的结构化输出。"""
+    answer: str = Field(..., description="基于检索结果综合生成的最终回答")
+    sources: List[Dict[str, Any]] = Field(default_factory=list, description="引用的知识来源列表，包含 title 和 score")
+    has_answer: bool = Field(True, description="是否在知识库中找到了相关内容")
+    search_query_used: str = Field("", description="实际使用的检索查询词")
+    confidence: float = Field(0.0, ge=0.0, le=1.0, description="回答置信度")
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list, description="本次执行中调用的工具记录")
+
+
+class ChitchatResult(BaseModel):
+    """闲聊 agent 的结构化输出。"""
+    answer: str = Field(..., description="自然友好的闲聊回复")
+    mood: Literal["friendly", "warm", "professional", "playful"] = Field(
+        "friendly", description="回复语气"
+    )

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import List, Optional, TypedDict
 
+from langgraph.store.memory import InMemoryStore
+from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel, Field
 
 
@@ -69,3 +71,6 @@ class ShoppingState(TypedDict, total=False):
     product_cards: List[ProductCard]
     error: Optional[str]
     profile: Optional[dict]
+
+    memory_saver = InMemorySaver  # 短期记忆
+    memory_store = InMemoryStore  # 长期记忆

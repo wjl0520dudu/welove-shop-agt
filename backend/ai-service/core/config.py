@@ -12,6 +12,7 @@ class Config:
     LLM_API_KEY = os.getenv("LLM_API_KEY", "")
     LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
     LLM_MODEL = os.getenv("LLM_MODEL", "")
+    MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "openai")  # 模型提供商，默认为 openai
 
     # 2.RAG 文档分块配置
     CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
@@ -31,6 +32,7 @@ class Config:
     DB_USER = os.getenv("DB_USER", "root")
     DB_PASSWORD = os.getenv("DB_PASSWORD", "")
     DB_CHARSET = os.getenv("DB_CHARSET", "utf8mb4")
+
 
 config = Config()
 logger = logging.getLogger("ai-service")
