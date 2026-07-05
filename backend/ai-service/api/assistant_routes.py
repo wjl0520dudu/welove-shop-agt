@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Literal, Optional
+from typing import Optional
 from uuid import uuid4
 
 from fastapi import APIRouter
@@ -18,15 +18,13 @@ logger = logging.getLogger("ai-service.assistant")
 
 
 class AssistantRunRequest(ChatRequest):
-    confirmed: bool = Field(False, description="Whether user confirmed a write operation")
-    cart_action: Optional[Literal["list", "count", "add", "remove", "update"]] = Field(
-        None,
-        description="Explicit cart action from caller",
-    )
-    product_id: Optional[int] = Field(None, description="Selected product ID")
-    sku_id: Optional[int] = Field(None, description="Selected SKU ID")
-    cart_item_id: Optional[int] = Field(None, description="Selected cart item ID")
-    quantity: int = Field(1, ge=1, description="Quantity")
+    # 购物车写操作已交给前端，这些字段保留兼容旧调用方，不再被 graph 消费。
+    confirmed: bool = Field(False, description="[deprecated] 购物车操作改由前端直接处理")
+    cart_action: Optional[str] = Field(None, description="[deprecated] 不再由 Agent 处理")
+    product_id: Optional[int] = Field(None, description="[deprecated] 不再由 Agent 处理")
+    sku_id: Optional[int] = Field(None, description="[deprecated] 不再由 Agent 处理")
+    cart_item_id: Optional[int] = Field(None, description="[deprecated] 不再由 Agent 处理")
+    quantity: int = Field(1, ge=1, description="[deprecated] 不再由 Agent 处理")
 
 
 def _parse_user_id(value: Optional[str]) -> Optional[int]:
@@ -59,12 +57,6 @@ async def run_assistant(request: AssistantRunRequest) -> AIResponse:
             conversation_id=request.conversation_id,
             user_id=_parse_user_id(request.user_id),
             jwt_token=request.jwt_token,
-            confirmed=request.confirmed,
-            cart_action=request.cart_action,
-            product_id=request.product_id,
-            sku_id=request.sku_id,
-            cart_item_id=request.cart_item_id,
-            quantity=request.quantity,
         )
     except Exception:
         logger.exception("Assistant agent run failed")

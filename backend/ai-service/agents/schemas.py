@@ -1,33 +1,29 @@
-from __future__ import annotations
-
-from typing import Any, Dict, Literal, Optional
-
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
-
-TaskType = Literal["shopping", "cart", "knowledge", "chitchat", "unknown", "plan_execute"]
+# 主图只产 shopping|knowledge|chitchat|unknown；cart 仅为兼容旧购物车库保留。
+TaskType = Literal["shopping", "knowledge", "chitchat", "unknown", "cart"]
 
 
 class IntentDecision(BaseModel):
-    task_type: TaskType = Field(..., description="Best agent route for the user request")
-    confidence: float = Field(0.0, ge=0.0, le=1.0, description="Routing confidence")
-    reason: str = Field("", description="Short routing reason")
+    task_type: TaskType = Field(..., description="best route")
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
+    reason: str = Field("")
 
 
 class AgentFinalResponse(BaseModel):
-    answer: str = Field("", description="Final user-facing answer")
-    task_type: TaskType = Field("unknown", description="Final task type")
-    product_cards: list[Dict[str, Any]] = Field(default_factory=list, description="Product cards")
-    confirm_card: Optional[Dict[str, Any]] = Field(None, description="Confirmation card")
-    cart_selection: Optional[Dict[str, Any]] = Field(None, description="Cart or product selection card")
-    cart_list: Optional[Dict[str, Any]] = Field(None, description="Cart list card")
-    tool_calls: list[Dict[str, Any]] = Field(default_factory=list, description="Tool call records")
-    error: bool = Field(False, description="Whether the response is an error")
-    error_code: Optional[str] = Field(None, description="Stable error code")
-    message: Optional[str] = Field(None, description="Stable status or error message")
+    answer: str = ""
+    task_type: TaskType = "unknown"
+    product_cards: List[Dict[str, Any]] = Field(default_factory=list)
+    sources: List[Dict[str, Any]] = Field(default_factory=list)
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
+    error: bool = False
+    error_code: Optional[str] = None
+    message: Optional[str] = None
 
 
 class AgentRequestContext(BaseModel):
+    """cart 库工具上下文（不接入主图，仅购物车库使用）。"""
     question: str = ""
     context: str = ""
     conversation_id: Optional[str] = None

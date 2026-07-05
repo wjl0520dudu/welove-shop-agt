@@ -36,6 +36,7 @@ def _last_ai_text(messages: list[Any]) -> str:
 
 
 def _merge_tool_payloads(messages: list[Any]) -> dict:
+    """从 ToolMessage 内容里合并检索/工具相关字段（已移除 cart 相关字段）。"""
     merged: dict = {"tool_calls": []}
     for message in messages:
         if not isinstance(message, ToolMessage) and getattr(message, "type", None) != "tool":
@@ -43,7 +44,7 @@ def _merge_tool_payloads(messages: list[Any]) -> dict:
         payload = _json_dict(getattr(message, "content", ""))
         if not payload:
             continue
-        for key in ("product_cards", "confirm_card", "cart_selection", "cart_list", "error", "error_code", "message"):
+        for key in ("product_cards", "sources", "error", "error_code", "message", "task_type", "answer"):
             if payload.get(key) not in (None, [], ""):
                 merged[key] = payload[key]
         if payload.get("tool_call"):
@@ -54,6 +55,7 @@ def _merge_tool_payloads(messages: list[Any]) -> dict:
 
 
 def agent_state_to_result(state: Dict[str, Any], default_task_type: str = "unknown") -> dict:
+    """从 create_agent 的 messages/structured_response 拼出 result dict。"""
     structured = state.get("structured_response")
     if structured is not None:
         result = model_to_dict(structured)
