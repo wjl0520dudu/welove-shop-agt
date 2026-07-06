@@ -53,6 +53,7 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 business_memory=state.get("business_memory", {}),
                 conversation_id=state.get("conversation_id"),
                 user_id=state.get("user_id"),
+                jwt_token=state.get("jwt_token"),
             )
         except Exception as e:
             logger.exception("shopping node failed")

@@ -42,10 +42,14 @@ class AssistantState(TypedDict):
 
 class ShoppingAgentState(AgentState):
     """ShoppingAgent 内部 state：继承 create_agent 的 AgentState（含 messages），
-    额外携带 conversation_id / user_id 给 ToolRuntime 里的工具读取。
+    额外携带 conversation_id / user_id / jwt_token 给 ToolRuntime 里的工具读取。
 
     工具通过 `runtime.state["conversation_id"]` 拿到当前上下文，无需闭包捕获。
     对应教程 05 的模式。
+
+    jwt_token 用于工具调 Java 后端接口时透传认证（如 user_tools 里的
+    get_user_favorites / get_user_orders 等，Java 侧走 JwtFilter 校验）。
     """
     conversation_id: NotRequired[str]
     user_id: NotRequired[int | str]
+    jwt_token: NotRequired[str]

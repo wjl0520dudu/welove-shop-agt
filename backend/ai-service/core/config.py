@@ -50,6 +50,17 @@ class Config:
     # Java 完成迁移后也接这个库。
     PG_BUSINESS_DB = os.getenv("PG_BUSINESS_DB", "welove_shop_db")
 
+    # 6. Java 后端服务地址（Python agent 通过 HTTP 调 Java 拿业务数据：收藏/浏览/订单）
+    JAVA_API_BASE_URL = os.getenv("JAVA_API_BASE_URL", "http://localhost:8888")
+    JAVA_API_TIMEOUT_SECONDS = float(os.getenv("JAVA_API_TIMEOUT_SECONDS", "10"))
+
+    # 7. LangSmith tracing（可观测性）
+    # LANGSMITH_TRACING=true 开启后 LangChain 自动上报所有 invoke/ainvoke/astream 到 LangSmith
+    LANGSMITH_TRACING = os.getenv("LANGSMITH_TRACING", "false").lower() in ("1", "true", "yes")
+    LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+    LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY", "")
+    LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "welove-shop-ai")
+
 
 config = Config()
 logger = logging.getLogger("ai-service")

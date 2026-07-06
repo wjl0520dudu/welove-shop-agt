@@ -5,6 +5,24 @@ if sys.platform == "win32":
     import asyncio
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+# LangSmith 追踪初始化。必须在 import LangChain / langgraph 之前，让它们
+# 加载时能读到 LANGCHAIN_* 环境变量并自动挂钩。
+# 我们把 config 里的 LANGSMITH_* 映射到 LangChain 期望的 LANGCHAIN_* 前缀名。
+import os
+from core.config import config as _cfg
+if _cfg.LANGSMITH_TRACING and _cfg.LANGSMITH_API_KEY:
+    os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+    os.environ.setdefault("LANGCHAIN_ENDPOINT", _cfg.LANGSMITH_ENDPOINT)
+    os.environ.setdefault("LANGCHAIN_API_KEY", _cfg.LANGSMITH_API_KEY)
+    os.environ.setdefault("LANGCHAIN_PROJECT", _cfg.LANGSMITH_PROJECT)
+    # 新版环境变量名也一起设，前后兼容
+    os.environ.setdefault("LANGSMITH_TRACING", "true")
+    os.environ.setdefault("LANGSMITH_ENDPOINT", _cfg.LANGSMITH_ENDPOINT)
+    os.environ.setdefault("LANGSMITH_API_KEY", _cfg.LANGSMITH_API_KEY)
+    os.environ.setdefault("LANGSMITH_PROJECT", _cfg.LANGSMITH_PROJECT)
+    import logging
+    logging.getLogger("ai-service").info("LangSmith tracing enabled, project=%s", _cfg.LANGSMITH_PROJECT)
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI

@@ -15,6 +15,10 @@ from agents.prompts import SHOPPING_AGENT_PROMPT
 from agents.schemas import ShoppingResult
 from agents.state import ShoppingAgentState
 from tools.shopping_tools import SHOPPING_TOOLS
+from tools.user_tools import USER_TOOLS
+
+# ShoppingAgent 使用的全部工具：商品搜索/详情/对比 + 用户维度（收藏/浏览/订单）
+_ALL_TOOLS = SHOPPING_TOOLS + USER_TOOLS
 
 logger = logging.getLogger("ai-service.shopping.agent")
 
@@ -104,6 +108,7 @@ class ShoppingAgent:
         business_memory: Dict[str, Any],
         conversation_id: Optional[str] = None,
         user_id: Optional[int] = None,
+        jwt_token: Optional[str] = None,
     ) -> dict:
         """执行导购推荐。
 
@@ -138,7 +143,7 @@ class ShoppingAgent:
             model=self._llm,
             checkpointer=_shopping_checkpointer,
             system_prompt=system_prompt,
-            tools=SHOPPING_TOOLS,
+            tools=_ALL_TOOLS,
             state_schema=ShoppingAgentState,
             response_format=ToolStrategy(ShoppingResult),
         )
@@ -146,12 +151,14 @@ class ShoppingAgent:
         agent_messages = self._build_messages(question, messages)
 
         try:
-            # 关键点：把 conversation_id / user_id 塞进 state，让工具通过 ToolRuntime 读取
+            # 关键点：把 conversation_id / user_id / jwt_token 塞进 state，
+            # 让工具通过 ToolRuntime.state 读取（jwt_token 用于 user_tools 调 Java）
             result = await agent.ainvoke(
                 {
                     "messages": agent_messages,
                     "conversation_id": conversation_id,
                     "user_id": user_id,
+                    "jwt_token": jwt_token,
                 },
                 config={"configurable": {"thread_id": str(uuid4())}},
             )
