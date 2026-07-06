@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import BigInteger, DateTime, DECIMAL, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, DECIMAL, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -58,6 +58,8 @@ class RecommendationLogORM(Base):
     recommended_product_ids: Mapped[Optional[list[int]]] = mapped_column(JSON)
     recommend_reason: Mapped[Optional[str]] = mapped_column(Text)
     agent_reasoning: Mapped[Optional[str]] = mapped_column(Text)
-    user_clicked: Mapped[Optional[int]] = mapped_column(Integer)
+    # PG 里 user_clicked 已从 SMALLINT 改为 BOOLEAN（Java 端 Boolean 类型对应）。
+    # Python ORM 同步类型，避免 SQLAlchemy 序列化时用 int 触发 PG 类型冲突。
+    user_clicked: Mapped[Optional[bool]] = mapped_column(Boolean)
     user_feedback: Mapped[Optional[int]] = mapped_column(Integer)
     create_time: Mapped[Optional[datetime]] = mapped_column(DateTime)
