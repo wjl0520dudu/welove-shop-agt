@@ -6,7 +6,7 @@ from typing import Any, Dict
 from langchain_core.tools import tool
 
 from rag.models import RetrievalPlan
-from rag.retriever import retriever
+from rag.retriever import get_retriever
 
 
 @tool(
@@ -64,7 +64,7 @@ def analyze_query(question: str) -> Dict[str, Any]:
 def knowledge_search(plan: Dict[str, Any]) -> Dict[str, Any]:
     """根据 RetrievalPlan 检索知识库，返回文档片段、sources 和 knowledge_context。"""
     retrieval_plan = RetrievalPlan(**plan)
-    output = retriever.retrieve(retrieval_plan)
+    output = get_retriever().retrieve(retrieval_plan)
     return {
         "documents": [
             {

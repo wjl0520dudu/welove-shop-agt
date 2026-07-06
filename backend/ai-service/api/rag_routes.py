@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException
 from chains.rag_qa_chain import ask_with_rag
 from rag.document_pipeline import DocumentIngestionService
 from rag.models import ParseRequest, RetrievalPlan
-from rag.retriever import retriever
+from rag.retriever import get_retriever
 from rag.vector_store import create_vector_store
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
@@ -26,7 +26,7 @@ async def parse_document(request: ParseRequest) -> Dict[str, Any]:
 
 @router.post("/search")
 async def search(plan: RetrievalPlan) -> Dict[str, Any]:
-    output = retriever.retrieve(plan)
+    output = get_retriever().retrieve(plan)
     return {
         "documents": [
             {

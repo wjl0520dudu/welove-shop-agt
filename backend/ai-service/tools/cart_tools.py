@@ -89,14 +89,14 @@ def _resolve_product_id(context: AgentRequestContext, product_id: Optional[int])
     return product.get("product_id") or product.get("id")
 
 
-def _confirm_payload(context: AgentRequestContext, action: str, product_id: Optional[int], sku_id: Optional[int], cart_item_id: Optional[int], quantity: int) -> dict:
+async def _confirm_payload(context: AgentRequestContext, action: str, product_id: Optional[int], sku_id: Optional[int], cart_item_id: Optional[int], quantity: int) -> dict:
     messages = {
         "add": f"确认把这件商品加入购物车吗？数量：{quantity}。",
         "remove": "确认从购物车移除这件商品吗？",
         "update": f"确认把这件商品数量改为 {quantity} 吗？",
     }
     pending = {"action": action, "product_id": product_id, "sku_id": sku_id, "cart_item_id": cart_item_id, "quantity": quantity}
-    remember_pending_cart_action(context.conversation_id, context.user_id, pending)
+    await remember_pending_cart_action(context.conversation_id, context.user_id, pending)
     return {
         "answer": messages.get(action, "请确认购物车操作。"),
         "task_type": "cart",
@@ -134,7 +134,7 @@ def build_cart_tools(client: CartJavaClient, context: AgentRequestContext):
         resolved_quantity = quantity or context.quantity or 1
         if not resolved_product_id:
             return {"answer": "我还不确定要加入哪件商品，请先选择商品。", "task_type": "cart", "cart_selection": {"type": "cart_selection", "message": "请选择要加入购物车的商品。", "items": context.business_memory.get("last_product_cards", []) if context.business_memory else []}, "error": True, "error_code": "PRODUCT_NOT_SELECTED", "message": "缺少商品标识。"}
-        return _confirm_payload(context, "add", resolved_product_id, resolved_sku_id, None, resolved_quantity)
+        return await _confirm_payload(context, "add", resolved_product_id, resolved_sku_id, None, resolved_quantity)
 
     @tool(args_schema=ProductRefInput)
     async def prepare_remove_cart(product_id: Optional[int] = None, sku_id: Optional[int] = None, quantity: int = 1, cart_item_id: Optional[int] = None) -> dict:
@@ -143,7 +143,7 @@ def build_cart_tools(client: CartJavaClient, context: AgentRequestContext):
         resolved_cart_item_id = cart_item_id or context.cart_item_id
         if not resolved_product_id and not resolved_cart_item_id:
             return {"answer": "我还不确定要移除哪件商品，请先选择商品。", "task_type": "cart", "cart_selection": {"type": "cart_selection", "message": "请选择要移除的商品。", "items": []}, "error": True, "error_code": "PRODUCT_NOT_SELECTED", "message": "缺少商品标识。"}
-        return _confirm_payload(context, "remove", resolved_product_id, sku_id, resolved_cart_item_id, quantity or context.quantity or 1)
+        return await _confirm_payload(context, "remove", resolved_product_id, sku_id, resolved_cart_item_id, quantity or context.quantity or 1)
 
     @tool(args_schema=ProductRefInput)
     async def prepare_update_cart(product_id: Optional[int] = None, sku_id: Optional[int] = None, quantity: int = 1, cart_item_id: Optional[int] = None) -> dict:
@@ -152,7 +152,7 @@ def build_cart_tools(client: CartJavaClient, context: AgentRequestContext):
         resolved_quantity = quantity or context.quantity or 1
         if not resolved_product_id:
             return {"answer": "我还不确定要修改哪件商品，请先选择商品。", "task_type": "cart", "cart_selection": {"type": "cart_selection", "message": "请选择要修改的商品。", "items": []}, "error": True, "error_code": "PRODUCT_NOT_SELECTED", "message": "缺少商品标识。"}
-        return _confirm_payload(context, "update", resolved_product_id, sku_id, cart_item_id, resolved_quantity)
+        return await _confirm_payload(context, "update", resolved_product_id, sku_id, cart_item_id, resolved_quantity)
 
     @tool(args_schema=ProductRefInput)
     async def execute_add_cart(product_id: Optional[int] = None, sku_id: Optional[int] = None, quantity: int = 1, cart_item_id: Optional[int] = None) -> dict:
@@ -171,7 +171,7 @@ def build_cart_tools(client: CartJavaClient, context: AgentRequestContext):
         started = time.time()
         result = await client.add_item(context.jwt_token, resolved_product_id, resolved_sku_id)
         if result.success:
-            clear_pending_cart_action(context.conversation_id, context.user_id)
+            await clear_pending_cart_action(context.conversation_id, context.user_id)
         return _result_payload("cart_add", result, started, {"product_id": resolved_product_id, "sku_id": resolved_sku_id, "quantity": quantity})
 
     @tool(args_schema=ProductRefInput)
@@ -184,7 +184,7 @@ def build_cart_tools(client: CartJavaClient, context: AgentRequestContext):
         started = time.time()
         result = await client.remove_item(context.jwt_token, product_id=resolved_product_id, cart_item_id=resolved_cart_item_id, quantity=quantity)
         if result.success:
-            clear_pending_cart_action(context.conversation_id, context.user_id)
+            await clear_pending_cart_action(context.conversation_id, context.user_id)
         return _result_payload("cart_remove", result, started, {"product_id": resolved_product_id, "cart_item_id": resolved_cart_item_id, "quantity": quantity})
 
     @tool(args_schema=ProductRefInput)
@@ -199,7 +199,7 @@ def build_cart_tools(client: CartJavaClient, context: AgentRequestContext):
         started = time.time()
         result = await client.update_quantity(context.jwt_token, resolved_product_id, resolved_quantity)
         if result.success:
-            clear_pending_cart_action(context.conversation_id, context.user_id)
+            await clear_pending_cart_action(context.conversation_id, context.user_id)
         return _result_payload("cart_update", result, started, {"product_id": resolved_product_id, "quantity": resolved_quantity})
 
     return [list_cart, count_cart, prepare_add_cart, prepare_remove_cart, prepare_update_cart, execute_add_cart, execute_remove_cart, execute_update_cart]

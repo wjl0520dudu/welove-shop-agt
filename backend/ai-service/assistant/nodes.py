@@ -74,20 +74,19 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 messages=messages,
                 conversation_id=state.get("conversation_id", ""),
             )
-            # ---- 置信度分流：confidence < 0.5 时引导用户补充信息 ----
-            confidence = result.get("confidence", 1.0)
-            if confidence < 0.5:
+            # 无检索结果兜底：sources 为空 或 has_answer=False 时补一句引导，
+            # 但 task_type 保持 knowledge —— 不要伪装成 chitchat，否则前端行为错乱。
+            # 具体的"知识库暂无相关信息"由 KNOWLEDGE_PROMPT 约束 LLM 自己说，这里只做兜底 answer 补全。
+            has_answer = bool(result.get("has_answer", True))
+            sources = result.get("sources") or []
+            answer = (result.get("answer") or "").strip()
+            if (not has_answer or not sources) and not answer:
                 question = state.get("question", "")
-                clarify_msg = (
-                    f"关于「{question}」，我目前的信息不够充分，暂时无法给出准确回答。"
-                    f"你能再详细描述一下你的需求吗？比如你想了解哪个具体方面？"
+                answer = (
+                    f"关于「{question}」，我在知识库里暂时没有找到直接相关的资料。"
+                    f"你可以换个角度问我，或者提供更具体的场景（比如你的肤质、使用需求），我再帮你分析。"
                 )
-                return {
-                    "answer": clarify_msg,
-                    "task_type": "chitchat",
-                    "sources": result.get("sources", []),
-                    "messages": [AIMessage(content=clarify_msg)],
-                }
+                result = {**result, "answer": answer}
         except Exception as e:
             logger.exception("knowledge node failed")
             return {

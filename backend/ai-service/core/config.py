@@ -33,6 +33,13 @@ class Config:
     DB_PASSWORD = os.getenv("DB_PASSWORD", "")
     DB_CHARSET = os.getenv("DB_CHARSET", "utf8mb4")
 
+    # 5.pgvector 配置，用于商品向量语义检索
+    PG_HOST = os.getenv("PG_HOST", "localhost")
+    PG_PORT = int(os.getenv("PG_PORT", "5432"))
+    PG_NAME = os.getenv("PG_NAME", "welove_shop_search")
+    PG_USER = os.getenv("PG_USER", "root")
+    PG_PASSWORD = os.getenv("PG_PASSWORD", "")
+
 
 config = Config()
 logger = logging.getLogger("ai-service")

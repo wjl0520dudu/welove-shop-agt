@@ -59,3 +59,20 @@ class ChitchatResult(BaseModel):
     mood: Literal["friendly", "warm", "professional", "playful"] = Field(
         "friendly", description="回复语气"
     )
+
+
+class ShoppingResult(BaseModel):
+    """导购 agent 的结构化输出。"""
+    answer: str = Field(..., description="基于真实商品的推荐话术")
+    product_cards: List[Dict[str, Any]] = Field(
+        default_factory=list, description="推荐的商品卡片列表"
+    )
+    need_followup: bool = Field(
+        False, description="是否需要追问用户以澄清需求"
+    )
+    followup_question: Optional[str] = Field(
+        None, description="追问用户的问题"
+    )
+    confidence: float = Field(
+        0.0, ge=0.0, le=1.0, description="推荐置信度"
+    )

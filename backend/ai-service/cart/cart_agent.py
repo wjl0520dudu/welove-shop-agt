@@ -60,7 +60,7 @@ class CartAgent:
             sku_id=sku_id,
             cart_item_id=cart_item_id,
             quantity=max(quantity or 1, 1),
-            business_memory=get_business_memory(conversation_id, user_id),
+            business_memory=await get_business_memory(conversation_id, user_id),
         )
         tools = build_cart_tools(self.client, request_context)
         agent = create_react_agent(

@@ -37,8 +37,18 @@ def build_knowledge_context(results: List[SearchResult]) -> str:
 
 
 class Retriever:
+    """RAG 检索器。vector_store 懒加载，避免 __init__ 时就连 Milvus。"""
+
     def __init__(self, vector_store=None):
-        self.vector_store = vector_store or create_vector_store()
+        # 只保留调用方传入的实例，不立刻 create_vector_store()。
+        # 真正的 Milvus 连接推迟到 self.vector_store 属性首次被访问时。
+        self._vector_store = vector_store
+
+    @property
+    def vector_store(self):
+        if self._vector_store is None:
+            self._vector_store = create_vector_store()
+        return self._vector_store
 
     def retrieve(self, plan: RetrievalPlan) -> RetrievalOutput:
         metadata_filter = build_metadata_filter(plan)
@@ -63,4 +73,16 @@ class Retriever:
         )
 
 
-retriever = Retriever()
+# 懒加载单例：模块 import 时不去连 Milvus，避免 Milvus 挂了整个服务起不来。
+# 第一次调用 get_retriever() 才真正建 Retriever + 连 Milvus。
+# 若 Milvus 抖动，也只影响 knowledge agent，不会拖垮 shopping/chitchat。
+_retriever_instance: Retriever | None = None
+
+
+def get_retriever() -> Retriever:
+    """懒获取 Retriever 单例。首次调用触发 Milvus 连接。"""
+    global _retriever_instance
+    if _retriever_instance is None:
+        _retriever_instance = Retriever()
+    return _retriever_instance
+

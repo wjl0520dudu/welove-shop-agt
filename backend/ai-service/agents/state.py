@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Annotated, Any, NotRequired, TypedDict
 from langchain_core.messages import AnyMessage
+from langchain.agents import AgentState
 from langgraph.graph import add_messages
 
 
@@ -37,3 +38,14 @@ class AssistantState(TypedDict):
     error_code: NotRequired[str]
     message: NotRequired[str]
     business_memory: NotRequired[dict[str, Any]]
+
+
+class ShoppingAgentState(AgentState):
+    """ShoppingAgent 内部 state：继承 create_agent 的 AgentState（含 messages），
+    额外携带 conversation_id / user_id 给 ToolRuntime 里的工具读取。
+
+    工具通过 `runtime.state["conversation_id"]` 拿到当前上下文，无需闭包捕获。
+    对应教程 05 的模式。
+    """
+    conversation_id: NotRequired[str]
+    user_id: NotRequired[int | str]

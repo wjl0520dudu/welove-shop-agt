@@ -9,7 +9,7 @@ from langgraph.graph import END, START, StateGraph
 from agents.schemas import IntentDecision
 from agents.prompts import ROUTER_PROMPT
 from agents.state import AssistantState
-from agents.runtime import checkpointer
+from agents import runtime as _runtime  # 用模块引用，运行时动态读 checkpointer/store
 from assistant.nodes import make_nodes
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
@@ -55,7 +55,8 @@ class AssistantGraph:
         for n in ("shopping", "knowledge", "chitchat", "unknown"):
             g.add_edge(n, "format_response")
         g.add_edge("format_response", END)
-        return g.compile(checkpointer=checkpointer)
+        # 从 runtime 模块动态读，确保拿到的是 init_runtime() 覆盖后的实例
+        return g.compile(checkpointer=_runtime.checkpointer, store=_runtime.store)
 
     async def _route(self, state: AssistantState) -> dict:
         question = state.get("question")

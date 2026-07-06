@@ -12,7 +12,7 @@ from langchain_core.tools import tool
 from agents.schemas import KnowledgeResult
 from agents.prompts import KNOWLEDGE_PROMPT
 from rag.models import RetrievalPlan
-from rag.retriever import Retriever
+from rag.retriever import get_retriever
 
 
 @tool
@@ -24,8 +24,7 @@ def search_knowledge(query: str) -> dict:
     3. 如果一次检索不够，可以用不同的查询词再次检索
     """
     plan = RetrievalPlan(query=query, top_k=5, search_mode="hybrid")
-    retriever = Retriever()
-    output = retriever.retrieve(plan)
+    output = get_retriever().retrieve(plan)
     return {
         "knowledge_context": output.knowledge_context,
         "sources": [{"title": s.doc, "score": round(s.score, 3)} for s in output.sources],

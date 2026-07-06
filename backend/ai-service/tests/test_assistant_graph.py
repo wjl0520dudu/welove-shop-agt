@@ -1,7 +1,13 @@
 import asyncio
 from agents.schemas import IntentDecision
-from agents.memory import clear_business_memory, remember_product_cards, get_business_memory
+from agents.memory import remember_product_cards, get_business_memory
 from assistant.graph import AssistantGraph
+
+
+def clear_business_memory():
+    """老测试遗留的钩子，现在业务记忆按 conversation_id 隔离，测试用不同 cid 即可，
+    这里保留空实现避免 import 失败。"""
+    pass
 
 
 class FakeShoppingAgent:
@@ -99,7 +105,7 @@ def test_business_memory_shared_across_turns(monkeypatch):
         shopping = FakeShoppingAgent()
         graph = AssistantGraph(llm=object(), shopping_agent=shopping, knowledge_agent=FakeKnowledgeAgent())
         await graph.run(question="推荐一款防晒", conversation_id="c-mem", user_id=42)
-        mem = get_business_memory("c-mem", 42)
+        mem = await get_business_memory("c-mem", 42)
         assert mem.get("last_product_cards")
         assert mem["last_product_cards"][0]["product_id"] == 7
         shopping.calls.clear()

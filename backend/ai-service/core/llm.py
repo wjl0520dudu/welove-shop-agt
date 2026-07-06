@@ -15,6 +15,11 @@ def get_llm():
     )
 
 
-llm = get_llm()
-response = llm.invoke("翻译如下的汉字：你好世界")
-print(response)
+def get_embeddings_model():
+    """返回 OpenAIEmbeddings 实例，用于向量嵌入。"""
+    from langchain_openai import OpenAIEmbeddings
+    return OpenAIEmbeddings(
+        model=config.EMBEDDING_MODEL,
+        base_url=config.OPENAI_BASE_URL,
+        api_key=config.OPENAI_API_KEY,
+    )

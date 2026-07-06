@@ -7,3 +7,7 @@
 /backend/docs/
 /backend/src/main/resources/application-dev.yml
 /backend/src/main/java/com/demo/weloveShopSystem/controller/TestController.java
+/backend/volumes/
+__pycache__/
+*.py[cod]
+*$py.class
