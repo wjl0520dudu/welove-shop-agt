@@ -25,7 +25,9 @@ class Config:
     MILVUS_URL = os.getenv("MILVUS_URL", "http://127.0.0.1:19530")
     MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "my_rag_collection")
 
-    # 4.MySQL 配置，用于导购推荐查询真实商品数据
+    # 4.MySQL 配置（历史遗留）
+    # ai-service 主库已迁移到 PostgreSQL。这里保留仅供 sync_mysql_to_pg.py 从 MySQL 拉数据到 PG。
+    # Java 那边完成迁移后可以彻底删除。
     DB_HOST = os.getenv("DB_HOST", "localhost")
     DB_PORT = int(os.getenv("DB_PORT", "3306"))
     DB_NAME = os.getenv("DB_NAME", "welove_shop_db")
@@ -33,12 +35,20 @@ class Config:
     DB_PASSWORD = os.getenv("DB_PASSWORD", "")
     DB_CHARSET = os.getenv("DB_CHARSET", "utf8mb4")
 
-    # 5.pgvector 配置，用于商品向量语义检索
+    # 5.PostgreSQL 共用配置（一个实例，两个库）
     PG_HOST = os.getenv("PG_HOST", "localhost")
     PG_PORT = int(os.getenv("PG_PORT", "5432"))
-    PG_NAME = os.getenv("PG_NAME", "welove_shop_search")
     PG_USER = os.getenv("PG_USER", "root")
     PG_PASSWORD = os.getenv("PG_PASSWORD", "")
+
+    # 5a. pgvector + langgraph 记忆库（商品向量、checkpointer、store）
+    # 保留 PG_NAME 作为向后兼容别名 —— 老代码可能直接用它。
+    PG_LANGGRAPH_DB = os.getenv("PG_LANGGRAPH_DB", os.getenv("PG_NAME", "welove_shop_search"))
+    PG_NAME = PG_LANGGRAPH_DB  # 别名，保持兼容
+
+    # 5b. 业务主库（商品、用户、购物车等，从 MySQL 迁过来）
+    # Java 完成迁移后也接这个库。
+    PG_BUSINESS_DB = os.getenv("PG_BUSINESS_DB", "welove_shop_db")
 
 
 config = Config()
