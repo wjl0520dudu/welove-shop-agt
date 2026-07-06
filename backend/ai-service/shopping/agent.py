@@ -14,11 +14,21 @@ from agents.memory import get_business_memory
 from agents.prompts import SHOPPING_AGENT_PROMPT
 from agents.schemas import ShoppingResult
 from agents.state import ShoppingAgentState
+from agents.middleware import (
+    PreferenceLearningMiddleware,
+    build_summarization_middleware,
+)
 from tools.shopping_tools import SHOPPING_TOOLS
 from tools.user_tools import USER_TOOLS
 
 # ShoppingAgent 使用的全部工具：商品搜索/详情/对比 + 用户维度（收藏/浏览/订单）
 _ALL_TOOLS = SHOPPING_TOOLS + USER_TOOLS
+
+# ShoppingAgent 专用 middleware：长对话压缩 + 偏好学习
+_SHOPPING_MIDDLEWARE = [
+    build_summarization_middleware(),
+    PreferenceLearningMiddleware(),
+]
 
 logger = logging.getLogger("ai-service.shopping.agent")
 
@@ -145,6 +155,7 @@ class ShoppingAgent:
             system_prompt=system_prompt,
             tools=_ALL_TOOLS,
             state_schema=ShoppingAgentState,
+            middleware=_SHOPPING_MIDDLEWARE,
             response_format=ToolStrategy(ShoppingResult),
         )
 

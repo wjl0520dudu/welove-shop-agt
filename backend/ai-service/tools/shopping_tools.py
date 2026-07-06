@@ -13,15 +13,19 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import List, Optional
 
+from cachetools import TTLCache
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
+from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 
 from agents.memory import remember_focused_product, remember_product_cards
 from core.database import get_session_factory
+from core.llm import get_llm
 from shopping.models import ShoppingIntent
 from shopping.orm_models import ProductORM
 
@@ -54,6 +58,88 @@ def _get_repository():
         from shopping.product_repository import ProductRepository
         _product_repository = ProductRepository()
     return _product_repository
+
+
+# ---- 商品特征抽取（compare_products 深度对比用）--------------------------
+
+class ProductFeatures(BaseModel):
+    """LLM 从商品文本中抽取的标准化特征。"""
+    core_ingredients: List[str] = Field(default_factory=list, description="核心成分列表，如['烟酰胺','透明质酸']")
+    concentration: str = Field(default="", description="浓度描述，如'10%'、'高浓度'、'未标明'")
+    suitable_skin: List[str] = Field(default_factory=list, description="适合肤质，如['油皮','混油']")
+    key_benefits: List[str] = Field(default_factory=list, description="主打功效，如['控油','淡化毛孔','提亮']")
+    texture: str = Field(default="", description="质地/使用感，如'清透水润'、'滋润厚重'")
+    cautions: List[str] = Field(default_factory=list, description="注意事项/禁忌，如['敏感肌先测试','含酒精']")
+
+
+# 商品特征缓存：product_id → ProductFeatures，30 分钟 TTL，最多 200 条
+_feature_cache: TTLCache = TTLCache(maxsize=200, ttl=1800)
+
+_EXTRACT_FEATURES_PROMPT = """从以下商品信息中提取标准化特征，用 JSON 格式返回：
+
+商品标题：{title}
+品牌：{brand}
+品类：{category}
+描述：{description}
+标签：{tags}
+
+提取以下字段（找不到就填空字符串或空列表）：
+- core_ingredients: 核心成分列表
+- concentration: 浓度描述
+- suitable_skin: 适合肤质列表
+- key_benefits: 主打功效列表
+- texture: 质地/使用感
+- cautions: 注意事项/禁忌
+
+只返回 JSON，不要额外文字。"""
+
+
+async def _extract_product_features(products: List[dict]) -> dict[int, ProductFeatures]:
+    """批量抽取商品特征，用 TTLCache 缓存结果。"""
+    llm = get_llm()
+    structured_llm = llm.with_structured_output(ProductFeatures) if llm else None
+
+    result: dict[int, ProductFeatures] = {}
+    uncached: list[dict] = []
+
+    # 先查缓存
+    for p in products:
+        pid = p.get("product_id") or p.get("id")
+        if pid is None:
+            continue
+        pid = int(pid)
+        if pid in _feature_cache:
+            result[pid] = _feature_cache[pid]
+        else:
+            uncached.append(p)
+
+    if not uncached or structured_llm is None:
+        return result
+
+    # 批量抽取未缓存的
+    for p in uncached:
+        pid = int(p.get("product_id") or p.get("id", 0))
+        if pid == 0:
+            continue
+        text = _EXTRACT_FEATURES_PROMPT.format(
+            title=p.get("title", ""),
+            brand=p.get("brand", ""),
+            category=p.get("sub_category", p.get("category", "")),
+            description=(p.get("description") or "")[:800],
+            tags=p.get("tags", ""),
+        )
+        try:
+            features = await structured_llm.ainvoke(text)
+            _feature_cache[pid] = features
+            result[pid] = features
+        except Exception:
+            logger.warning("商品特征抽取失败 pid=%d", pid, exc_info=True)
+            # 失败也缓存空对象，避免重复尝试
+            empty = ProductFeatures()
+            _feature_cache[pid] = empty
+            result[pid] = empty
+
+    return result
 
 
 # ---- 内部 helper ---------------------------------------------------------
@@ -291,24 +377,60 @@ async def build_product_cards(
 
 @tool(parse_docstring=True)
 async def compare_products(products: List[dict]) -> dict:
-    """Compare products using factual fields already returned by tools.
+    """Compare products with deep feature extraction (ingredients, skin type, benefits).
+
+    Internally calls an LLM to extract standardized features from each product's
+    title/description/tags, then builds a multi-dimensional comparison table.
 
     Args:
-        products: Products to compare.
+        products: Products to compare (usually from search_products results).
     """
-    comparisons = []
-    for item in products or []:
-        comparisons.append(
-            {
-                "product_id": item.get("product_id") or item.get("id"),
-                "title": item.get("title") or "",
-                "price": item.get("price") or item.get("base_price"),
-                "rating": item.get("rating"),
-                "sales_count": item.get("sales_count"),
-                "reason": item.get("reason") or "",
-            }
-        )
-    return {"task_type": "shopping", "comparisons": comparisons, "count": len(comparisons)}
+    items = products or []
+    if not items:
+        return {"task_type": "shopping", "comparisons": [], "count": 0,
+                "dimensions": [], "message": "没有要对比的商品。"}
+
+    # 基础字段对比
+    basic_comparisons = []
+    for item in items:
+        basic_comparisons.append({
+            "product_id": item.get("product_id") or item.get("id"),
+            "title": item.get("title") or "",
+            "price": item.get("price") or item.get("base_price"),
+            "rating": item.get("rating"),
+            "sales_count": item.get("sales_count"),
+        })
+
+    # 深度特征抽取
+    features = await _extract_product_features(items)
+
+    # 组装多维对比
+    dimensions = ["价格", "评分", "销量", "核心成分", "浓度", "适合肤质", "主打功效", "质地/使用感", "注意事项"]
+    deep_comparisons = []
+    for item in items:
+        pid = int(item.get("product_id") or item.get("id", 0))
+        f = features.get(pid, ProductFeatures())
+        deep_comparisons.append({
+            "product_id": pid,
+            "title": item.get("title") or "",
+            "price": item.get("price") or item.get("base_price"),
+            "rating": item.get("rating"),
+            "sales_count": item.get("sales_count"),
+            "core_ingredients": f.core_ingredients,
+            "concentration": f.concentration,
+            "suitable_skin": f.suitable_skin,
+            "key_benefits": f.key_benefits,
+            "texture": f.texture,
+            "cautions": f.cautions,
+        })
+
+    return {
+        "task_type": "shopping",
+        "comparisons": deep_comparisons,
+        "basic_comparisons": basic_comparisons,
+        "count": len(deep_comparisons),
+        "dimensions": dimensions,
+    }
 
 
 # ---- 模块级工具列表 -------------------------------------------------------

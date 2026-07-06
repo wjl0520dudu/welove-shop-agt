@@ -10,6 +10,7 @@ from langchain.agents.structured_output import ToolStrategy
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.tools import tool
 
+from agents.middleware import build_summarization_middleware
 from agents.schemas import KnowledgeResult
 from agents.prompts import KNOWLEDGE_PROMPT
 from rag.models import RetrievalPlan
@@ -74,6 +75,7 @@ class KnowledgeAgent:
                 checkpointer=_knowledge_checkpointer,
                 system_prompt=KNOWLEDGE_PROMPT,
                 tools=[search_knowledge],
+                middleware=[build_summarization_middleware()],
                 response_format=ToolStrategy(KnowledgeResult),
             )
         return self._agent

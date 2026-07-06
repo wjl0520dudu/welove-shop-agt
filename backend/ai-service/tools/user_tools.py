@@ -187,9 +187,65 @@ async def get_order_detail(runtime: ToolRuntime, order_id: int) -> dict:
     return _java_result_to_tool_output(result)
 
 
+@tool(parse_docstring=True)
+async def get_user_profile(runtime: ToolRuntime) -> dict:
+    """获取当前登录用户的个人资料（含注册时预填的偏好标签）。
+
+    用户注册时填写的 skin_type（肤质）、gender（性别）、preference_tags（偏好标签如["平价","敏感肌"]）
+    会通过 Java /api/auth/profile 返回。Agent 应在以下时机调用此工具：
+
+    1. **新对话开始时**：用户第一次在会话中开口时，先调此工具了解用户的预填偏好，
+       用于后续推荐时做个性化（参考 skin_type/gender/preference_tags）。
+    2. **用户明确要求更新偏好**：如"我其实是大油皮"，调此工具确认当前 Profile，
+       然后结合对话上下文更新。
+
+    与 remember_user_preferences 的关系：
+    - get_user_profile → 从 Java 读注册预填偏好（静态画像）
+    - remember_user_preferences → 写 Store 记录对话中学习到的偏好（动态画像）
+    get_business_memory 会合并两处，让 agent 拿到统一视图。
+
+    Args:
+        runtime: 工具运行时（自动注入）。从 runtime.state 拿 jwt_token。
+
+    Returns:
+        dict: {"error": bool, "data": {id, username, phone, gender, skinType, preferenceTags, ...} | None}
+              未登录时 error_code = "LOGIN_REQUIRED"
+    """
+    jwt = _jwt_from_runtime(runtime)
+    if not jwt:
+        return _needs_login_result()
+    result = await get_java_api_client().get("/api/auth/profile", jwt_token=jwt)
+    if result.success and result.data:
+        # 自动同步用户预填偏好到 Store，后续 get_business_memory 能读到
+        profile = result.data
+        prefs_to_sync = {}
+        skin_type = profile.get("skinType") or profile.get("skin_type")
+        if skin_type:
+            prefs_to_sync["skin_type"] = skin_type
+        gender = profile.get("gender")
+        if gender is not None:
+            prefs_to_sync["gender"] = "女" if gender == 2 else ("男" if gender == 1 else "未设置")
+        tags = profile.get("preferenceTags") or profile.get("preference_tags")
+        if tags:
+            if isinstance(tags, str):
+                import json
+                try:
+                    tags = json.loads(tags)
+                except (json.JSONDecodeError, TypeError):
+                    tags = [tags]
+            prefs_to_sync["preference_tags"] = tags
+        if prefs_to_sync:
+            from agents.memory import remember_user_preferences
+            user_id = runtime.state.get("user_id") if runtime.state else None
+            cid = runtime.state.get("conversation_id") if runtime.state else None
+            await remember_user_preferences(cid, user_id, prefs_to_sync)
+    return _java_result_to_tool_output(result)
+
+
 # ---- 工具集合 -------------------------------------------------------------
 
 USER_TOOLS: list = [
+    get_user_profile,
     get_user_favorites,
     get_user_browse_history,
     get_user_orders,

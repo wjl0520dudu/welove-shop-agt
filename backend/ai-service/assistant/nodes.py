@@ -37,10 +37,12 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
 
     def _get_chitchat_agent():
         if _chitchat_holder["agent"] is None:
+            from agents.middleware import build_summarization_middleware
             _chitchat_holder["agent"] = create_agent(
                 model=llm,
                 checkpointer=_chitchat_checkpointer,
                 system_prompt=CHITCHAT_PROMPT,
+                middleware=[build_summarization_middleware()],
                 response_format=ToolStrategy(ChitchatResult),
             )
         return _chitchat_holder["agent"]
