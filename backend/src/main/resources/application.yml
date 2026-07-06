@@ -8,10 +8,15 @@ spring:
   application:
     name: weloveShopAgt
   datasource:
-    driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:welove_shop_db}?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
-    username: ${DB_USER:root}
-    password: ${DB_PASSWORD:123456}
+    # 业务主库从 MySQL 迁移到 PostgreSQL（同一个 postgres 实例的 welove_shop_db）。
+    # stringtype=unspecified: MyBatis-Plus 写 JSON 字段 → PG JSONB 时避免"column is of type jsonb but expression is of type character varying"。
+    # 如需回退 MySQL：
+    #   driver-class-name: com.mysql.cj.jdbc.Driver
+    #   url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:welove_shop_db}?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+    driver-class-name: org.postgresql.Driver
+    url: jdbc:postgresql://${PG_HOST:localhost}:${PG_PORT:5432}/${PG_BUSINESS_DB:welove_shop_db}?stringtype=unspecified
+    username: ${PG_USER:root}
+    password: ${PG_PASSWORD:12345678}
   http:
     encoding:
       charset: UTF-8

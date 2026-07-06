@@ -48,6 +48,13 @@
             <artifactId>mysql-connector-j</artifactId>
             <scope>runtime</scope>
         </dependency>
+        <!-- PostgreSQL JDBC 驱动。业务库从 MySQL 迁移到 PG 后主用这个；
+             MySQL 驱动暂时保留以支持回退（灰度期）。彻底稳定后可删除 mysql-connector-j。 -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>

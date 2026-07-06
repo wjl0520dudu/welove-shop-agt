@@ -9,9 +9,12 @@ import java.time.LocalDateTime;
 
 /**
  * 订单主表实体。
+ * <p>
+ * 表名从 `order` 改为 `orders`：`order` 是 SQL 标准保留字（PG/MySQL 都需要引号转义，
+ * 语法互不兼容）。统一改成 `orders` 避免方言引号冲突。MySQL 和 PG 两侧都已 rename table。
  */
 @Data
-@TableName("`order`")
+@TableName("orders")
 public class Order {
     /** 订单 ID。 */
     @TableId(type = IdType.AUTO)

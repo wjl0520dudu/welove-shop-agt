@@ -11,9 +11,13 @@ import java.util.List;
 
 /**
  * 普通用户实体。
+ * <p>
+ * 表名从 `user` 改为 `users`：`user` 是 PostgreSQL 里的保留字（等价于 CURRENT_USER 函数），
+ * 直接用会被解析成当前会话用户名而非表。为兼容 PG，统一改表名为 `users`。
+ * MySQL 端也已 rename table。
  */
 @Data
-@TableName(value = "user", autoResultMap = true)
+@TableName(value = "users", autoResultMap = true)
 public class User {
     /** 用户 ID。 */
     @TableId(type = IdType.AUTO)
