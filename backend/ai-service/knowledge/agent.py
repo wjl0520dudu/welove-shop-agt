@@ -4,6 +4,7 @@ import hashlib
 from uuid import uuid4
 from typing import List
 
+from cachetools import TTLCache
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 from langgraph.checkpoint.memory import InMemorySaver
@@ -37,9 +38,15 @@ def search_knowledge(query: str) -> dict:
 # 如果用共享 checkpointer + 同一 thread_id，tool_call 消息会混入下一轮
 _knowledge_checkpointer = InMemorySaver()
 
-# 对话级知识缓存：key 为 question 的 hash，value 为 run() 返回结果
-# 同一问题在同一会话中不必重复 RAG
-_knowledge_cache: dict = {}
+# 对话级知识缓存：key = f"{conversation_id}:{md5(question)}"，value = run() 返回结果。
+# 同一问题在同一会话中不必重复 RAG。
+#
+# 用 TTLCache 而非普通 dict：
+#   - maxsize=1024：单进程最多 1024 条，超出 LRU 淘汰
+#   - ttl=1800（30 分钟）：条目自动过期，避免长时间运行内存膨胀
+# 多 worker 部署时每个 worker 有独立缓存，命中率分摊但不影响正确性。
+# 如果未来需要跨进程共享，把这个 cache 挪到 PostgresStore 里即可。
+_knowledge_cache: TTLCache = TTLCache(maxsize=1024, ttl=1800)
 
 
 class KnowledgeAgent:

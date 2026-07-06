@@ -11,7 +11,6 @@ from fastapi import FastAPI
 
 from agents.runtime import init_runtime, close_runtime
 from api.assistant_routes import router as assistant_router
-from api.shopping_routes import router as shopping_router
 
 
 @asynccontextmanager
@@ -29,7 +28,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ai-service", lifespan=lifespan)
 app.include_router(assistant_router)
-app.include_router(shopping_router)
 
 # RAG 路由依赖 pymilvus；缺依赖时降级跳过，保证 assistant 主图始终可用。
 try:
