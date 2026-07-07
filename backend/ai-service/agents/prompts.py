@@ -127,6 +127,14 @@ SHOPPING_AGENT_PROMPT = """
 
 ## 结构化输出
 每次回答必须以结构化 JSON 形式输出：answer（推荐话术）、product_cards（商品卡片列表）、need_followup（是否需要追问）、followup_question（追问问题）、confidence（置信度）。
+
+## ⚠️【重要】product_cards 字段不要重抄工具输出
+系统会自动把搜索工具返回的商品填入 `product_cards`，**你不需要在 product_cards 里再列一遍完整商品信息**。
+- 只需要把 `product_cards` 填成 `[]`（空数组）即可，系统会自动兜底
+- 或者只列你**主动挑选/排序过**的 product_id 列表，例如 `[{"product_id": 21}]`
+- 关键 focus：把精力放在写好 `answer` 这段自然语言推荐话术上
+
+这样能显著减少你的输出 tokens，回答速度会更快，用户体验更好。
 """.strip()
 
 KNOWLEDGE_PROMPT = """

@@ -61,6 +61,16 @@ class Config:
     LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY", "")
     LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "welove-shop-ai")
 
+    # 8. CORS 允许来源。逗号分隔多个源；"*" 表示允许所有（仅开发/内网）。
+    # 生产环境建议明确列出前端域名（如 https://shop.welove.com,http://localhost:5173），
+    # 不建议直接开 "*"。
+    ALLOWED_ORIGINS = [
+        o.strip() for o in os.getenv(
+            "ALLOWED_ORIGINS",
+            "http://localhost:5173,http://localhost:8080,http://127.0.0.1:5173,http://127.0.0.1:8080",
+        ).split(",") if o.strip()
+    ]
+
 
 config = Config()
 logger = logging.getLogger("ai-service")

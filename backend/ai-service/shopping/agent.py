@@ -18,6 +18,7 @@ from agents.middleware import (
     PreferenceLearningMiddleware,
     build_summarization_middleware,
 )
+from core.errors import ErrorCode
 from tools.shopping_tools import SHOPPING_TOOLS
 from tools.user_tools import USER_TOOLS
 from tools.reference_tools import REFERENCE_TOOLS
@@ -139,7 +140,7 @@ class ShoppingAgent:
                 "answer": "导购 Agent 暂不可用。",
                 "task_type": "shopping",
                 "error": True,
-                "error_code": "AI_LLM_NOT_CONFIGURED",
+                "error_code": ErrorCode.LLM_NOT_CONFIGURED,
             }
 
         # 从 Store 读取业务记忆（跨 shopping/cart agent 共享）
@@ -180,7 +181,7 @@ class ShoppingAgent:
                 "answer": "导购 Agent 处理失败，请稍后再试。",
                 "task_type": "shopping",
                 "error": True,
-                "error_code": "AI_SHOPPING_ERROR",
+                "error_code": ErrorCode.SHOPPING_ERROR,
                 "message": str(e),
             }
 
@@ -188,6 +189,13 @@ class ShoppingAgent:
         # 从 result.messages 里抽取实际的工具调用记录，供上层观测/调试。
         # create_agent 内部循环产生的 AIMessage.tool_calls 是 [{name, args, id}]。
         collected_tool_calls = _extract_tool_calls(result.get("messages", []))
+
+        # 从 Store 拿最新 cards（工具执行时已写入）作为兜底。
+        # 首轮性能优化的关键：搜索工具返回给 LLM 的是瘦身版（去掉 image_url 等），
+        # 完整 cards 存在 Store 里；这里读出来作为 product_cards 的兜底/主源，
+        # 避免让 LLM 再"抄"一遍完整字段（那是首轮 30-70s 的主要开销）。
+        fallback_memory = await get_business_memory(conversation_id, user_id)
+        fallback_cards = fallback_memory.get("last_product_cards") or []
 
         if structured is None:
             # fallback：从最后一条 AI 消息提取文本（部分代理不支持结构化输出时）
@@ -201,16 +209,18 @@ class ShoppingAgent:
                         break
             return {
                 "answer": answer or "暂时没能找到合适的商品，能再说详细一点吗？",
-                "product_cards": [],
+                "product_cards": fallback_cards,
                 "task_type": "shopping",
                 "sources": [],
                 "tool_calls": collected_tool_calls,
                 "error": False,
             }
 
+        # 优先用 Store 里的完整 cards（image_url/reason 齐全）；LLM 输出为兜底
+        product_cards = fallback_cards or (structured.product_cards or [])
         return {
             "answer": structured.answer,
-            "product_cards": structured.product_cards or [],
+            "product_cards": product_cards,
             "task_type": "shopping",
             "need_followup": getattr(structured, "need_followup", False),
             "followup_question": getattr(structured, "followup_question", None),

@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from agents.state import AssistantState
 from agents.schemas import ChitchatResult
 from agents.prompts import CHITCHAT_PROMPT
+from core.errors import ErrorCode
 from shopping.agent import ShoppingAgent
 from knowledge.agent import KnowledgeAgent
 
@@ -63,7 +64,7 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 "answer": "导购 Agent 暂时不可用，请稍后再试。",
                 "task_type": "shopping",
                 "error": True,
-                "error_code": "AI_SHOPPING_ERROR",
+                "error_code": ErrorCode.SHOPPING_ERROR,
                 "message": str(e),
                 "messages": [AIMessage(content="导购 Agent 暂时不可用，请稍后再试。")],
             }
@@ -96,7 +97,7 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 "answer": "知识检索暂时不可用，请稍后再试。",
                 "task_type": "knowledge",
                 "error": True,
-                "error_code": "AI_RAG_ERROR",
+                "error_code": ErrorCode.KNOWLEDGE_ERROR,
                 "message": str(e),
                 "messages": [AIMessage(content="知识检索暂时不可用，请稍后再试。")],
             }
@@ -109,7 +110,7 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 "answer": "AI 助手暂未配置，无法闲聊。",
                 "task_type": "chitchat",
                 "error": True,
-                "error_code": "AI_LLM_NOT_CONFIGURED",
+                "error_code": ErrorCode.LLM_NOT_CONFIGURED,
             }
         try:
             messages = _build_agent_messages(state)
@@ -144,7 +145,7 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 "answer": "闲聊回复失败，请稍后再试。",
                 "task_type": "chitchat",
                 "error": True,
-                "error_code": "AI_CHITCHAT_ERROR",
+                "error_code": ErrorCode.CHITCHAT_ERROR,
                 "message": str(e),
                 "messages": [AIMessage(content="闲聊回复失败，请稍后再试。")],
             }

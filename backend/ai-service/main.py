@@ -20,15 +20,24 @@ if _cfg.LANGSMITH_TRACING and _cfg.LANGSMITH_API_KEY:
     os.environ.setdefault("LANGSMITH_ENDPOINT", _cfg.LANGSMITH_ENDPOINT)
     os.environ.setdefault("LANGSMITH_API_KEY", _cfg.LANGSMITH_API_KEY)
     os.environ.setdefault("LANGSMITH_PROJECT", _cfg.LANGSMITH_PROJECT)
-    import logging
+
+# 结构化日志必须尽早配置，让 lifespan 和后续 import 阶段的日志都用统一格式
+from core.logging_config import setup_logging
+setup_logging(level=os.getenv("LOG_LEVEL", "INFO"))
+
+import logging
+if _cfg.LANGSMITH_TRACING and _cfg.LANGSMITH_API_KEY:
     logging.getLogger("ai-service").info("LangSmith tracing enabled, project=%s", _cfg.LANGSMITH_PROJECT)
 
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from agents.runtime import init_runtime, close_runtime
 from api.assistant_routes import router as assistant_router
+from api.health_routes import router as health_router
+from api.middleware import RequestLogMiddleware, TraceIdMiddleware
 
 
 @asynccontextmanager
@@ -45,20 +54,32 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ai-service", lifespan=lifespan)
+
+# ── 中间件（自内向外注册，实际执行顺序倒过来）──
+# TraceId 必须最外层：response 阶段要给所有响应都带上 X-Trace-Id header，
+# 且 request 阶段要在最早就把 traceId 塞进 contextvar，供后续所有日志用。
+app.add_middleware(RequestLogMiddleware)
+app.add_middleware(TraceIdMiddleware)
+
+# CORS：允许来源从 config 读，逗号分隔可配置。SSE 长连接必须允许 GET/POST。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cfg.ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["X-Trace-Id"],
+)
+
 app.include_router(assistant_router)
+app.include_router(health_router)
 
 # RAG 路由依赖 pymilvus；缺依赖时降级跳过，保证 assistant 主图始终可用。
 try:
     from api.rag_routes import router as rag_router
     app.include_router(rag_router)
 except Exception as _rag_import_error:  # pragma: no cover
-    import logging
     logging.getLogger("ai-service").warning("RAG routes disabled: %s", _rag_import_error)
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
 
 
 import uvicorn

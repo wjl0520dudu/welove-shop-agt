@@ -170,6 +170,45 @@ def _dump_product(product: ProductORM) -> dict:
     }
 
 
+# 返回给 LLM 时的最大长度限制。description 平均占单商品 tokens 的 60%+，
+# 是首轮 shopping 慢的主要来源。截断到 220 字符（≈100-140 中文 tokens）
+# 既让 LLM 能看到主打卖点，又不至于把整个 detail 全塞进 LLM 上下文。
+# 如果 LLM 需要完整信息，让它调 get_product_detail 二次拉取。
+_DESC_MAX_LEN = 220
+
+
+def _slim_for_llm(products: list[dict]) -> list[dict]:
+    """把商品列表压缩成"给 LLM 看"的最小充分表示。
+
+    首轮 shopping 慢的主因：search 返回的 20-30 个商品 JSON 里每个都带完整
+    description + tags，输入 tokens 爆炸 → LLM 又要把这堆东西消化一遍再输出
+    结构化 product_cards（等于重抄一遍）。
+
+    这里做两件事：
+    1. description 截断到 220 字符
+    2. 去掉 review_count / image_url 这类 LLM 决策不需要的字段
+       （反正 product_cards 由系统兜底填充，image_url 从 Store 里拿）
+    """
+    slim = []
+    for p in products or []:
+        desc = (p.get("description") or "")
+        if len(desc) > _DESC_MAX_LEN:
+            desc = desc[:_DESC_MAX_LEN] + "…"
+        slim.append({
+            "product_id": p.get("product_id") or p.get("id"),
+            "title": p.get("title", ""),
+            "brand": p.get("brand", ""),
+            "price": p.get("price") or p.get("base_price"),
+            "rating": p.get("rating"),
+            "sales_count": p.get("sales_count"),
+            "sub_category": p.get("sub_category", ""),
+            "tags": p.get("tags", ""),
+            "description_preview": desc,
+            "reason": p.get("reason", ""),
+        })
+    return slim
+
+
 def _java_product_to_dict(java_product: dict) -> dict:
     """将 Java Product（camelCase）映射为 Python 侧统一 dict（snake_case）。
 
@@ -317,7 +356,9 @@ async def search_products(
 
     if results:
         await remember_product_cards(conversation_id, user_id, _cards_from_products(results))
-    return results
+    # 返回给 LLM 的是瘦身版：只保留决策必需字段，description 截断
+    # 完整 cards 已经写进 Store，shopping_node 会在结束时用它兜底 product_cards
+    return _slim_for_llm(results)
 
 
 @tool(parse_docstring=True)
@@ -353,7 +394,7 @@ async def search_products_by_name(
             if results:
                 await remember_product_cards(conversation_id, user_id, _cards_from_products(results))
                 await remember_focused_product(conversation_id, user_id, _cards_from_products(results, limit=1)[0])
-            return results
+            return _slim_for_llm(results)
         # Java 返回空列表也算正常（success=True, data=[] 或 null）
         if result.success:
             return []
@@ -388,7 +429,7 @@ async def search_products_by_name(
     if results:
         await remember_product_cards(conversation_id, user_id, _cards_from_products(results))
         await remember_focused_product(conversation_id, user_id, _cards_from_products(results, limit=1)[0])
-    return results
+    return _slim_for_llm(results)
 
 
 @tool(parse_docstring=True)
