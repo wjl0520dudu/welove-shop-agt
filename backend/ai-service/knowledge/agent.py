@@ -70,12 +70,23 @@ class KnowledgeAgent:
 
     def _get_agent(self):
         if self._agent is None:
+            from langchain.agents.middleware.tool_call_limit import ToolCallLimitMiddleware
             self._agent = create_agent(
                 model=self._llm,
                 checkpointer=_knowledge_checkpointer,
                 system_prompt=KNOWLEDGE_PROMPT,
                 tools=[search_knowledge],
-                middleware=[build_summarization_middleware()],
+                middleware=[
+                    build_summarization_middleware(),
+                    # 防死循环：search_knowledge 单轮最多 2 次；有些模型（qwen-plus）
+                    # 拿到检索结果后不满意会不停换词再搜。超限后 agent 立即用当前
+                    # 已知信息输出结果。
+                    ToolCallLimitMiddleware(
+                        tool_name="search_knowledge",
+                        run_limit=2,
+                        exit_behavior="end",
+                    ),
+                ],
                 response_format=ToolStrategy(KnowledgeResult),
             )
         return self._agent
@@ -116,9 +127,13 @@ class KnowledgeAgent:
             return _knowledge_cache[cache_key]
 
         # 每次调用使用唯一 thread_id，确保不受内部 tool_call 消息污染
+        # recursion_limit=8：正常 2-3 步（1 次 search + 1 次输出），8 是硬防死循环
         result = await self._get_agent().ainvoke(
             {"messages": messages},
-            config={"configurable": {"thread_id": str(uuid4())}},
+            config={
+                "configurable": {"thread_id": str(uuid4())},
+                "recursion_limit": 8,
+            },
         )
 
         structured = result.get("structured_response")

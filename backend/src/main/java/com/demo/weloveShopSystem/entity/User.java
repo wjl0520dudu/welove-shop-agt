@@ -13,7 +13,7 @@ import java.util.List;
  * 普通用户实体。
  */
 @Data
-@TableName(value = "user", autoResultMap = true)
+@TableName(value = "users", autoResultMap = true)
 public class User {
     /** 用户 ID。 */
     @TableId(type = IdType.AUTO)

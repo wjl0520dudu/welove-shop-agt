@@ -115,9 +115,13 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         try:
             messages = _build_agent_messages(state)
             agent = _get_chitchat_agent()
+            # recursion_limit=5：chitchat 正常 1-2 步就出结果，5 步防死循环
             result = await agent.ainvoke(
                 {"messages": messages},
-                config={"configurable": {"thread_id": str(uuid4())}},
+                config={
+                    "configurable": {"thread_id": str(uuid4())},
+                    "recursion_limit": 5,
+                },
             )
             structured = result.get("structured_response")
             if structured is not None:

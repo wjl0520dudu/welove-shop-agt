@@ -11,7 +11,7 @@ import java.time.LocalDateTime;
  * 订单主表实体。
  */
 @Data
-@TableName("`order`")
+@TableName("orders")
 public class Order {
     /** 订单 ID。 */
     @TableId(type = IdType.AUTO)

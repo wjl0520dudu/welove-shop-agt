@@ -26,10 +26,16 @@ from tools.reference_tools import REFERENCE_TOOLS
 # ShoppingAgent 使用的全部工具：商品搜索/详情/对比 + 用户维度（收藏/浏览/订单）+ 指代消解
 _ALL_TOOLS = SHOPPING_TOOLS + USER_TOOLS + REFERENCE_TOOLS
 
-# ShoppingAgent 专用 middleware：长对话压缩 + 偏好学习
+# ShoppingAgent 专用 middleware：长对话压缩。
+#
+# ⚠️ PreferenceLearningMiddleware 暂时禁用：after_model 每次 LLM 调用都触发，
+#    如果 LLM 陷入 tool-call 循环（比如 44 次调用），偏好抽取也跟着 44 次，
+#    每次一次额外 LLM 调用 = 灾难性放大。
+#    后续要重新开的话，要加节流（每 conversation_id 只跑 1 次）+ 从 after_agent
+#    钩子而不是 after_model，见 langchain.agents.middleware。
 _SHOPPING_MIDDLEWARE = [
     build_summarization_middleware(),
-    PreferenceLearningMiddleware(),
+    # PreferenceLearningMiddleware(),  # 暂时关闭，见上方注释
 ]
 
 logger = logging.getLogger("ai-service.shopping.agent")
@@ -166,6 +172,11 @@ class ShoppingAgent:
         try:
             # 关键点：把 conversation_id / user_id / jwt_token 塞进 state，
             # 让工具通过 ToolRuntime.state 读取（jwt_token 用于 user_tools 调 Java）
+            #
+            # ⚠️ recursion_limit=15：防死循环硬顶。
+            # create_agent 内部把 recursion_limit 硬编码成 9999（factory.py:1780），
+            # 遇到"LLM 不知道什么时候算完成"的 case 会疯狂调工具。
+            # 15 步足够 3-4 轮 tool_call + 1 次结构化输出，超过就强制退出。
             result = await agent.ainvoke(
                 {
                     "messages": agent_messages,
@@ -173,12 +184,30 @@ class ShoppingAgent:
                     "user_id": user_id,
                     "jwt_token": jwt_token,
                 },
-                config={"configurable": {"thread_id": str(uuid4())}},
+                config={
+                    "configurable": {"thread_id": str(uuid4())},
+                    "recursion_limit": 15,
+                },
             )
         except Exception as e:
+            # GraphRecursionError 也走这里 —— 循环到顶时能优雅回退，
+            # 通常此时 Store 里已经有 last_product_cards（工具至少调成功一次），
+            # 后面的 fallback_cards 兜底就派上用场了。
             logger.exception("ShoppingAgent ainvoke failed")
+            # 尝试从 Store 兜底商品卡（可能循环了几轮工具已经写进 Store 了）
+            try:
+                fallback_memory = await get_business_memory(conversation_id, user_id)
+                fallback_cards = fallback_memory.get("last_product_cards") or []
+            except Exception:  # noqa: BLE001
+                fallback_cards = []
             return {
-                "answer": "导购 Agent 处理失败，请稍后再试。",
+                "answer": (
+                    "我已经为你找到了几款商品，但整理推荐语时遇到点问题。"
+                    "你可以直接看下面的商品卡片，或者告诉我更具体的偏好我再帮你精选。"
+                    if fallback_cards
+                    else "导购 Agent 处理失败，请稍后再试。"
+                ),
+                "product_cards": fallback_cards,
                 "task_type": "shopping",
                 "error": True,
                 "error_code": ErrorCode.SHOPPING_ERROR,

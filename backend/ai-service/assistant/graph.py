@@ -96,9 +96,13 @@ class AssistantGraph:
 
         # 使用独立 checkpointer + 唯一 thread_id，确保每次路由调用都从干净状态开始
         # 避免 router 自己上轮的 tool_call 消息污染本次分类。
+        # recursion_limit=5：Router 正常 1-2 步就能出结果，5 步是硬防死循环
         decision = await self._router.ainvoke(
             {"messages": router_messages},
-            config={"configurable": {"thread_id": str(uuid4())}},
+            config={
+                "configurable": {"thread_id": str(uuid4())},
+                "recursion_limit": 5,
+            },
         )
         structured = decision.get("structured_response")
         if structured is None:

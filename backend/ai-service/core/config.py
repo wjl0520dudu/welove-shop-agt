@@ -51,8 +51,10 @@ class Config:
     PG_BUSINESS_DB = os.getenv("PG_BUSINESS_DB", "welove_shop_db")
 
     # 6. Java 后端服务地址（Python agent 通过 HTTP 调 Java 拿业务数据：收藏/浏览/订单）
+    # ⚠️ 超时默认 2s：Java 挂了时快速失败，走 PG ORM 降级路径，避免每个工具调用卡 10s。
+    # 如果生产 Java 响应本身就慢，可通过 env 拉到 5-10s。
     JAVA_API_BASE_URL = os.getenv("JAVA_API_BASE_URL", "http://localhost:8888")
-    JAVA_API_TIMEOUT_SECONDS = float(os.getenv("JAVA_API_TIMEOUT_SECONDS", "10"))
+    JAVA_API_TIMEOUT_SECONDS = float(os.getenv("JAVA_API_TIMEOUT_SECONDS", "2"))
 
     # 7. LangSmith tracing（可观测性）
     # LANGSMITH_TRACING=true 开启后 LangChain 自动上报所有 invoke/ainvoke/astream 到 LangSmith

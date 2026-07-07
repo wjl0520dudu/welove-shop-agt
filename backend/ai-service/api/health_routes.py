@@ -106,16 +106,23 @@ async def _check_postgres() -> dict:
 
 
 async def _check_java_api() -> dict:
-    """Java 后端健康：调用 /health 或首页做一次 HEAD，尽量轻。"""
+    """Java 后端健康：调用 Java 侧 /api/health/live。
+
+    路径挂在 /api/** 下，天然被 Java SecurityConfig 放行，无需 JWT。
+    Java 返回 code=200 的 Result 结构 → JavaApiResult.success=True。
+    """
     try:
         from core.java_api_client import get_java_api_client
         client = get_java_api_client()
         async with asyncio.timeout(_DEP_CHECK_TIMEOUT):
-            # Java 侧统一 /health 端点
-            result = await client.get("/health")
-        # Java 返回 ApiResult 结构；这里只关心 HTTP 层通了没
-        return {"ok": True, "endpoint": config.JAVA_API_BASE_URL,
-                "response_success": bool(getattr(result, "success", False))}
+            result = await client.get("/api/health/live")
+        # success 已经包含"HTTP 200 且 Java code=200"两层判断
+        ok = bool(getattr(result, "success", False))
+        return {
+            "ok": ok,
+            "endpoint": config.JAVA_API_BASE_URL,
+            "status": (result.data.get("status") if ok and isinstance(result.data, dict) else None),
+        }
     except asyncio.TimeoutError:
         return {"ok": False, "error": f"timeout > {_DEP_CHECK_TIMEOUT}s"}
     except Exception as e:  # noqa: BLE001
