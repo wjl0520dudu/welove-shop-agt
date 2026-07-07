@@ -25,6 +25,7 @@ from sqlalchemy import or_, select
 
 from agents.memory import remember_focused_product, remember_product_cards
 from core.database import get_session_factory
+from core.java_api_client import get_java_api_client
 from core.llm import get_llm
 from shopping.models import ShoppingIntent
 from shopping.orm_models import ProductORM
@@ -161,6 +162,33 @@ def _dump_product(product: ProductORM) -> dict:
     }
 
 
+def _java_product_to_dict(java_product: dict) -> dict:
+    """将 Java Product（camelCase）映射为 Python 侧统一 dict（snake_case）。
+
+    Java Product 字段（来自 /api/product/search 和 /api/product/{id}）：
+      id, productCode, categoryId, title, brand, subCategory, basePrice,
+      imageUrl, description, tags, rating, reviewCount, salesCount, status
+
+    输出与 _dump_product() 格式一致，确保下游 _cards_from_products / compare_products
+    等函数无需改动。
+    """
+    price_val = java_product.get("basePrice")
+    return {
+        "product_id": int(java_product.get("id", 0)),
+        "title": java_product.get("title") or "",
+        "brand": java_product.get("brand") or "",
+        "price": float(price_val) if price_val is not None else None,
+        "base_price": float(price_val) if price_val is not None else None,
+        "image_url": java_product.get("imageUrl") or "",
+        "rating": float(java_product.get("rating", 0)) if java_product.get("rating") is not None else None,
+        "review_count": int(java_product.get("reviewCount") or 0),
+        "sales_count": int(java_product.get("salesCount") or 0),
+        "sub_category": java_product.get("subCategory") or "",
+        "tags": java_product.get("tags") or "",
+        "description": java_product.get("description") or "",
+    }
+
+
 def _cards_from_products(products: List[dict], limit: int = 3) -> list[dict]:
     cards = []
     for item in (products or [])[:limit]:
@@ -292,6 +320,9 @@ async def search_products_by_name(
 ) -> list[dict]:
     """Search real products by exact or fuzzy product name, brand, tags, or description.
 
+    Calls Java /api/product/search for keyword-based search. Falls back to direct PG
+    ORM query if Java is unreachable.
+
     Args:
         query: Product name, brand, or natural language product query.
         limit: Max number of results (default 5).
@@ -301,6 +332,32 @@ async def search_products_by_name(
     clean_query = (query or "").strip()
     if not clean_query:
         return []
+
+    # ---- 优先走 Java API ----
+    try:
+        result = await get_java_api_client().get(
+            "/api/product/search",
+            params={"keyword": clean_query, "limit": limit},
+        )
+        if result.success and result.data:
+            java_products = result.data if isinstance(result.data, list) else []
+            results = [_java_product_to_dict(p) for p in java_products]
+            if results:
+                await remember_product_cards(conversation_id, user_id, _cards_from_products(results))
+                await remember_focused_product(conversation_id, user_id, _cards_from_products(results, limit=1)[0])
+            return results
+        # Java 返回空列表也算正常（success=True, data=[] 或 null）
+        if result.success:
+            return []
+        # Java 返回失败（success=False），走降级
+        logger.warning(
+            "Java /api/product/search failed (code=%s), falling back to PG ORM",
+            result.error_code,
+        )
+    except Exception:
+        logger.warning("Java /api/product/search unreachable, falling back to PG ORM", exc_info=True)
+
+    # ---- 降级：PG ORM LIKE 查询 ----
     like = f"%{clean_query}%"
     stmt = (
         select(ProductORM)
@@ -330,17 +387,60 @@ async def search_products_by_name(
 async def get_product_detail(runtime: ToolRuntime, product_id: int) -> dict:
     """Get detailed information for one product by product_id.
 
+    Calls Java /api/product/{id} which returns product + skus + images + reviews + faqs
+    in a single response. Falls back to direct PG ORM query if Java is unreachable.
+
     Args:
         product_id: Product ID to look up.
     """
     conversation_id, user_id = _runtime_context(runtime)
 
+    # ---- 优先走 Java API ----
+    try:
+        result = await get_java_api_client().get(f"/api/product/{product_id}")
+        if result.success and result.data:
+            # Java 返回 {product: {...}, skus: [...], images: [...], reviews: [...], faqs: [...]}
+            java_data = result.data
+            java_product = java_data.get("product") if isinstance(java_data, dict) else java_data
+            if not java_product:
+                return {
+                    "error": True,
+                    "error_code": "PRODUCT_NOT_FOUND",
+                    "message": "Product not found",
+                    "product_id": product_id,
+                }
+            data = _java_product_to_dict(java_product)
+            # 附带 Java 侧额外数据（skus / images / reviews / faqs）
+            if isinstance(java_data, dict):
+                for extra_key in ("skus", "images", "reviews", "faqs"):
+                    extra_val = java_data.get(extra_key)
+                    if extra_val is not None:
+                        data[extra_key] = extra_val
+            await remember_focused_product(conversation_id, user_id, _cards_from_products([data], limit=1)[0])
+            return data
+        # Java 返回失败（success=False），走降级
+        logger.warning(
+            "Java /api/product/%s failed (code=%s), falling back to PG ORM",
+            product_id, result.error_code,
+        )
+    except Exception:
+        logger.warning(
+            "Java /api/product/%s unreachable, falling back to PG ORM",
+            product_id, exc_info=True,
+        )
+
+    # ---- 降级：PG ORM 直查 ----
     session_factory = get_session_factory()
     async with session_factory() as session:
-        result = await session.execute(select(ProductORM).where(ProductORM.id == product_id))
-        product = result.scalar_one_or_none()
+        db_result = await session.execute(select(ProductORM).where(ProductORM.id == product_id))
+        product = db_result.scalar_one_or_none()
     if not product:
-        return {"error": True, "error_code": "PRODUCT_NOT_FOUND", "message": "Product not found", "product_id": product_id}
+        return {
+            "error": True,
+            "error_code": "PRODUCT_NOT_FOUND",
+            "message": "Product not found",
+            "product_id": product_id,
+        }
     data = _dump_product(product)
     await remember_focused_product(conversation_id, user_id, _cards_from_products([data], limit=1)[0])
     return data
@@ -348,12 +448,27 @@ async def get_product_detail(runtime: ToolRuntime, product_id: int) -> dict:
 
 @tool(parse_docstring=True)
 async def list_product_skus(product_id: int) -> dict:
-    """List product SKUs. Currently not implemented in Python service.
+    """List SKUs for a product by product_id.
+
+    Calls Java /api/product/{id}/skus. Falls back to empty list if Java is unreachable.
 
     Args:
         product_id: Product ID.
     """
-    return {"product_id": product_id, "skus": [], "message": "SKU data is not available in ai-service yet."}
+    try:
+        result = await get_java_api_client().get(f"/api/product/{product_id}/skus")
+        if result.success:
+            return {"product_id": product_id, "skus": result.data or [], "message": "OK"}
+        logger.warning(
+            "Java /api/product/%s/skus failed (code=%s)",
+            product_id, result.error_code,
+        )
+    except Exception:
+        logger.warning(
+            "Java /api/product/%s/skus unreachable",
+            product_id, exc_info=True,
+        )
+    return {"product_id": product_id, "skus": [], "message": "SKU data is not available."}
 
 
 @tool(parse_docstring=True)
