@@ -20,7 +20,7 @@ from typing import List, Optional
 from cachetools import TTLCache
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import or_, select
 
 from agents.memory import remember_focused_product, remember_product_cards
@@ -71,6 +71,14 @@ class ProductFeatures(BaseModel):
     key_benefits: List[str] = Field(default_factory=list, description="主打功效，如['控油','淡化毛孔','提亮']")
     texture: str = Field(default="", description="质地/使用感，如'清透水润'、'滋润厚重'")
     cautions: List[str] = Field(default_factory=list, description="注意事项/禁忌，如['敏感肌先测试','含酒精']")
+
+    @field_validator("core_ingredients", "suitable_skin", "key_benefits", "cautions", mode="before")
+    @classmethod
+    def _coerce_empty_str_to_list(cls, v: object) -> object:
+        """LLM 有时对列表字段返回空字符串 "" 而非空列表 []，做容错转换。"""
+        if isinstance(v, str):
+            return [v] if v.strip() else []
+        return v
 
 
 # 商品特征缓存：product_id → ProductFeatures，30 分钟 TTL，最多 200 条
