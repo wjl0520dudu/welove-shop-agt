@@ -20,9 +20,10 @@ from agents.middleware import (
 )
 from tools.shopping_tools import SHOPPING_TOOLS
 from tools.user_tools import USER_TOOLS
+from tools.reference_tools import REFERENCE_TOOLS
 
-# ShoppingAgent 使用的全部工具：商品搜索/详情/对比 + 用户维度（收藏/浏览/订单）
-_ALL_TOOLS = SHOPPING_TOOLS + USER_TOOLS
+# ShoppingAgent 使用的全部工具：商品搜索/详情/对比 + 用户维度（收藏/浏览/订单）+ 指代消解
+_ALL_TOOLS = SHOPPING_TOOLS + USER_TOOLS + REFERENCE_TOOLS
 
 # ShoppingAgent 专用 middleware：长对话压缩 + 偏好学习
 _SHOPPING_MIDDLEWARE = [
@@ -184,6 +185,10 @@ class ShoppingAgent:
             }
 
         structured = result.get("structured_response")
+        # 从 result.messages 里抽取实际的工具调用记录，供上层观测/调试。
+        # create_agent 内部循环产生的 AIMessage.tool_calls 是 [{name, args, id}]。
+        collected_tool_calls = _extract_tool_calls(result.get("messages", []))
+
         if structured is None:
             # fallback：从最后一条 AI 消息提取文本（部分代理不支持结构化输出时）
             answer = ""
@@ -199,7 +204,7 @@ class ShoppingAgent:
                 "product_cards": [],
                 "task_type": "shopping",
                 "sources": [],
-                "tool_calls": [],
+                "tool_calls": collected_tool_calls,
                 "error": False,
             }
 
@@ -211,6 +216,30 @@ class ShoppingAgent:
             "followup_question": getattr(structured, "followup_question", None),
             "confidence": getattr(structured, "confidence", 0.5),
             "sources": [],
-            "tool_calls": [],
+            "tool_calls": collected_tool_calls,
             "error": False,
         }
+
+
+def _extract_tool_calls(messages: list) -> List[Dict[str, Any]]:
+    """从 create_agent 的 result["messages"] 里抽取工具调用记录。
+
+    只保留 name / args，剔除 id 等对上层无用的字段。返回顺序按调用顺序。
+    """
+    out: List[Dict[str, Any]] = []
+    for m in messages or []:
+        # AIMessage.tool_calls 属性（LangChain BaseMessage 上的标准字段）
+        tcs = getattr(m, "tool_calls", None)
+        if not tcs:
+            continue
+        for tc in tcs:
+            if isinstance(tc, dict):
+                name = tc.get("name") or ""
+                args = tc.get("args") or tc.get("arguments") or {}
+            else:
+                name = getattr(tc, "name", "") or ""
+                args = getattr(tc, "args", None) or getattr(tc, "arguments", None) or {}
+            if not name:
+                continue
+            out.append({"name": name, "args": args})
+    return out

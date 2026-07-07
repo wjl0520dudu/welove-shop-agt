@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+import logging
 from typing import Any, AsyncIterator, Dict
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from agents.memory import get_business_memory
 from agents.schemas import IntentDecision
 from agents.prompts import ROUTER_PROMPT
 from agents.state import AssistantState
@@ -14,6 +16,9 @@ from agents import runtime as _runtime  # 用模块引用，运行时动态读 c
 from assistant.nodes import make_nodes
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
+from tools.router_tools import format_business_memory_for_router
+
+logger = logging.getLogger("ai-service.assistant.graph")
 
 # 路由器专用 checkpointer，独立于主图 checkpointer，避免消息污染
 _router_checkpointer = InMemorySaver()
@@ -66,12 +71,33 @@ class AssistantGraph:
 
         # 直接传 state["messages"]（已通过主图 checkpointer 合并了历史）
         # 不要再拼接第二次 question，否则问题出现两次。
-        messages = state.get("messages") or [HumanMessage(question)]
+        history_messages = state.get("messages") or [HumanMessage(question)]
+
+        # 方案 B：把业务上下文（上轮推荐商品、当前关注商品、用户偏好）
+        # 塞进 Router 的 messages 前面，让分类看到"用户在指代什么"。
+        # 例如 "第二个多少钱" 单看这句无法分类，但看到 last_product_cards
+        # 就能判断这是 shopping 场景（追问具体商品）。
+        cid = state.get("conversation_id")
+        uid = state.get("user_id")
+        context_text = ""
+        try:
+            memory = await get_business_memory(cid, uid)
+            context_text = format_business_memory_for_router(memory)
+        except Exception:  # noqa: BLE001
+            # Store 读取失败不阻塞分类，退化到纯 messages 分类
+            logger.warning("router: 读取 business_memory 失败，退化到纯分类", exc_info=True)
+
+        router_messages: list = []
+        if context_text:
+            # SystemMessage 放最前面，作为 Router 的补充上下文
+            # 不覆盖原始 ROUTER_PROMPT，只是追加信息
+            router_messages.append(SystemMessage(content=context_text))
+        router_messages.extend(history_messages)
 
         # 使用独立 checkpointer + 唯一 thread_id，确保每次路由调用都从干净状态开始
         # 避免 router 自己上轮的 tool_call 消息污染本次分类。
         decision = await self._router.ainvoke(
-            {"messages": messages},
+            {"messages": router_messages},
             config={"configurable": {"thread_id": str(uuid4())}},
         )
         structured = decision.get("structured_response")
