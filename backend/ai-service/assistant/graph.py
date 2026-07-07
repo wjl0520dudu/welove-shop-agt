@@ -5,7 +5,6 @@ from typing import Any, AsyncIterator, Dict
 from uuid import uuid4
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from agents.memory import get_business_memory
@@ -14,15 +13,9 @@ from agents.prompts import ROUTER_PROMPT
 from agents.state import AssistantState
 from agents import runtime as _runtime  # 用模块引用，运行时动态读 checkpointer/store
 from assistant.nodes import make_nodes
-from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
 from tools.router_tools import format_business_memory_for_router
 
 logger = logging.getLogger("ai-service.assistant.graph")
-
-# 路由器专用 checkpointer，独立于主图 checkpointer，避免消息污染
-_router_checkpointer = InMemorySaver()
-
 
 class AssistantGraph:
     """Supervisor 编排图：route_intent 路由 -> 子节点 -> format_response。
@@ -35,14 +28,15 @@ class AssistantGraph:
         self.shopping_agent = shopping_agent
         self.knowledge_agent = knowledge_agent
         self._nodes = make_nodes(llm, shopping_agent, knowledge_agent)
-        # 路由器使用独立 checkpointer + 每次唯一 thread_id，确保：
-        # 1. ainvoke 正常工作（notebook 验证 checkpointer=None 会报 TypeError）
-        # 2. router 不会看到自己上轮的 tool_call 消息（避免 LLM 被污染）
-        self._router = create_agent(
-            model=llm,
-            checkpointer=_router_checkpointer,
-            system_prompt=ROUTER_PROMPT,
-            response_format=ToolStrategy(IntentDecision),
+        # 路由器：单次结构化分类，不走 agent 循环。
+        # 原先用 create_agent(response_format=ToolStrategy) 会多一次 LLM 往返
+        # （schema 注册成工具 → 模型 tool_call → 回 ToolMessage → 再调一次模型 = 2 次）。
+        # with_structured_output 是直链：模型一次产出结构化结果，LangChain 客户端解析 = 1 次。
+        # method="function_calling" 走工具调用（与原 ToolStrategy 同机制，已验证兼容当前代理）。
+        self._router_llm = (
+            llm.with_structured_output(IntentDecision, method="function_calling")
+            if llm is not None
+            else None
         )
         self.graph = self._build()
 
@@ -73,10 +67,9 @@ class AssistantGraph:
         # 不要再拼接第二次 question，否则问题出现两次。
         history_messages = state.get("messages") or [HumanMessage(question)]
 
-        # 方案 B：把业务上下文（上轮推荐商品、当前关注商品、用户偏好）
-        # 塞进 Router 的 messages 前面，让分类看到"用户在指代什么"。
-        # 例如 "第二个多少钱" 单看这句无法分类，但看到 last_product_cards
-        # 就能判断这是 shopping 场景（追问具体商品）。
+        # 把业务上下文（上轮推荐商品、当前关注商品、用户偏好）塞进 Router 的 messages，
+        # 让分类能看到"用户在指代什么"。例如 "第二个多少钱" 单看这句无法分类，
+        # 但看到 last_product_cards 就能判断这是 shopping 场景（追问具体商品）。
         cid = state.get("conversation_id")
         uid = state.get("user_id")
         context_text = ""
@@ -87,27 +80,26 @@ class AssistantGraph:
             # Store 读取失败不阻塞分类，退化到纯 messages 分类
             logger.warning("router: 读取 business_memory 失败，退化到纯分类", exc_info=True)
 
-        router_messages: list = []
+        # ROUTER_PROMPT 作为首条 system 消息置顶；会话上下文作为第二条 system 消息追加。
+        # with_structured_output 直链，不再需要 checkpointer / thread_id / recursion_limit。
+        router_messages: list = [SystemMessage(content=ROUTER_PROMPT)]
         if context_text:
-            # SystemMessage 放最前面，作为 Router 的补充上下文
-            # 不覆盖原始 ROUTER_PROMPT，只是追加信息
             router_messages.append(SystemMessage(content=context_text))
         router_messages.extend(history_messages)
 
-        # 使用独立 checkpointer + 唯一 thread_id，确保每次路由调用都从干净状态开始
-        # 避免 router 自己上轮的 tool_call 消息污染本次分类。
-        # recursion_limit=5：Router 正常 1-2 步就能出结果，5 步是硬防死循环
-        decision = await self._router.ainvoke(
-            {"messages": router_messages},
-            config={
-                "configurable": {"thread_id": str(uuid4())},
-                "recursion_limit": 5,
-            },
-        )
-        structured = decision.get("structured_response")
-        if structured is None:
+        if self._router_llm is None:
+            return {"route": "unknown", "route_reason": "路由模型未配置"}
+
+        # with_structured_output 默认 include_raw=False，解析失败会抛异常；
+        # 这里兜住，分类失败一律归 unknown，不阻塞主图。
+        try:
+            decision = await self._router_llm.ainvoke(router_messages)
+        except Exception:  # noqa: BLE001
+            logger.warning("router: 结构化分类失败，退化到 unknown", exc_info=True)
             return {"route": "unknown", "route_reason": "路由分类失败"}
-        return {"route": structured.task_type, "route_reason": structured.reason}
+        if decision is None:
+            return {"route": "unknown", "route_reason": "路由分类失败"}
+        return {"route": decision.task_type, "route_reason": decision.reason}
 
     def _make_initial_state(self, **kwargs) -> tuple[AssistantState, str, str]:
         """构造主图初始 state。返回 (state, run_id, trace_id)。"""

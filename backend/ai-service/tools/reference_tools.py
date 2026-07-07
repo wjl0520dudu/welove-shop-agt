@@ -101,6 +101,25 @@ _IMPLICIT_MARKERS = [
     "适合什么肤质", "适合我吗",
 ]
 
+# 复数/集合指代：指向上轮推荐的多款商品（他们三、这三款、这几款、它们）
+# 区别于 _resolve_comparative（"更便宜的那款" = 选一个）：这里返回多款，用于
+# "他们三价格怎么样""这三款对比一下"这类对集合整体提问的场景。
+_PLURAL_PRONOUNS: list[str] = [
+    "他们", "它们", "这几款", "这几个", "那几款", "那几个",
+    "上面几款", "上面几个", "刚才那几款", "刚才那几个", "刚才推荐的",
+    "这俩", "那俩", "这两款", "那两款", "这几样", "那几样",
+]
+# "这/那 + 数字 + 款/个" —— 这三款、那两个、这 3 款
+_PLURAL_NUM_PATTERN = re.compile(r"[这那]\s*([0-9一二两三四五六七八九十]+)\s*[款个]")
+# "他们三 / 它们三" —— 带数量的集合代词
+_PLURAL_PRONOUN_NUM_PATTERN = re.compile(r"(?:他们|它们)\s*([0-9一二两三四五六七八九十]+)")
+
+# 比较意图：用户想对多款商品做横向对比（区别于"更便宜的那款"这种选一个）
+# 命中时 hint 会引导 agent 调 compare_products。
+_COMPARE_INTENT_MARKERS: list[str] = [
+    "比较", "对比", "比一下", "相比", "比比", "横向对比", "对比一下", "比一比",
+]
+
 
 def _resolve_ordinal(
     query: str, last_cards: List[Dict[str, Any]]
@@ -235,20 +254,87 @@ def _resolve_implicit(
     return None
 
 
+def _resolve_plural(
+    query: str, last_cards: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """尝试解析复数/集合指代：他们三、这三款、这几款 → 上轮推荐的多款商品。
+
+    用于"他们三价格怎么样""这三款对比一下""它们哪个销量高"这类对
+    集合整体提问的场景。区别于 _resolve_comparative（选一个最优），
+    这里返回多款，让 agent 基于这些商品回答或调 compare_products。
+    """
+    if not last_cards:
+        return None
+
+    n: Optional[int] = None
+    matched = False
+
+    # 这三款 / 那两个 / 这 3 款 → 取前 N 个
+    m = _PLURAL_NUM_PATTERN.search(query)
+    if m:
+        n = _parse_numeral(m.group(1))
+        matched = True
+
+    # 他们三 / 它们三 → 取前 N 个
+    if not matched:
+        m2 = _PLURAL_PRONOUN_NUM_PATTERN.search(query)
+        if m2:
+            n = _parse_numeral(m2.group(1))
+            matched = True
+
+    # 裸复数代词：他们 / 它们 / 这几款 → 全部
+    if not matched and any(p in query for p in _PLURAL_PRONOUNS):
+        matched = True
+
+    if not matched:
+        return None
+
+    products = list(last_cards[:n]) if n else list(last_cards)
+    if not products:
+        return None
+
+    names = "、".join(
+        p.get("title") or f"商品{p.get('product_id', '')}" for p in products
+    )
+    is_compare = any(mk in query for mk in _COMPARE_INTENT_MARKERS)
+    ref_type = "plural_compare" if is_compare else "plural"
+    if is_compare:
+        hint = (
+            f"已将指代解析为上轮推荐的 {len(products)} 款商品：{names}。"
+            f"用户想对比这些商品，请直接调用 compare_products()（无需传参，"
+            f"工具会自动读取这 {len(products)} 款做对比），禁止重新搜索。"
+        )
+    else:
+        hint = (
+            f"已将指代解析为上轮推荐的 {len(products)} 款商品：{names}。"
+            f"请基于这些商品回答，禁止重新搜索。"
+        )
+    return {
+        "has_reference": True,
+        "resolved_query": query,
+        "matched_product": products[0],   # 兼容单数字段
+        "matched_products": products,     # 复数
+        "reference_type": ref_type,
+        "hint": hint,
+    }
+
+
 # ---- 工具本体 ----------------------------------------------------------------
 
 
 @tool(parse_docstring=True)
 async def resolve_reference(query: str, runtime: ToolRuntime) -> Dict[str, Any]:
-    """解析用户问题中的商品指代表达（如"第二个""刚才那个""更便宜的"）。
+    """解析用户问题中的商品指代表达（如"第二个""刚才那个""更便宜的""他们三"）。
 
     当用户问题中包含指向之前推荐商品的模糊表达时，**必须先调用此工具**解析，
     拿到具体商品后再进行后续操作（查详情、对比、回答）。
 
     **调用时机**：
     - 用户说"第二个"/"第三款"/"最后一个" → 序号指代
+    - 用户说"他们三"/"这三款"/"这几款"/"它们"/"上面那几款" → 复数指代（多款）
     - 用户说"刚才那个"/"这个"/"它" → 代词指代
-    - 用户说"更便宜的"/"评分高的那个"/"销量多的" → 比较指代
+    - 用户说"更便宜的"/"评分高的那个"/"销量多的" → 比较指代（选一个最优）
+    - 用户说"这几款对比一下"/"他们三价格比较" → 复数 + 比较意图（调 compare_products）
     - 用户说"还有别的颜色吗"/"多少钱" → 隐式指代（指向当前关注商品）
 
     如果工具返回 has_reference=False，说明没有检测到指代，按正常流程处理即可。
@@ -260,10 +346,11 @@ async def resolve_reference(query: str, runtime: ToolRuntime) -> Dict[str, Any]:
     Returns:
         dict: {
             "has_reference": bool,
-            "resolved_query": str,         # 解析后的 query（指代已替换为商品名）
-            "matched_product": dict|None,  # 匹配到的商品信息
-            "reference_type": str|None,    # ordinal | pronominal | comparative | implicit
-            "hint": str,                   # 给 LLM 的提示
+            "resolved_query": str,          # 解析后的 query
+            "matched_product": dict|None,   # 匹配到的（首个）商品，兼容单数场景
+            "matched_products": list,        # 复数指代时为多款商品列表（plural / plural_compare）
+            "reference_type": str|None,     # ordinal | plural | plural_compare | pronominal | comparative | implicit
+            "hint": str,                    # 给 LLM 的提示（含后续动作建议）
         }
     """
     state = runtime.state or {}
@@ -285,15 +372,17 @@ async def resolve_reference(query: str, runtime: ToolRuntime) -> Dict[str, Any]:
     last_cards: List[Dict[str, Any]] = memory.get("last_product_cards") or []
     focused: Optional[Dict[str, Any]] = memory.get("last_focused_product")
 
-    # 按优先级尝试各类型解析（序号 > 代词 > 比较 > 隐式）
+    # 按优先级尝试各类型解析（序号 > 复数 > 代词 > 比较 > 隐式）
     for resolver in (
         _resolve_ordinal,
+        _resolve_plural,
         _resolve_pronominal,
         _resolve_comparative,
         _resolve_implicit,
     ):
-        # 前两个 resolver 需要额外参数
         if resolver is _resolve_ordinal:
+            result = resolver(query, last_cards)
+        elif resolver is _resolve_plural:
             result = resolver(query, last_cards)
         elif resolver is _resolve_pronominal:
             result = resolver(query, focused, last_cards)

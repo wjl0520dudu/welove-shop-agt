@@ -1,7 +1,8 @@
-"""测试 tools/shopping_tools.py —— Java API 工具 + 降级回退。
+"""测试 tools/shopping_tools.py —— PG ORM 工具。
 
-不需要外部服务（Java/PG/Milvus），全部用 mock 覆盖。
+不需要外部服务（PG/Milvus），全部用 mock 覆盖。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -9,86 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from tools.shopping_tools import (
-    _java_product_to_dict,
-    ProductFeatures,
-)
-
-
-# ---- _java_product_to_dict --------------------------------------------------
-
-class TestJavaProductToDict:
-    """测试 Java 驼峰 → Python 下划线字段映射。"""
-
-    def test_full_product_mapping(self):
-        java = {
-            "id": 42,
-            "title": "测试粉底液",
-            "brand": "测试品牌",
-            "basePrice": 299.00,
-            "imageUrl": "http://img/test.jpg",
-            "rating": 4.5,
-            "reviewCount": 88,
-            "salesCount": 1500,
-            "subCategory": "粉底液",
-            "tags": "保湿,滋润",
-            "description": "一款测试粉底液",
-        }
-        result = _java_product_to_dict(java)
-        assert result["product_id"] == 42
-        assert result["title"] == "测试粉底液"
-        assert result["brand"] == "测试品牌"
-        assert result["price"] == 299.0
-        assert result["base_price"] == 299.0
-        assert result["image_url"] == "http://img/test.jpg"
-        assert result["rating"] == 4.5
-        assert result["review_count"] == 88
-        assert result["sales_count"] == 1500
-        assert result["sub_category"] == "粉底液"
-        assert result["tags"] == "保湿,滋润"
-        assert result["description"] == "一款测试粉底液"
-
-    def test_minimal_product(self):
-        java = {"id": 1}
-        result = _java_product_to_dict(java)
-        assert result["product_id"] == 1
-        assert result["title"] == ""
-        assert result["brand"] == ""
-        assert result["price"] is None
-        assert result["base_price"] is None
-        assert result["image_url"] == ""
-        assert result["rating"] is None
-        assert result["review_count"] == 0
-        assert result["sales_count"] == 0
-        assert result["sub_category"] == ""
-        assert result["tags"] == ""
-        assert result["description"] == ""
-
-    def test_none_price(self):
-        java = {"id": 1, "basePrice": None}
-        result = _java_product_to_dict(java)
-        assert result["price"] is None
-        assert result["base_price"] is None
-
-    def test_zero_price(self):
-        java = {"id": 1, "basePrice": 0}
-        result = _java_product_to_dict(java)
-        assert result["price"] == 0.0
-        assert result["base_price"] == 0.0
-
-    def test_empty_string_fields(self):
-        java = {"id": 1, "title": None, "brand": None}
-        result = _java_product_to_dict(java)
-        assert result["title"] == ""
-        assert result["brand"] == ""
-
-    def test_missing_fields(self):
-        java = {"id": 1, "title": "test"}
-        result = _java_product_to_dict(java)
-        assert result["product_id"] == 1
-        assert result["title"] == "test"
-        assert result["brand"] == ""
-        assert result["price"] is None
+from tools.shopping_tools import ProductFeatures
 
 
 # ---- ProductFeatures field_validator ----------------------------------------
@@ -148,27 +70,7 @@ class TestProductFeaturesValidation:
         assert f.cautions == ["含酒精"]
 
 
-# ---- search_products_by_name (Java API path) --------------------------------
-
-class FakeJavaApiResult:
-    """模拟 JavaApiResult。"""
-    def __init__(self, success=True, data=None, error_code=None, message=None):
-        self.success = success
-        self.data = data
-        self.error_code = error_code
-        self.message = message
-
-
-class FakeJavaApiClient:
-    """模拟 JavaApiClient，记录调用参数并返回预设结果。"""
-    def __init__(self, get_result=None):
-        self.get_result = get_result or FakeJavaApiResult(success=True, data=[])
-        self.get_calls = []
-
-    async def get(self, path, jwt_token=None, params=None):
-        self.get_calls.append({"path": path, "jwt_token": jwt_token, "params": params})
-        return self.get_result
-
+# ---- helpers ----------------------------------------------------------------
 
 def _make_runtime(conversation_id="c1", user_id=1):
     """构造模拟 ToolRuntime。"""
@@ -184,22 +86,61 @@ def _make_runtime(conversation_id="c1", user_id=1):
     )
 
 
-class TestSearchProductsByNameJavaApi:
-    """测试 search_products_by_name 的 Java API 路径。"""
+def _make_mock_product(product_id, title="测试商品", brand="测试品牌", base_price=199.0,
+                        rating=4.5, sales_count=100, sub_category="粉底液",
+                        tags="保湿,滋润", description="一款测试商品"):
+    """构造模拟 ProductORM 对象。"""
+    p = MagicMock()
+    p.id = product_id
+    p.title = title
+    p.brand = brand
+    p.base_price = base_price
+    p.image_url = "http://img/test.jpg"
+    p.rating = rating
+    p.review_count = 50
+    p.sales_count = sales_count
+    p.sub_category = sub_category
+    p.tags = tags
+    p.description = description
+    return p
 
-    def test_java_api_success_returns_products(self):
-        java_products = [
-            {"id": 1, "title": "粉底液A", "basePrice": 199, "brand": "品牌A"},
-            {"id": 2, "title": "粉底液B", "basePrice": 299, "brand": "品牌B"},
+
+def _mock_session_factory(rows):
+    """构造 mock 的 get_session_factory：返回含 rows 的 async session。"""
+    mock_result = MagicMock()
+    mock_result.scalars.return_value.all.return_value = rows
+
+    mock_session = MagicMock()
+    # session.execute 需要是 async → 用 AsyncMock
+    mock_execute = AsyncMock(return_value=mock_result)
+    mock_session.execute = mock_execute
+
+    mock_sf = MagicMock()
+    # session_factory() 返回一个 async context manager
+    mock_ctx = MagicMock()
+    mock_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_ctx.__aexit__ = AsyncMock(return_value=None)
+    mock_sf.return_value = mock_ctx
+
+    return mock_sf
+
+
+# ---- search_products_by_name (PG ORM path) ----------------------------------
+
+class TestSearchProductsByName:
+    """测试 search_products_by_name 的 PG ORM 路径。"""
+
+    def test_pg_orm_returns_products(self):
+        mock_products = [
+            _make_mock_product(1, "粉底液A", base_price=199.0),
+            _make_mock_product(2, "粉底液B", base_price=299.0),
         ]
-        fake_client = FakeJavaApiClient(
-            get_result=FakeJavaApiResult(success=True, data=java_products)
-        )
+        mock_sf = _mock_session_factory(mock_products)
 
         from tools.shopping_tools import search_products_by_name
 
         async def run():
-            with patch("tools.shopping_tools.get_java_api_client", return_value=fake_client):
+            with patch("tools.shopping_tools.get_session_factory", return_value=mock_sf):
                 with patch("tools.shopping_tools.remember_product_cards", new_callable=AsyncMock):
                     with patch("tools.shopping_tools.remember_focused_product", new_callable=AsyncMock):
                         runtime = _make_runtime()
@@ -216,19 +157,14 @@ class TestSearchProductsByNameJavaApi:
         assert result[0]["title"] == "粉底液A"
         assert result[0]["price"] == 199.0
         assert result[1]["product_id"] == 2
-        # 验证调用了正确的 Java API
-        assert fake_client.get_calls[0]["path"] == "/api/product/search"
-        assert fake_client.get_calls[0]["params"] == {"keyword": "粉底液", "limit": 5}
 
-    def test_java_api_empty_result(self):
-        fake_client = FakeJavaApiClient(
-            get_result=FakeJavaApiResult(success=True, data=[])
-        )
+    def test_no_results_returns_empty(self):
+        mock_sf = _mock_session_factory([])
 
         from tools.shopping_tools import search_products_by_name
 
         async def run():
-            with patch("tools.shopping_tools.get_java_api_client", return_value=fake_client):
+            with patch("tools.shopping_tools.get_session_factory", return_value=mock_sf):
                 runtime = _make_runtime()
                 result = await search_products_by_name.ainvoke({
                     "query": "不存在的商品",
@@ -259,21 +195,31 @@ class TestSearchProductsByNameJavaApi:
 # ---- list_product_skus ------------------------------------------------------
 
 class TestListProductSkus:
-    """测试 list_product_skus 工具。"""
+    """测试 list_product_skus 工具（PG ORM 路径）。"""
 
-    def test_java_api_success(self):
-        skus = [
-            {"id": 1, "skuCode": "SKU001", "price": 199},
-            {"id": 2, "skuCode": "SKU002", "price": 229},
-        ]
-        fake_client = FakeJavaApiClient(
-            get_result=FakeJavaApiResult(success=True, data=skus)
-        )
+    def test_pg_orm_returns_skus(self):
+        mock_sku1 = MagicMock()
+        mock_sku1.id = 1
+        mock_sku1.sku_code = "SKU001"
+        mock_sku1.properties = {"容量": "30ml"}
+        mock_sku1.price = 199.0
+        mock_sku1.stock = 50
+        mock_sku1.is_default = True
+
+        mock_sku2 = MagicMock()
+        mock_sku2.id = 2
+        mock_sku2.sku_code = "SKU002"
+        mock_sku2.properties = {"容量": "50ml"}
+        mock_sku2.price = 299.0
+        mock_sku2.stock = 30
+        mock_sku2.is_default = False
+
+        mock_sf = _mock_session_factory([mock_sku1, mock_sku2])
 
         from tools.shopping_tools import list_product_skus
 
         async def run():
-            with patch("tools.shopping_tools.get_java_api_client", return_value=fake_client):
+            with patch("tools.shopping_tools.get_session_factory", return_value=mock_sf):
                 result = await list_product_skus.ainvoke({"product_id": 1})
             return result
 
@@ -281,21 +227,20 @@ class TestListProductSkus:
         assert result["product_id"] == 1
         assert len(result["skus"]) == 2
         assert result["skus"][0]["skuCode"] == "SKU001"
+        assert result["skus"][0]["price"] == 199.0
         assert result["message"] == "OK"
 
-    def test_java_api_failure_fallback(self):
-        fake_client = FakeJavaApiClient(
-            get_result=FakeJavaApiResult(success=False, error_code="JAVA_API_ERROR")
-        )
+    def test_no_skus_returns_empty(self):
+        mock_sf = _mock_session_factory([])
 
         from tools.shopping_tools import list_product_skus
 
         async def run():
-            with patch("tools.shopping_tools.get_java_api_client", return_value=fake_client):
+            with patch("tools.shopping_tools.get_session_factory", return_value=mock_sf):
                 result = await list_product_skus.ainvoke({"product_id": 99})
             return result
 
         result = asyncio.run(run())
         assert result["product_id"] == 99
         assert result["skus"] == []
-        assert "not available" in result["message"]
+        assert "暂无" in result["message"]

@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import hashlib
+import json
 from uuid import uuid4
 from typing import List
 
 from cachetools import TTLCache
 from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
+from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddleware
+from langchain.agents.middleware.tool_call_limit import ToolCallLimitMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.tools import tool
 
 from agents.middleware import build_summarization_middleware
-from agents.schemas import KnowledgeResult
 from agents.prompts import KNOWLEDGE_PROMPT
 from rag.models import RetrievalPlan
 from rag.retriever import get_retriever
@@ -34,6 +35,32 @@ def search_knowledge(query: str) -> dict:
     }
 
 
+def _extract_sources(messages: list) -> list:
+    """从 search_knowledge 工具的 ToolMessage 里抽取 sources。
+
+    search_knowledge 返回 {"knowledge_context":..., "sources":[{"title","score"}], ...}，
+    LangChain 把它 JSON 序列化进 ToolMessage.content，这里解析回来。
+    去 ToolStrategy 后 sources 不再由结构化输出提供，改由这里抽取。
+    """
+    sources: list = []
+    for m in messages or []:
+        if getattr(m, "type", "") != "tool":
+            continue
+        content = getattr(m, "content", "")
+        if not isinstance(content, str) or not content:
+            continue
+        try:
+            data = json.loads(content)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(data, dict):
+            continue
+        for s in data.get("sources") or []:
+            if isinstance(s, dict):
+                sources.append({"title": s.get("title"), "score": s.get("score")})
+    return sources
+
+
 # KnowledgeAgent 专用独立 checkpointer，与主图 checkpointer 完全隔离
 # 原因同 router：create_agent 内部的工具调用会往 checkpointer 写消息，
 # 如果用共享 checkpointer + 同一 thread_id，tool_call 消息会混入下一轮
@@ -51,7 +78,7 @@ _knowledge_cache: TTLCache = TTLCache(maxsize=1024, ttl=1800)
 
 
 class KnowledgeAgent:
-    """知识问答 agent：create_agent + search_knowledge 工具 + KnowledgeResult 结构化输出。
+    """知识问答 agent：create_agent + search_knowledge 工具，answer 走纯文本流式（无结构化输出，sources 从 ToolMessage 抽取）。
 
     使用独立 checkpointer 确保 ainvoke 正常工作，每次调用传唯一 thread_id
     避免内部 tool_call 消息污染下一次调用。
@@ -70,7 +97,14 @@ class KnowledgeAgent:
 
     def _get_agent(self):
         if self._agent is None:
-            from langchain.agents.middleware.tool_call_limit import ToolCallLimitMiddleware
+            # 去掉 response_format=ToolStrategy：原先是它和 ToolCallLimitMiddleware("end")
+            # 打架导致 GraphRecursionError——ToolStrategy 注册的结构化输出工具也算"其他工具"，
+            # 触发 tool_call_limit.py 的 NotImplementedError / jump_to:end 后
+            # structured_response=None → 走错误分支"知识检索暂时不可用"。去掉后两者不再冲突。
+            #
+            # ToolCallLimit 改 continue：search_knowledge 最多 2 次，超限后注入错误
+            # ToolMessage 提示模型"别再调了"，让模型用已检索内容组织回答（而非硬停）。
+            # ModelCallLimit 作为硬顶兜底，防弱模型真的死循环；recursion_limit 再兜一层。
             self._agent = create_agent(
                 model=self._llm,
                 checkpointer=_knowledge_checkpointer,
@@ -78,16 +112,13 @@ class KnowledgeAgent:
                 tools=[search_knowledge],
                 middleware=[
                     build_summarization_middleware(),
-                    # 防死循环：search_knowledge 单轮最多 2 次；有些模型（qwen-plus）
-                    # 拿到检索结果后不满意会不停换词再搜。超限后 agent 立即用当前
-                    # 已知信息输出结果。
                     ToolCallLimitMiddleware(
                         tool_name="search_knowledge",
                         run_limit=2,
-                        exit_behavior="end",
+                        exit_behavior="continue",
                     ),
+                    ModelCallLimitMiddleware(run_limit=5, exit_behavior="end"),
                 ],
-                response_format=ToolStrategy(KnowledgeResult),
             )
         return self._agent
 
@@ -126,32 +157,33 @@ class KnowledgeAgent:
         if cache_key and cache_key in _knowledge_cache:
             return _knowledge_cache[cache_key]
 
-        # 每次调用使用唯一 thread_id，确保不受内部 tool_call 消息污染
-        # recursion_limit=8：正常 2-3 步（1 次 search + 1 次输出），8 是硬防死循环
+        # 每次调用使用唯一 thread_id，确保不受内部 tool_call 消息污染。
+        # recursion_limit=12：高于 ModelCallLimit(5) 的 ~10 步，让 ModelCallLimit 先干净退出。
         result = await self._get_agent().ainvoke(
             {"messages": messages},
             config={
                 "configurable": {"thread_id": str(uuid4())},
-                "recursion_limit": 8,
+                "recursion_limit": 12,
             },
         )
 
-        structured = result.get("structured_response")
-        if structured is None:
-            return {
-                "answer": "知识检索暂时不可用，请稍后再试。",
-                "sources": [],
-                "confidence": 0.0,
-                "task_type": "knowledge",
-                "error": True,
-                "error_code": "AI_RAG_STRUCTURED_ERROR",
-            }
+        # answer 从最后一条 AI 消息 content 提取（纯文本，可流式）；
+        # sources 从 search_knowledge 的 ToolMessage 里 JSON 解析抽取。
+        result_messages = result.get("messages", [])
+        answer = ""
+        for m in reversed(result_messages):
+            if getattr(m, "type", "") == "ai":
+                content = getattr(m, "content", "")
+                if isinstance(content, str) and content.strip():
+                    answer = content
+                    break
+        sources = _extract_sources(result_messages)
 
         output = {
-            "answer": structured.answer,
-            "sources": [s for s in structured.sources] if structured.sources else [],
-            "confidence": getattr(structured, "confidence", 0.5),
-            "has_answer": getattr(structured, "has_answer", True),
+            "answer": answer or "知识检索暂时不可用，请稍后再试。",
+            "sources": sources,
+            "confidence": 0.7 if sources else 0.3,
+            "has_answer": bool(sources),
             "task_type": "knowledge",
         }
 

@@ -4,11 +4,9 @@ import logging
 from uuid import uuid4
 from typing import Any, Callable, Dict, Optional
 from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import AIMessage, HumanMessage
 from agents.state import AssistantState
-from agents.schemas import ChitchatResult
 from agents.prompts import CHITCHAT_PROMPT
 from core.errors import ErrorCode
 from shopping.agent import ShoppingAgent
@@ -39,12 +37,14 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
     def _get_chitchat_agent():
         if _chitchat_holder["agent"] is None:
             from agents.middleware import build_summarization_middleware
+            # 不挂 response_format：让 answer 走纯文本 content，才能被
+            # graph.astream 的 messages 流逐 token 吐给前端（豆包式打字机）。
+            # ToolStrategy 会把答案塞进 tool_call.args，content 为空，流式被废。
             _chitchat_holder["agent"] = create_agent(
                 model=llm,
                 checkpointer=_chitchat_checkpointer,
                 system_prompt=CHITCHAT_PROMPT,
                 middleware=[build_summarization_middleware()],
-                response_format=ToolStrategy(ChitchatResult),
             )
         return _chitchat_holder["agent"]
 
@@ -123,26 +123,21 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                     "recursion_limit": 5,
                 },
             )
-            structured = result.get("structured_response")
-            if structured is not None:
-                answer = structured.answer
-            else:
-                # fallback：从 messages 最后一条 AI 消息提取文本
-                last_ai = ""
-                for m in reversed(result.get("messages", [])):
-                    if isinstance(m, dict):
-                        mtype = m.get("type", "")
-                        if mtype == "ai" and m.get("content"):
-                            last_ai = str(m.get("content", ""))
+            # answer 直接从最后一条 AI 消息 content 提取（纯文本，可流式）。
+            # 去 ToolStrategy 后不再有 structured_response，这里就是主路径。
+            answer = ""
+            for m in reversed(result.get("messages", [])):
+                if isinstance(m, dict):
+                    if m.get("type") == "ai" and m.get("content"):
+                        answer = str(m.get("content", ""))
+                        break
+                else:
+                    if getattr(m, "type", "") == "ai":
+                        content = getattr(m, "content", "")
+                        if isinstance(content, str) and content.strip():
+                            answer = content
                             break
-                    else:
-                        mtype = getattr(m, "type", "")
-                        if mtype == "ai":
-                            content = getattr(m, "content", "")
-                            if isinstance(content, str) and content.strip():
-                                last_ai = content
-                                break
-                answer = last_ai or "嗯嗯，我在呢~"
+            answer = answer or "嗯嗯，我在呢~"
         except Exception as e:
             logger.exception("chitchat node failed")
             return {

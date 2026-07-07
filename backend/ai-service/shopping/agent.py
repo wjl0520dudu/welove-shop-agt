@@ -6,13 +6,11 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agents.memory import get_business_memory
 from agents.prompts import SHOPPING_AGENT_PROMPT
-from agents.schemas import ShoppingResult
 from agents.state import ShoppingAgentState
 from agents.middleware import (
     PreferenceLearningMiddleware,
@@ -47,7 +45,7 @@ _shopping_checkpointer = InMemorySaver()
 
 
 class ShoppingAgent:
-    """导购 agent：create_agent + 模块级工具 + ShoppingResult 结构化输出。
+    """导购 agent：create_agent + 模块级工具，answer 走纯文本流式 + product_cards 走 Store 旁路。
 
     ## ToolRuntime 模式（教程 05）
     - 工具是模块级常量 SHOPPING_TOOLS（无需每次请求重建）
@@ -157,6 +155,8 @@ class ShoppingAgent:
         system_prompt = self._build_system_prompt(effective_memory)
 
         # create_agent 每次重建：system_prompt 依赖本次记忆快照，工具已单例复用。
+        # 不挂 response_format：让 answer 走纯文本 content，才能被 graph.astream 流式吐给前端。
+        # product_cards 走 Store 旁路（工具执行时 remember_product_cards 已写入），跨轮持久。
         agent = create_agent(
             model=self._llm,
             checkpointer=_shopping_checkpointer,
@@ -164,7 +164,6 @@ class ShoppingAgent:
             tools=_ALL_TOOLS,
             state_schema=ShoppingAgentState,
             middleware=_SHOPPING_MIDDLEWARE,
-            response_format=ToolStrategy(ShoppingResult),
         )
 
         agent_messages = self._build_messages(question, messages)
@@ -214,46 +213,30 @@ class ShoppingAgent:
                 "message": str(e),
             }
 
-        structured = result.get("structured_response")
         # 从 result.messages 里抽取实际的工具调用记录，供上层观测/调试。
         # create_agent 内部循环产生的 AIMessage.tool_calls 是 [{name, args, id}]。
         collected_tool_calls = _extract_tool_calls(result.get("messages", []))
 
-        # 从 Store 拿最新 cards（工具执行时已写入）作为兜底。
-        # 首轮性能优化的关键：搜索工具返回给 LLM 的是瘦身版（去掉 image_url 等），
-        # 完整 cards 存在 Store 里；这里读出来作为 product_cards 的兜底/主源，
-        # 避免让 LLM 再"抄"一遍完整字段（那是首轮 30-70s 的主要开销）。
+        # product_cards 走 Store 旁路：工具执行时 remember_product_cards 已写入完整 cards。
+        # 搜索工具返回给 LLM 的是瘦身版（去掉 image_url 等），完整字段只存 Store，
+        # 这里读出来作为 product_cards 主源，避免让 LLM 再"抄"一遍完整字段。
         fallback_memory = await get_business_memory(conversation_id, user_id)
         fallback_cards = fallback_memory.get("last_product_cards") or []
 
-        if structured is None:
-            # fallback：从最后一条 AI 消息提取文本（部分代理不支持结构化输出时）
-            answer = ""
-            for m in reversed(result.get("messages", [])):
-                mtype = getattr(m, "type", "")
-                if mtype == "ai":
-                    content = getattr(m, "content", "")
-                    if isinstance(content, str) and content.strip():
-                        answer = content
-                        break
-            return {
-                "answer": answer or "暂时没能找到合适的商品，能再说详细一点吗？",
-                "product_cards": fallback_cards,
-                "task_type": "shopping",
-                "sources": [],
-                "tool_calls": collected_tool_calls,
-                "error": False,
-            }
+        # answer 从最后一条 AI 消息 content 提取（纯文本，可被 graph.astream 流式吐给前端）
+        answer = ""
+        for m in reversed(result.get("messages", [])):
+            mtype = getattr(m, "type", "")
+            if mtype == "ai":
+                content = getattr(m, "content", "")
+                if isinstance(content, str) and content.strip():
+                    answer = content
+                    break
 
-        # 优先用 Store 里的完整 cards（image_url/reason 齐全）；LLM 输出为兜底
-        product_cards = fallback_cards or (structured.product_cards or [])
         return {
-            "answer": structured.answer,
-            "product_cards": product_cards,
+            "answer": answer or "暂时没能找到合适的商品，能再说详细一点吗？",
+            "product_cards": fallback_cards,
             "task_type": "shopping",
-            "need_followup": getattr(structured, "need_followup", False),
-            "followup_question": getattr(structured, "followup_question", None),
-            "confidence": getattr(structured, "confidence", 0.5),
             "sources": [],
             "tool_calls": collected_tool_calls,
             "error": False,
