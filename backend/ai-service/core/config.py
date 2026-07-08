@@ -32,6 +32,18 @@ class Config:
     # 改这个字段前先跑 drop_milvus_collection.py 清库，否则 schema dim 不一致会插入失败。
     MILVUS_DENSE_DIM = int(os.getenv("MILVUS_DENSE_DIM", "1024"))
 
+    # ── 商品多模态 collection（Phase 1b 起启用）──
+    # 商品向量迁移到独立 collection，跟知识 collection 隔离；
+    # schema 里预留 multimodal_vector 字段，Phase 2 图片就绪后灌图+文融合向量。
+    MILVUS_PRODUCT_COLLECTION = os.getenv("MILVUS_PRODUCT_COLLECTION", "product_mm_collection")
+
+    # tongyi-embedding-vision-flash（图+文多模态 embedding，Phase 2 启用）
+    # MVP（Phase 1b）：商品文本向量仍走 DashScope text-embedding-v4，跟 KnowledgeAgent 保持同一 embedding。
+    # 只有 multimodal_vector 字段等 Phase 2 才用 tongyi。
+    DASH_SCOPE_MULTI_MODAL_EMBEDDING_MODEL = os.getenv(
+        "DASH_SCOPE_MULTI_MODAL_EMBEDDING_MODEL", "tongyi-embedding-vision-flash-2026-03-06",
+    )
+
     # ── DashScope（阿里云百炼）text-embedding-v4 ──
     # 现在是主用 embedding 通道（RAG 的 dense 向量走这里），OpenAI 通道保留仅供兼容。
     DASH_SCOPE_API_KEY = os.getenv("DASH_SCOPE_API_KEY", "")

@@ -289,7 +289,8 @@ class RecommendCapability:
         await clear_pending_shopping_need(context.conversation_id, context.user_id)
 
         # ── 4. 检索 ──
-        plan = build_retrieval_plan(need, top_k=max(limit * 4, 12))
+        # top_k = limit（rerank 从 initial_top_k=20 里挑），Phase 1b 起启用 Milvus hybrid + rerank
+        plan = build_retrieval_plan(need, top_k=limit)
         candidates, recall_trace = await self.retriever.retrieve(plan, need)
         trace.append({"step": "retrieval", "output": {
             "plan_primary_query": plan.primary_query,

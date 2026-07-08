@@ -102,6 +102,10 @@ class ShoppingRetrievalPlan(BaseModel):
     initial_top_k: int = 20    # 两阶段召回时的第一阶段候选数
     use_rerank: bool = True
 
+    # Phase 1b：检索模式（hybrid/dense/bm25），默认 hybrid。
+    # A/B 测试时可以显式指定，让 verify 脚本对比效果。
+    search_mode: Literal["hybrid", "dense", "bm25", "sparse"] = "hybrid"
+
 
 # ---- 排序后的商品（Capability 内部 + Tool 输出）--------------------------
 

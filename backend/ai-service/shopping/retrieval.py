@@ -1,47 +1,75 @@
 """ShoppingRetriever —— Capability 面对的检索抽象层。
 
-## Phase 1a（本次）
-内部继续用 PgVectorStore，多路降级为单路 dense（跟旧 shopping_tools.search_products 一致），
-但对外暴露的接口和 Phase 1b（Milvus 三路）完全一致，切换时零改动 Capability。
+## Phase 1b（本次）
+- 内部从 PgVectorStore 切成 ProductMilvusStore（三路 + rerank 两阶段）；
+- 对外接口和 Phase 1a 一致 —— Capability 完全零改动；
+- pgvector 保留作为**降级路径**：Milvus 挂了自动 fallback，线上不中断。
 
-## Phase 1b（下个 commit）
-把 `_dense_recall` 换成 ProductMilvusStore.dense_search，
-加上 `_bm25_recall` / `_hybrid_recall` / rerank 两阶段。
+## 两阶段检索
+```
+hybrid_search(top_k=initial_top_k=20)
+    ↓
+qwen3-rerank(query, docs, top_n=final_top_k)
+    ↓
+final top_k
+```
+失败降级：rerank 返回全 0 → 走 recall 阶段的向量分数排序。
 
-## 返回契约
-retrieve() → (candidates: list[dict], trace: list[dict])
-- candidates 每个 dict 至少含 product_id/title/brand/price/base_price/image_url/
-  rating/sales_count/review_count/category/sub_category/tags/description，
-  且带 `recall_sources: List[str]` 记录哪些召回路径找到了它（未来多路时用）。
-- trace 供上层观测：[{"source":"dense","status":"ok","count":N}, ...]
+## 三路开关
+`ShoppingRetrievalPlan.search_mode` = "hybrid" | "dense" | "bm25"，
+Capability 层可以显式指定；MVP 默认 hybrid。
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+from core.config import config
 from shopping.schemas import ShoppingNeed, ShoppingRetrievalPlan
 
 logger = logging.getLogger("ai-service.shopping.retrieval")
 
 
 class ShoppingRetriever:
-    """Capability 依赖的检索器接口。
+    """Capability 依赖的检索器。
 
-    Phase 1a 内部单路 pgvector，Phase 1b 切三路 Milvus + rerank。
+    Phase 1b：内部 Milvus 三路 + qwen3-rerank；
+    Milvus 不可用时降级到 pgvector 单路 dense。
     """
 
-    def __init__(self, pg_vector_store=None):
-        self._pg_vector_store = pg_vector_store  # 允许注入 mock 单测
+    def __init__(
+        self,
+        milvus_store=None,
+        pg_vector_store=None,
+        reranker=None,
+    ):
+        # 支持三种注入（都可 mock 单测）
+        self._milvus_store = milvus_store
+        self._pg_vector_store = pg_vector_store
+        self._reranker = reranker
+
+    # ── 懒加载单例 ──────────────────────────────────────────
+
+    def _get_milvus_store(self):
+        if self._milvus_store is None:
+            from shopping.vector_store import get_product_milvus_store
+            self._milvus_store = get_product_milvus_store()
+        return self._milvus_store
 
     def _get_pg_store(self):
-        """懒加载 PgVectorStore（pgvector 未安装时 ImportError，让上游降级）。"""
         if self._pg_vector_store is None:
             from pg_search.pgvector_store import PgVectorStore
             self._pg_vector_store = PgVectorStore()
         return self._pg_vector_store
 
+    def _get_reranker(self):
+        if self._reranker is None:
+            from rag.reranker import get_reranker
+            self._reranker = get_reranker()
+        return self._reranker
+
+    # ── 主入口 ──────────────────────────────────────────────
     async def retrieve(
         self,
         plan: ShoppingRetrievalPlan,
@@ -49,46 +77,149 @@ class ShoppingRetriever:
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """按 plan 检索商品，返回 (candidates, trace)。
 
-        Phase 1a 只跑 dense 一路，plan.semantic_queries 里的多个 query 依次跑，
-        结果按 product_id 去重。
+        Pipeline:
+        1. 主链路：Milvus dense/bm25/hybrid（按 plan.search_mode）+ 服务端 filter；
+        2. 若 plan.use_rerank：qwen3-rerank 两阶段精排；
+        3. 若 candidates < 5：走 relaxed 兜底（去掉部分 filter 重新召回）；
+        4. Milvus 不可用：整体降级到 pgvector 单路 dense（Phase 1a 的老路径）。
         """
-        candidates: List[Dict[str, Any]] = []
         trace: List[Dict[str, Any]] = []
+        candidates: List[Dict[str, Any]] = []
 
-        # ── 稠密语义召回（唯一一路，MVP）──
+        # ── 主链路：Milvus 三路 + rerank ──
         try:
-            dense_results = await self._dense_recall(plan, need)
-            _tag_recall_source(dense_results, "dense")
-            candidates.extend(dense_results)
-            trace.append({"source": "dense", "status": "ok", "count": len(dense_results)})
+            candidates = await self._milvus_recall(plan, need, trace)
         except Exception as e:  # noqa: BLE001
-            logger.warning("dense recall failed", exc_info=True)
-            trace.append({"source": "dense", "status": "error", "message": str(e)})
+            logger.warning("Milvus recall failed, fallback to pgvector: %s", e, exc_info=True)
+            trace.append({"source": "milvus", "status": "error", "message": str(e)})
+            # ── 降级：pgvector 单路 ──
+            try:
+                candidates = await self._pgvector_fallback(plan, need)
+                _tag_recall_source(candidates, "pgvector_fallback")
+                trace.append({"source": "pgvector_fallback", "status": "ok", "count": len(candidates)})
+            except Exception as e2:  # noqa: BLE001
+                logger.warning("pgvector fallback also failed: %s", e2, exc_info=True)
+                trace.append({"source": "pgvector_fallback", "status": "error", "message": str(e2)})
+                candidates = []
 
-        # ── 候选过少时的兜底：放宽 filter 再来一次 ──
+        # ── relaxed 兜底：候选过少时放宽 filter 再来一次 ──
         if len(candidates) < 5 and plan.relaxed_filters:
             try:
-                relaxed_results = await self._relaxed_recall(plan, need)
-                _tag_recall_source(relaxed_results, "relaxed")
-                candidates.extend(relaxed_results)
-                trace.append({"source": "relaxed", "status": "ok", "count": len(relaxed_results)})
+                relaxed = await self._milvus_relaxed_recall(plan, need)
+                if relaxed:
+                    _tag_recall_source(relaxed, "relaxed")
+                    # 去重合并：Milvus 主召回和 relaxed 可能重叠
+                    candidates = _dedupe_by_product_id(candidates + relaxed)
+                    trace.append({"source": "relaxed", "status": "ok", "count": len(relaxed)})
             except Exception as e:  # noqa: BLE001
-                logger.warning("relaxed recall failed", exc_info=True)
+                logger.warning("relaxed recall failed: %s", e)
                 trace.append({"source": "relaxed", "status": "error", "message": str(e)})
 
-        # 按 product_id 去重，合并 recall_sources
-        return _dedupe_by_product_id(candidates), trace
+        return candidates, trace
 
-    # ---- 私有：具体召回路径 ----------------------------------------------
-
-    async def _dense_recall(
-        self, plan: ShoppingRetrievalPlan, need: ShoppingNeed
+    # ── Milvus 主召回（含 rerank）──────────────────────────
+    async def _milvus_recall(
+        self,
+        plan: ShoppingRetrievalPlan,
+        need: ShoppingNeed,
+        trace: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """pgvector 稠密召回。
+        store = self._get_milvus_store()
+        query = plan.primary_query or (need.category or "")
 
-        Phase 1b 切 Milvus 时，这个方法整体换成 milvus.dense_search，
-        参数保持一样（query, filters, top_k）。
-        """
+        # rerank 开启时，第一阶段要多召回一些候选
+        final_top_k = plan.top_k
+        recall_top_k = max(plan.initial_top_k or config.RAG_INITIAL_TOP_K, final_top_k) \
+            if plan.use_rerank else final_top_k
+
+        filters = _plan_to_milvus_filters(plan, need)
+
+        # Phase 1b 支持三路开关（默认 hybrid）
+        mode = _pick_search_mode(plan, need)
+        results = store.search(
+            query=query,
+            mode=mode,
+            filters=filters,
+            top_k=recall_top_k,
+        )
+        _tag_recall_source(results, mode)
+        trace.append({"source": f"milvus_{mode}", "status": "ok", "count": len(results),
+                      "filters": filters, "query": query})
+
+        if not results:
+            return []
+
+        # ── rerank 两阶段 ──
+        if plan.use_rerank and len(results) > 1:
+            reranked = self._apply_rerank(query, results, final_top_k)
+            trace.append({"source": "rerank", "status": "ok",
+                          "in": len(results), "out": len(reranked)})
+            return reranked
+
+        # 不 rerank：按向量分数排序截 top_k
+        return sorted(results, key=lambda r: r.get("score", 0), reverse=True)[:final_top_k]
+
+    def _apply_rerank(
+        self,
+        query: str,
+        candidates: List[Dict[str, Any]],
+        final_top_k: int,
+    ) -> List[Dict[str, Any]]:
+        """qwen3-rerank 精排。失败时退回向量分数排序。"""
+        try:
+            reranker = self._get_reranker()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Reranker not available, skip: %s", e)
+            return sorted(candidates, key=lambda r: r.get("score", 0), reverse=True)[:final_top_k]
+
+        docs = [_build_rerank_doc(c) for c in candidates]
+        pairs = reranker.rerank(query, docs, top_n=final_top_k)
+
+        # 全 0 分（客户端降级信号）→ 退回向量分数
+        if pairs and all(score == 0.0 for _, score in pairs):
+            return sorted(candidates, key=lambda r: r.get("score", 0), reverse=True)[:final_top_k]
+
+        out: List[Dict[str, Any]] = []
+        for idx, score in pairs:
+            if 0 <= idx < len(candidates):
+                item = dict(candidates[idx])
+                item["rerank_score"] = float(score)
+                item["score"] = float(score)   # 覆盖成 rerank 分数供 Ranker 参考
+                # 打标：这个候选经过 rerank
+                srcs = item.setdefault("recall_sources", [])
+                if "rerank" not in srcs:
+                    srcs.append("rerank")
+                out.append(item)
+        return out
+
+    # ── Milvus relaxed 兜底 ─────────────────────────────────
+    async def _milvus_relaxed_recall(
+        self,
+        plan: ShoppingRetrievalPlan,
+        need: ShoppingNeed,
+    ) -> List[Dict[str, Any]]:
+        """按 plan.relaxed_filters 依次放宽，取第一个能出 5+ 结果的档。"""
+        store = self._get_milvus_store()
+        query = plan.primary_query or (need.category or "")
+
+        for relaxed in plan.relaxed_filters:
+            filters = _relaxed_to_milvus_filters(relaxed)
+            try:
+                results = store.hybrid_search(query, filters=filters, top_k=plan.top_k)
+                if results:
+                    return results
+            except Exception as e:  # noqa: BLE001
+                logger.warning("relaxed recall step failed (%s): %s", filters, e)
+                continue
+        return []
+
+    # ── pgvector 降级路径 ───────────────────────────────────
+    async def _pgvector_fallback(
+        self,
+        plan: ShoppingRetrievalPlan,
+        need: ShoppingNeed,
+    ) -> List[Dict[str, Any]]:
+        """Milvus 挂时的最后一道防线：pgvector 单路 dense。"""
         pg = self._get_pg_store()
         query = plan.primary_query or " ".join(plan.semantic_queries[:3]) or (need.category or "")
         results = await pg.search(
@@ -104,26 +235,68 @@ class ShoppingRetriever:
         )
         return results or []
 
-    async def _relaxed_recall(
-        self, plan: ShoppingRetrievalPlan, need: ShoppingNeed
-    ) -> List[Dict[str, Any]]:
-        """按 plan.relaxed_filters 依次尝试，直到取到 5+ 个候选。
 
-        Phase 1a 简单实现：只放宽预算和偏好；Milvus 阶段会做多档阶梯。
-        """
-        pg = self._get_pg_store()
-        query = plan.primary_query or (need.category or "")
-        # 只保留 category，最宽松一档
-        results = await pg.search(
-            query=query,
-            top_k=plan.top_k,
-            category=need.category,
-            limit=plan.top_k,
-        )
-        return results or []
+# ---- helper functions ----------------------------------------------------
 
 
-# ---- helper: 打标 + 去重 --------------------------------------------------
+def _pick_search_mode(plan: ShoppingRetrievalPlan, need: ShoppingNeed) -> str:
+    """选检索模式。
+
+    - plan.search_mode 明确指定时按它走（供 A/B 测试）；
+    - 否则默认 hybrid。
+    """
+    mode = getattr(plan, "search_mode", None)
+    if mode in ("dense", "bm25", "sparse", "hybrid"):
+        return mode
+    return "hybrid"
+
+
+def _plan_to_milvus_filters(
+    plan: ShoppingRetrievalPlan, need: ShoppingNeed
+) -> Dict[str, Any]:
+    """把 plan + need 翻译成 ProductMilvusStore.search 的 filters dict。
+
+    优先用 plan.filters（Capability 可能自定义），缺失字段从 need 补。
+    """
+    filters: Dict[str, Any] = dict(plan.filters or {})
+    if need.category and not filters.get("category"):
+        filters["category"] = need.category
+    if need.brand and not filters.get("brand"):
+        filters["brand"] = need.brand
+    if need.budget_min is not None and "budget_min" not in filters:
+        filters["budget_min"] = need.budget_min
+    if need.budget_max is not None and "budget_max" not in filters:
+        filters["budget_max"] = need.budget_max
+    return filters
+
+
+def _relaxed_to_milvus_filters(relaxed: Dict[str, Any]) -> Dict[str, Any]:
+    """把 relaxed_filters 的一条翻译成 Milvus filters。
+
+    支持字段和 _plan_to_milvus_filters 一致。
+    """
+    out: Dict[str, Any] = {}
+    for key in ("category", "sub_category", "brand"):
+        v = relaxed.get(key)
+        if v:
+            out[key] = v
+    if "budget_max" in relaxed and relaxed["budget_max"] is not None:
+        out["budget_max"] = relaxed["budget_max"]
+    if "budget_min" in relaxed and relaxed["budget_min"] is not None:
+        out["budget_min"] = relaxed["budget_min"]
+    return out
+
+
+def _build_rerank_doc(item: Dict[str, Any]) -> str:
+    """为 rerank 拼一条 doc：title + tags + description。
+
+    rerank 模型只看文本，商品数值字段（price/rating）它不理解，别塞进去。
+    """
+    title = str(item.get("title") or "")
+    brand = str(item.get("brand") or "")
+    tags = str(item.get("tags") or "")
+    desc = str(item.get("description") or "")
+    return " ".join([title, brand, tags, desc[:400]]).strip()
 
 
 def _tag_recall_source(items: List[Dict[str, Any]], source: str) -> None:
@@ -139,11 +312,10 @@ def _dedupe_by_product_id(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen: Dict[int, Dict[str, Any]] = {}
     order: List[int] = []
     for item in items:
-        pid = int(item.get("product_id") or item.get("id") or 0)
+        pid = int(item.get("product_id") or 0)
         if pid == 0:
             continue
         if pid in seen:
-            # 合并 recall_sources
             for s in item.get("recall_sources") or []:
                 if s not in seen[pid].setdefault("recall_sources", []):
                     seen[pid]["recall_sources"].append(s)
@@ -153,10 +325,14 @@ def _dedupe_by_product_id(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [seen[pid] for pid in order]
 
 
-def build_retrieval_plan(need: ShoppingNeed, top_k: int = 20) -> ShoppingRetrievalPlan:
-    """把 ShoppingNeed 翻译成 ShoppingRetrievalPlan。
+# ---- build_retrieval_plan（供 Capability 用）------------------------------
 
-    独立函数好单测（不依赖 Retriever 实例）。
+def build_retrieval_plan(need: ShoppingNeed, top_k: int = 5) -> ShoppingRetrievalPlan:
+    """把 ShoppingNeed 翻译成 ShoppingRetrievalPlan（Phase 1b 版）。
+
+    - top_k：最终返回给排序器的候选数（默认 5）
+    - initial_top_k：hybrid 一路的召回数（默认 config.RAG_INITIAL_TOP_K=20）
+    - use_rerank：默认 True，走两阶段精排
     """
     parts: List[str] = []
     if need.preferences:
@@ -169,10 +345,11 @@ def build_retrieval_plan(need: ShoppingNeed, top_k: int = 20) -> ShoppingRetriev
         parts.extend(need.scenario[:2])
     if need.category:
         parts.append(need.category)
+    if need.brand:
+        parts.append(need.brand)
     primary = " ".join(parts) if parts else (need.category or "")
 
     semantic_queries = [primary]
-    # 派生 query：category 单独一条兜底（当 primary 里塞了很多词时）
     if need.category and need.category not in semantic_queries:
         semantic_queries.append(need.category)
     if need.skin_type and need.category:
@@ -190,9 +367,12 @@ def build_retrieval_plan(need: ShoppingNeed, top_k: int = 20) -> ShoppingRetriev
 
     relaxed: List[Dict[str, Any]] = []
     if need.budget_max is not None:
-        # 预算 * 1.2 兜底
         relaxed.append({**filters, "budget_max": need.budget_max * 1.2})
-    relaxed.append({"category": need.category} if need.category else {})
+    if need.category:
+        relaxed.append({"category": need.category})
+
+    # 召回数：rerank 需要更多候选（默认 20）；不 rerank 直接按 top_k
+    initial_top_k = config.RAG_INITIAL_TOP_K
 
     return ShoppingRetrievalPlan(
         primary_query=primary,
@@ -201,6 +381,6 @@ def build_retrieval_plan(need: ShoppingNeed, top_k: int = 20) -> ShoppingRetriev
         filters=filters,
         relaxed_filters=[r for r in relaxed if r],
         top_k=top_k,
-        initial_top_k=top_k,
-        use_rerank=False,   # Phase 1a pgvector 没有 rerank；1b Milvus 时切 True
+        initial_top_k=initial_top_k,
+        use_rerank=True,   # Phase 1b：默认开 rerank
     )
