@@ -340,7 +340,10 @@ class KnowledgeAgent:
             return cached
 
         # 每次调用使用唯一 thread_id，确保不受内部 tool_call 消息污染。
-        # recursion_limit=12：高于 ModelCallLimit(5) 的 ~10 步，让 ModelCallLimit 先干净退出。
+        # recursion_limit=20：跨轮指代 case（resolve_reference → search_knowledge → 再答）
+        # 需要 model+tool 各 3-4 次往返，加上 middleware 也算 step，12 步不够。
+        # ModelCallLimit(run_limit=5, exit_behavior="end") 兜底防真死循环。
+        # 观测：正常单轮问答 5-6 步，跨轮指代 8-10 步，20 有充裕余量。
         result = await self._get_agent().ainvoke(
             {
                 "messages": messages,
@@ -349,7 +352,7 @@ class KnowledgeAgent:
             },
             config={
                 "configurable": {"thread_id": str(uuid4())},
-                "recursion_limit": 12,
+                "recursion_limit": 20,
             },
         )
 
