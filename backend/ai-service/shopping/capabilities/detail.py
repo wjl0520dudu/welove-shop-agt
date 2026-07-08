@@ -108,40 +108,86 @@ def _resolve_product_id(
 
 
 async def _load_product_detail_raw(product_id: int) -> Dict[str, Any]:
-    """调用旧 get_product_detail 工具的内部函数版（不经过 @tool 封装）。
+    """加载单个商品的主档 + SKU。
 
-    get_product_detail 是 @tool 装饰过的，直接 ainvoke 也行；这里手动构 runtime state。
+    Phase 1b 起分工：
+    - **主档**（title/brand/price/description/tags/image/rating 等）从 **Milvus** 读，
+      因为商品数据已从 pgvector 迁到 product_mm_collection。PG 主库暂时可能没有对应 row
+      （合成 product_id 映射 100001~ 只写进了 Milvus）。
+    - **SKU 列表**从 **PG** 读（如果表里有），供 focus=price/stock/sku 用；
+      PG 里没这个商品的 SKU 就返回空列表 —— 上层根据 facts["skus"] 是否为空决定
+      是否报"暂无 SKU"。
     """
-    # 直接 invoke 工具：@tool 支持 async invoke，但需要 runtime 参数
-    # 简单做法：把 tool 里的 SQL 逻辑抄一次，避免依赖 runtime。改成直接查库。
-    from sqlalchemy import select
-    from core.database import get_session_factory
-    from shopping.orm_models import ProductORM, ProductSkuORM
-    from tools.shopping_tools import _dump_product
+    from shopping.vector_store import get_product_milvus_store
 
-    session_factory = get_session_factory()
-    async with session_factory() as session:
-        product = (await session.execute(
-            select(ProductORM).where(ProductORM.id == product_id)
-        )).scalar_one_or_none()
-        if not product:
-            return {}
-        sku_rows = (await session.execute(
-            select(ProductSkuORM).where(ProductSkuORM.product_id == product_id)
-        )).scalars().all()
+    # ── 1. 从 Milvus 拿主档 ──
+    try:
+        store = get_product_milvus_store()
+        # Milvus query 走 filter 精确 lookup，用 product_id 主键
+        from pymilvus import Collection
+        collection = Collection(store.collection_name)
+        collection.load()
+        rows = collection.query(
+            expr=f"product_id == {int(product_id)}",
+            output_fields=[
+                "product_id", "title", "brand", "image_url", "description",
+                "category", "sub_category", "tags",
+                "base_price", "rating", "sales_count", "review_count", "status",
+            ],
+            limit=1,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("Milvus query 商品主档失败 product_id=%s", product_id, exc_info=True)
+        rows = []
 
-    data = _dump_product(product)
-    data["skus"] = [
-        {
-            "id": s.id,
-            "skuCode": s.sku_code or "",
-            "properties": s.properties or {},
-            "price": float(s.price) if s.price is not None else None,
-            "stock": s.stock,
-            "isDefault": s.is_default,
-        }
-        for s in sku_rows
-    ]
+    if not rows:
+        return {}
+
+    r = rows[0]
+    base_price = float(r.get("base_price") or 0)
+    data: Dict[str, Any] = {
+        "product_id": int(r.get("product_id") or product_id),
+        "title": r.get("title") or "",
+        "brand": r.get("brand") or "",
+        "price": base_price,
+        "base_price": base_price,
+        "image_url": r.get("image_url") or "",
+        "description": r.get("description") or "",
+        "category": r.get("category") or "",
+        "sub_category": r.get("sub_category") or "",
+        "tags": r.get("tags") or "",
+        "rating": float(r.get("rating") or 0),
+        "sales_count": int(r.get("sales_count") or 0),
+        "review_count": int(r.get("review_count") or 0),
+        "status": int(r.get("status") or 0),
+    }
+
+    # ── 2. SKU 从 PG 读（有就带上，没有留空）──
+    try:
+        from sqlalchemy import select
+        from core.database import get_session_factory
+        from shopping.orm_models import ProductSkuORM
+
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            sku_rows = (await session.execute(
+                select(ProductSkuORM).where(ProductSkuORM.product_id == product_id)
+            )).scalars().all()
+        data["skus"] = [
+            {
+                "id": s.id,
+                "skuCode": s.sku_code or "",
+                "properties": s.properties or {},
+                "price": float(s.price) if s.price is not None else None,
+                "stock": s.stock,
+                "isDefault": s.is_default,
+            }
+            for s in sku_rows
+        ]
+    except Exception:  # noqa: BLE001
+        logger.warning("PG SKU 查询失败 product_id=%s，SKU 留空", product_id, exc_info=True)
+        data["skus"] = []
+
     return data
 
 

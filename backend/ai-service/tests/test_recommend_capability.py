@@ -167,17 +167,27 @@ class TestRecommendCapabilityRun:
         }
         parsed_current = ShoppingNeed(category="护肤品", budget_max=300)
 
-        mock_store = MagicMock()
-        mock_store.search = AsyncMock(return_value=[
-            {"product_id": 1, "title": "面霜", "price": 250, "brand": "X",
+        # Phase 1b：主链路走 Milvus，注入 milvus_store mock（不再是 pg_vector_store）
+        mock_milvus = MagicMock()
+        candidates = [
+            {"product_id": 1, "title": "面霜", "price": 250, "base_price": 250, "brand": "X",
              "tags": "护肤 保湿", "description": "适合成熟肌肤", "category": "护肤品",
-             "sales_count": 500, "rating": 4.7},
-            {"product_id": 2, "title": "精华", "price": 280, "brand": "Y",
+             "sales_count": 500, "rating": 4.7, "score": 0.9, "recall_sources": []},
+            {"product_id": 2, "title": "精华", "price": 280, "base_price": 280, "brand": "Y",
              "tags": "护肤 抗老", "description": "抗初老", "category": "护肤品",
-             "sales_count": 300, "rating": 4.6},
-        ])
+             "sales_count": 300, "rating": 4.6, "score": 0.85, "recall_sources": []},
+        ]
+        mock_milvus.search = MagicMock(return_value=candidates)
+        mock_milvus.hybrid_search = MagicMock(return_value=candidates)
+
+        # rerank 直接把两个候选按原顺序返回（保持真实概率）
+        mock_rerank = MagicMock()
+        mock_rerank.rerank = MagicMock(return_value=[(0, 0.95), (1, 0.85)])
+
         from shopping.retrieval import ShoppingRetriever
-        cap = RecommendCapability(retriever=ShoppingRetriever(pg_vector_store=mock_store))
+        cap = RecommendCapability(
+            retriever=ShoppingRetriever(milvus_store=mock_milvus, reranker=mock_rerank),
+        )
 
         p_pending, p_remember, p_clear, p_cards = self._patch_pending(pending=pending_dict)
 
@@ -201,10 +211,14 @@ class TestRecommendCapabilityRun:
     def test_empty_candidates_returns_empty(self):
         """检索无结果 → action=empty。"""
         parsed = ShoppingNeed(category="不存在的品类")
-        mock_store = MagicMock()
-        mock_store.search = AsyncMock(return_value=[])
+        # Phase 1b：主链路 Milvus，注入空 milvus_store（不再是 pg_vector_store）
+        mock_milvus = MagicMock()
+        mock_milvus.search = MagicMock(return_value=[])
+        mock_milvus.hybrid_search = MagicMock(return_value=[])
         from shopping.retrieval import ShoppingRetriever
-        cap = RecommendCapability(retriever=ShoppingRetriever(pg_vector_store=mock_store))
+        cap = RecommendCapability(
+            retriever=ShoppingRetriever(milvus_store=mock_milvus, reranker=MagicMock()),
+        )
 
         p_pending, p_remember, p_clear, p_cards = self._patch_pending(pending=None)
 

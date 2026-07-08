@@ -249,3 +249,32 @@ class TestShoppingRetriever:
 
         # search 被调用时 mode=dense
         assert milvus.search.call_args.kwargs["mode"] == "dense"
+
+    def test_category_fallback_when_filter_returns_zero(self):
+        """category filter 命中 0 条时，去掉 category 再来一次（"护肤品"这类泛化词兜底）。"""
+        milvus = MagicMock()
+        # 第一次带 category="护肤品" filter 返回空
+        # 第二次无 category filter 返回 3 条
+        fallback_hits = [
+            {"product_id": i, "title": f"P{i}", "score": 0.5 - i * 0.01, "recall_sources": []}
+            for i in range(3)
+        ]
+        milvus.search = MagicMock(side_effect=[[], fallback_hits])
+        rerank = MagicMock()
+        rerank.rerank = MagicMock(return_value=[(0, 0.9), (1, 0.8), (2, 0.7)])
+
+        retriever = ShoppingRetriever(milvus_store=milvus, reranker=rerank)
+
+        plan = ShoppingRetrievalPlan(top_k=3, use_rerank=True)
+        need = ShoppingNeed(category="护肤品", budget_max=300)
+        out, trace = asyncio.run(retriever.retrieve(plan, need))
+
+        # 第二次 search 应该不带 category
+        second_call_filters = milvus.search.call_args_list[1].kwargs["filters"]
+        assert "category" not in second_call_filters
+        assert "budget_max" in second_call_filters   # 保留其他 filter
+
+        # trace 应该有 fallback 标记
+        assert any("no_cat" in t.get("source", "") for t in trace)
+        # 输出有结果
+        assert len(out) == 3

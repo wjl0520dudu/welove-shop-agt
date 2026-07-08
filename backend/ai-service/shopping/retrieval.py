@@ -146,6 +146,25 @@ class ShoppingRetriever:
         trace.append({"source": f"milvus_{mode}", "status": "ok", "count": len(results),
                       "filters": filters, "query": query})
 
+        # ── category 兜底：filter 里带了 category 但零命中 → 去掉 category 再来一次 ──
+        # 场景：LLM 抽出的 category 词跟库里两级类目都对不上（如 "护肤品" vs 库里
+        # "美妆护肤/面霜"）。语义 hybrid 本身对 "护肤品" 的召回能力是好的，只是被
+        # 死板的 filter 拦掉了 —— 松掉 filter 让 hybrid 语义救场。
+        if not results and filters.get("category"):
+            no_cat_filters = {k: v for k, v in filters.items() if k not in ("category", "sub_category")}
+            fallback_results = store.search(
+                query=query,
+                mode=mode,
+                filters=no_cat_filters,
+                top_k=recall_top_k,
+            )
+            if fallback_results:
+                _tag_recall_source(fallback_results, f"{mode}_no_cat")
+                trace.append({"source": f"milvus_{mode}_no_cat", "status": "ok",
+                              "count": len(fallback_results), "filters": no_cat_filters,
+                              "note": "category 精确匹配失败，走无 category filter 语义召回兜底"})
+                results = fallback_results
+
         if not results:
             return []
 

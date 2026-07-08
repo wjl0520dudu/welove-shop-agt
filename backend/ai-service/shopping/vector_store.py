@@ -120,7 +120,12 @@ def build_milvus_filter_expr(
     支持字段（见 _FILTERABLE_FIELDS）：
     - product_id: int → `product_id == 42`
     - product_ids: List[int] → `product_id in [1,2,3]`
-    - category / sub_category / brand: str → `category == "防晒"`
+    - category: str → `(category == "防晒" || sub_category == "防晒")`
+                       ★ 关键：LLM 抽出的品类词可能是顶级类目（"美妆护肤"）
+                       也可能是子类目（"防晒" / "面霜" / "速干 T 恤"）。
+                       统一做 OR 匹配，两级都试，避免 "防晒" 命中 category（顶级）失败。
+    - sub_category: str → `sub_category == "..."`  显式子类目（跳过 OR，精确匹配）
+    - brand: str → `brand == "Nike"`
     - budget_min / budget_max: float → `base_price >= 100 && base_price <= 200`
     - min_rating: float → `rating >= 4.5`
     - status: int → `status == 1`（默认加，除非显式传 status=None）
@@ -135,12 +140,23 @@ def build_milvus_filter_expr(
         ids = ", ".join(str(int(x)) for x in filters["product_ids"])
         parts.append(f"product_id in [{ids}]")
 
-    # 字符串等值
-    for field in ("category", "sub_category", "brand"):
-        v = filters.get(field)
-        if v:
-            v = str(v).replace('"', '\\"')
-            parts.append(f'{field} == "{v}"')
+    # category：两级 OR 匹配（顶级 || 子类目）
+    cat = filters.get("category")
+    if cat:
+        cat_esc = str(cat).replace('"', '\\"')
+        parts.append(f'(category == "{cat_esc}" || sub_category == "{cat_esc}")')
+
+    # sub_category 显式传时精确匹配（供高级场景，比如 Capability 内部想强制子类）
+    sub_cat = filters.get("sub_category")
+    if sub_cat:
+        sub_esc = str(sub_cat).replace('"', '\\"')
+        parts.append(f'sub_category == "{sub_esc}"')
+
+    # brand
+    brand = filters.get("brand")
+    if brand:
+        brand_esc = str(brand).replace('"', '\\"')
+        parts.append(f'brand == "{brand_esc}"')
 
     # 预算区间
     bmin = filters.get("budget_min")

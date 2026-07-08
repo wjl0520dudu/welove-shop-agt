@@ -66,7 +66,8 @@ class TestBuildMilvusFilterExpr:
 
     def test_category_and_price(self):
         expr = build_milvus_filter_expr({"category": "防晒", "budget_max": 200})
-        assert 'category == "防晒"' in expr
+        # category 走两级 OR 匹配（顶级或子类都算命中）
+        assert '(category == "防晒" || sub_category == "防晒")' in expr
         assert "base_price <= 200.0" in expr
         assert "status == 1" in expr
 
@@ -92,6 +93,21 @@ class TestBuildMilvusFilterExpr:
         """品牌名带引号时应转义，避免语法错误。"""
         expr = build_milvus_filter_expr({"brand": 'a"b'})
         assert '\\"' in expr
+
+    def test_sub_category_precise_match(self):
+        """只传 sub_category 时走精确匹配（不带 category 的 OR 括号形式）。"""
+        expr = build_milvus_filter_expr({"sub_category": "防晒"})
+        assert 'sub_category == "防晒"' in expr
+        # 只传 sub_category 时，不会出现顶级 category 的 OR 括号（那是 filter["category"] 触发的）
+        assert '(category == ' not in expr
+
+    def test_category_or_matches_both_levels(self):
+        """category filter 覆盖顶级和子类目两个字段。"""
+        expr = build_milvus_filter_expr({"category": "美妆护肤"})
+        # 顶级类目"美妆护肤"存在 → 命中 category == "美妆护肤"
+        # 子类目"美妆护肤"不存在 → OR 里另一路空转
+        # 但表达式必须两个都写，才能兼容"防晒"这种子类目 case
+        assert '(category == "美妆护肤" || sub_category == "美妆护肤")' in expr
 
     def test_budget_range(self):
         expr = build_milvus_filter_expr({"budget_min": 100, "budget_max": 300})

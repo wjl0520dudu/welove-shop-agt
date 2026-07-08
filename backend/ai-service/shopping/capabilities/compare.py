@@ -28,10 +28,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
-
-from core.database import get_session_factory
-from shopping.orm_models import ProductORM
 from shopping.schemas import CompareToolResult, ShoppingContext
 from tools.reference_tools import (
     _resolve_ordinal,
@@ -41,7 +37,6 @@ from tools.reference_tools import (
 from tools.shopping_tools import (
     ProductFeatures,
     _cards_from_products,
-    _dump_product,
     _extract_product_features,
 )
 
@@ -74,18 +69,54 @@ def _extract_focus(query: str) -> str:
 
 
 async def _load_products_by_ids(product_ids: List[int]) -> List[Dict[str, Any]]:
-    """按 product_id 列表批量拉商品主档。"""
+    """按 product_id 列表批量拉商品主档。
+
+    Phase 1b 起走 Milvus（商品数据在 product_mm_collection），
+    跟 DetailCapability._load_product_detail_raw 保持同一数据源。
+    """
     if not product_ids:
         return []
-    session_factory = get_session_factory()
-    async with session_factory() as session:
-        rows = (
-            await session.execute(
-                select(ProductORM).where(ProductORM.id.in_(product_ids))
-            )
-        ).scalars().all()
+    from shopping.vector_store import get_product_milvus_store
+    from pymilvus import Collection
+
+    try:
+        store = get_product_milvus_store()
+        collection = Collection(store.collection_name)
+        collection.load()
+        ids_expr = ", ".join(str(int(x)) for x in product_ids)
+        rows = collection.query(
+            expr=f"product_id in [{ids_expr}]",
+            output_fields=[
+                "product_id", "title", "brand", "image_url", "description",
+                "category", "sub_category", "tags",
+                "base_price", "rating", "sales_count", "review_count",
+            ],
+            limit=len(product_ids),
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("Milvus query 商品主档失败 product_ids=%s", product_ids, exc_info=True)
+        return []
+
     # 保持传入顺序
-    by_id = {int(p.id): _dump_product(p) for p in rows}
+    by_id: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        pid = int(r.get("product_id") or 0)
+        base_price = float(r.get("base_price") or 0)
+        by_id[pid] = {
+            "product_id": pid,
+            "title": r.get("title") or "",
+            "brand": r.get("brand") or "",
+            "price": base_price,
+            "base_price": base_price,
+            "image_url": r.get("image_url") or "",
+            "description": r.get("description") or "",
+            "category": r.get("category") or "",
+            "sub_category": r.get("sub_category") or "",
+            "tags": r.get("tags") or "",
+            "rating": float(r.get("rating") or 0),
+            "sales_count": int(r.get("sales_count") or 0),
+            "review_count": int(r.get("review_count") or 0),
+        }
     return [by_id[pid] for pid in product_ids if pid in by_id]
 
 
