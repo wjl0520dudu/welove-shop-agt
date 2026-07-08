@@ -1,6 +1,22 @@
 """把 backend/db/data 里的 100 商品灌进 Milvus product_mm_collection。
 
+⚠️ **LEGACY / 冷启专用** —— 生产运维**不要**走这个脚本！
+
+## 什么时候用它
+
+只在 PG 里还没有商品数据、需要给 Milvus 灌一批冒烟数据时用。它的 product_id
+是从 JSON 里的字符串 code（"p_beauty_001"）**合成**出来的（100001 / 200001 / ...），
+跟 PG 的 product.id（1-100 自然主键）**对不上**。
+
+## 生产运维走哪个？
+
+`scripts/sync_products_pg_to_milvus.py` —— 那个是权威路径：
+- PG 是商品的唯一真源
+- Milvus product_id = PG.id（一一对应，无需映射转换）
+- 支持全量 / 增量 / 单商品同步 + watermark
+
 ## 数据源
+
 ```
 backend/db/data/ecommerce_agent_dataset/
   1_美妆护肤/data/p_beauty_*.json    (25 商品)
@@ -12,12 +28,17 @@ backend/db/data/ecommerce_agent_dataset/
 每个 JSON 有 title / brand / category / sub_category / base_price / image_path /
 skus / rag_knowledge。rag_knowledge.marketing_description 用来做 description（→ BM25 + dense）。
 
-## product_id 映射
+## product_id 映射（**仅本 legacy 脚本使用**）
+
 数据集里的 product_id 是字符串 `p_beauty_001`。Milvus 主键必须 INT64，用：
     prefix_num * 100000 + seq
     beauty=1 → 100001, digital=2 → 200001, clothes=3 → 300001, food=4 → 400001
 
-## 用法
+跑完之后**必须**接一次 `sync_products_pg_to_milvus.py --mode full` 把合成 id
+数据换成 PG.id 数据（sync 脚本会 diff 出老 id 并自动删除）。
+
+## 用法（仅冷启）
+
     # 冒烟：每类灌 3 个 = 12 商品
     python scripts/ingest_products_to_milvus.py --limit 3
 
@@ -176,12 +197,21 @@ def _collect_json_files(data_root: Path, category: Optional[str], limit: Optiona
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ingest products to Milvus product_mm_collection")
+    parser = argparse.ArgumentParser(
+        description="[LEGACY] Ingest products to Milvus product_mm_collection from JSON files. "
+                    "生产运维请用 sync_products_pg_to_milvus.py",
+    )
     parser.add_argument("--limit", type=int, default=None, help="每类最多灌几个（冒烟用）")
     parser.add_argument("--category", choices=list(_CATEGORY_DIRS.keys()),
                         help="只灌指定类目（beauty/digital/clothes/food）")
     parser.add_argument("--batch-size", type=int, default=10, help="每批 upsert 多少个（DashScope 单次 batch=10）")
     args = parser.parse_args()
+
+    logger.warning(
+        "⚠️  这是 legacy 冷启脚本。product_id 从 JSON code 合成（100001~），"
+        "跟 PG.id（1~100）**不一致**。跑完后必须接 sync_products_pg_to_milvus.py --mode full "
+        "把合成 id 数据替换成 PG.id 数据。生产运维不要走这个脚本。"
+    )
 
     data_root = _resolve_data_root()
     if not data_root.exists():
