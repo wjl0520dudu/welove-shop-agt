@@ -77,6 +77,7 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             result = await get_knowledge().run(
                 messages=messages,
                 conversation_id=state.get("conversation_id", ""),
+                user_id=state.get("user_id"),
             )
             # 无检索结果兜底：sources 为空 或 has_answer=False 时补一句引导，
             # 但 task_type 保持 knowledge —— 不要伪装成 chitchat，否则前端行为错乱。

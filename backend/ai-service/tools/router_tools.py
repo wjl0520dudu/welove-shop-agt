@@ -173,6 +173,14 @@ def format_business_memory_for_router(memory: Optional[Dict[str, Any]]) -> str:
         title = focused.get("title") or f"商品{focused.get('product_id', 'N/A')}"
         parts.append(f"[当前关注商品] {title}")
 
+    # 知识实体：Router 靠这个判断"第二个的成分"该走 knowledge 还是 shopping。
+    # 有商品且无实体 → 商品指代；有实体且无商品 → 知识实体指代；两者都有由 prompt 里的
+    # "指代词性质"规则区分（商品维度词 vs 知识维度词）。
+    entities = memory.get("last_knowledge_entities") or []
+    if entities:
+        entity_lines = [f"  {i}. {e}" for i, e in enumerate(entities, 1)]
+        parts.append("[上轮谈到的知识实体]\n" + "\n".join(entity_lines))
+
     prefs = memory.get("user_preferences") or {}
     if prefs:
         # 精简：只保留 skin_type / gender / preference_tags

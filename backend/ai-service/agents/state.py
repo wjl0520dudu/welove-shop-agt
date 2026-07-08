@@ -53,3 +53,17 @@ class ShoppingAgentState(AgentState):
     conversation_id: NotRequired[str]
     user_id: NotRequired[int | str]
     jwt_token: NotRequired[str]
+
+
+class KnowledgeAgentState(AgentState):
+    """KnowledgeAgent 内部 state：继承 AgentState（含 messages），额外携带
+    conversation_id / user_id 给 ToolRuntime 里的工具读取。
+
+    KnowledgeAgent 也挂了 resolve_reference（跨 shopping/knowledge 的指代消解），
+    resolve_reference 要从 runtime.state 拿 conversation_id 去读 Store 里的
+    last_knowledge_entities / last_product_cards。
+
+    KnowledgeAgent 不调 Java 后端，所以不需要 jwt_token。
+    """
+    conversation_id: NotRequired[str]
+    user_id: NotRequired[int | str]

@@ -1,26 +1,46 @@
-"""指代消解工具 —— 显式解析用户问题中的商品指代表达。
+"""指代消解工具 —— 显式解析用户问题中的商品/知识实体指代表达。
 
-resolve_reference 工具负责把 "第二个"、"刚才那个"、"更便宜的" 等模糊指代
-解析为具体商品，让 ShoppingAgent 不再靠 LLM 自行猜测。
+resolve_reference 工具负责把 "第二个"、"刚才那个"、"更便宜的"、"它" 等模糊指代
+解析为具体商品或知识实体，让 Agent 不再靠 LLM 自行猜测。
+
+## 两种解析域
+
+### 商品域（ShoppingAgent 使用）
+从 Store 的 last_product_cards / last_focused_product 里定位商品，
+返回 matched_product（单数）或 matched_products（复数）。
+
+### 知识实体域（KnowledgeAgent 使用）
+从 Store 的 last_knowledge_entities 里定位实体（成分名、产品名等），
+返回 matched_entity（单数）或 matched_entities（复数）。
+
+**优先级：商品指代命中优先**（product 有 product_id 更结构化，
+且 shopping 场景对指代的定位精度要求更高）。商品未命中再尝试实体。
 
 ## 支持的指代类型
 
 | 类型 | 示例 | 解析方式 |
 |------|------|----------|
 | 序号指代 | "第二个"、"最后一款"、"倒数第一个" | last_product_cards[index] |
+| 复数/集合 | "他们三"、"这三款"、"这几款" | last_product_cards 多款 |
 | 代词指代 | "刚才那个"、"这个"、"那个"、"它" | last_focused_product 或 cards[0] |
-| 比较指代 | "更便宜的"、"评分更高的"、"销量多的" | 在 last_product_cards 中按字段排序取最优 |
-| 隐式指代 | "还有别的颜色吗"、"多少钱" | 指向 last_focused_product |
+| 比较指代 | "更便宜的"、"评分更高的"、"销量多的" | last_product_cards 按字段排序取最优 |
+| 隐式指代 | "还有别的颜色吗"、"多少钱" | last_focused_product |
+| **实体序号** | 上一轮"烟酰胺和视黄醇" → "第二个成分" | last_knowledge_entities[1] |
+| **实体复数** | 上一轮"A/B/C" → "它们都能空腹用吗" | last_knowledge_entities 全部 |
+| **实体隐式** | 上一轮谈"烟酰胺" → "副作用有哪些"（无商品上下文） | last_knowledge_entities[0] |
 
 ## 工具返回结构
 
 ```json
 {
   "has_reference": true,
-  "resolved_query": "「XX粉底液」多少钱",
-  "matched_product": {...},
-  "reference_type": "ordinal",
-  "hint": "已将「第二个」解析为「XX粉底液」，请基于此商品回答"
+  "resolved_query": "「视黄醇」的成分是什么",
+  "matched_product": {...} | null,           // 商品域命中时
+  "matched_products": [...],                 // 商品复数
+  "matched_entity": "视黄醇" | null,          // 实体域命中时
+  "matched_entities": ["视黄醇"],            // 实体复数
+  "reference_type": "ordinal|entity_ordinal|...",
+  "hint": "已将「第二个」解析为「视黄醇」，请基于此实体检索"
 }
 ```
 
@@ -254,6 +274,136 @@ def _resolve_implicit(
     return None
 
 
+# ---- 知识实体域解析 --------------------------------------------------------
+# 复用商品域的序号 / 复数正则模式（"第二个"、"这三个"、"它们"都通用）；
+# 但隐式指代的触发词不同：知识场景没有"多少钱""还有颜色吗"这类，改成
+# "副作用"、"功效"、"成分"、"怎么用"这类跟知识主体强绑定的词。
+
+# 实体隐式指代触发词：句子里出现这些词、且没有明确说主语，就认为在
+# 追问上一轮谈到的实体。区别于商品的 _IMPLICIT_MARKERS。
+_ENTITY_IMPLICIT_MARKERS = [
+    "副作用", "禁忌", "禁用", "不良反应",
+    "功效", "作用", "效果", "有用吗", "有效吗",
+    "成分", "有什么成分", "含什么",
+    "怎么用", "怎样用", "怎么使用", "用法",
+    "适合什么", "适合哪种", "适合谁",
+    "浓度", "剂量",
+    "原理", "机制",
+]
+
+
+def _resolve_entity_ordinal(
+    query: str, entities: List[str]
+) -> Optional[Dict[str, Any]]:
+    """实体序号指代：'第二个'、'最后一个' → last_knowledge_entities[index]。
+
+    正则模式与商品序号完全一致（"第二个/最后一个/倒数第 N 个"），
+    只是拿 index 去查实体列表而非商品列表。
+    """
+    if not entities:
+        return None
+    for pattern, index_fn in _ORDINAL_PATTERNS:
+        m = re.search(pattern, query)
+        if not m:
+            continue
+        try:
+            idx = index_fn(m)
+        except (TypeError, ValueError):
+            continue
+        if idx == -1 and "最后" not in m.group():
+            continue
+        if 0 <= idx < len(entities):
+            entity = entities[idx]
+        elif idx < 0 and abs(idx) <= len(entities):
+            entity = entities[idx]
+        else:
+            return None
+        resolved = re.sub(pattern, f"「{entity}」", query, count=1)
+        return {
+            "has_reference": True,
+            "resolved_query": resolved,
+            "matched_entity": entity,
+            "matched_entities": [entity],
+            "reference_type": "entity_ordinal",
+            "hint": f"已将序号指代解析为上一轮知识实体「{entity}」，请基于此实体检索/回答。",
+        }
+    return None
+
+
+def _resolve_entity_plural(
+    query: str, entities: List[str]
+) -> Optional[Dict[str, Any]]:
+    """实体复数指代：'它们'、'这几个'、'他们三' → last_knowledge_entities 多个。"""
+    if not entities:
+        return None
+
+    n: Optional[int] = None
+    matched = False
+
+    m = _PLURAL_NUM_PATTERN.search(query)
+    if m:
+        n = _parse_numeral(m.group(1))
+        matched = True
+
+    if not matched:
+        m2 = _PLURAL_PRONOUN_NUM_PATTERN.search(query)
+        if m2:
+            n = _parse_numeral(m2.group(1))
+            matched = True
+
+    if not matched and any(p in query for p in _PLURAL_PRONOUNS):
+        matched = True
+
+    if not matched:
+        return None
+
+    picked = list(entities[:n]) if n else list(entities)
+    if not picked:
+        return None
+
+    names = "、".join(picked)
+    return {
+        "has_reference": True,
+        "resolved_query": query,
+        "matched_entity": picked[0],       # 兼容单数字段
+        "matched_entities": picked,
+        "reference_type": "entity_plural",
+        "hint": (
+            f"已将指代解析为上一轮知识实体：{names}。"
+            f"请针对这些实体分别检索/回答，禁止把整句原样丢进 search_knowledge。"
+        ),
+    }
+
+
+def _resolve_entity_implicit(
+    query: str, entities: List[str]
+) -> Optional[Dict[str, Any]]:
+    """实体隐式指代：句里含 '副作用/功效/成分/怎么用' 等词、没有明确主语，
+    就认为在追问上一轮谈到的（首个）实体。
+
+    只在没匹配到商品指代且 last_knowledge_entities 非空时才会走到这里。
+    只取首个实体（entities[0]）作为默认追问对象，因为多轮追问的
+    "副作用是什么"通常问的是上一轮讨论的主要对象。
+    """
+    if not entities:
+        return None
+    for marker in _ENTITY_IMPLICIT_MARKERS:
+        if marker in query:
+            entity = entities[0]
+            return {
+                "has_reference": True,
+                "resolved_query": query,
+                "matched_entity": entity,
+                "matched_entities": [entity],
+                "reference_type": "entity_implicit",
+                "hint": (
+                    f"此问题隐式追问上一轮知识实体「{entity}」的「{marker}」，"
+                    f"请以「{entity}」为检索主体。"
+                ),
+            }
+    return None
+
+
 def _resolve_plural(
     query: str, last_cards: List[Dict[str, Any]]
 ) -> Optional[Dict[str, Any]]:
@@ -324,20 +474,25 @@ def _resolve_plural(
 
 @tool(parse_docstring=True)
 async def resolve_reference(query: str, runtime: ToolRuntime) -> Dict[str, Any]:
-    """解析用户问题中的商品指代表达（如"第二个""刚才那个""更便宜的""他们三"）。
+    """解析用户问题中的商品/知识实体指代表达。
 
-    当用户问题中包含指向之前推荐商品的模糊表达时，**必须先调用此工具**解析，
-    拿到具体商品后再进行后续操作（查详情、对比、回答）。
+    支持两个域的指代消解：
+    - 商品域（ShoppingAgent）：从 last_product_cards / last_focused_product 定位商品
+    - 知识实体域（KnowledgeAgent）：从 last_knowledge_entities 定位实体（成分名等）
 
     **调用时机**：
-    - 用户说"第二个"/"第三款"/"最后一个" → 序号指代
-    - 用户说"他们三"/"这三款"/"这几款"/"它们"/"上面那几款" → 复数指代（多款）
-    - 用户说"刚才那个"/"这个"/"它" → 代词指代
-    - 用户说"更便宜的"/"评分高的那个"/"销量多的" → 比较指代（选一个最优）
-    - 用户说"这几款对比一下"/"他们三价格比较" → 复数 + 比较意图（调 compare_products）
-    - 用户说"还有别的颜色吗"/"多少钱" → 隐式指代（指向当前关注商品）
+    - 序号："第二个"、"第三款"、"最后一个"
+    - 复数："他们三"、"这三款"、"这几款"、"它们"
+    - 代词："刚才那个"、"这个"、"它"
+    - 比较："更便宜的"、"评分高的那个"（仅商品域）
+    - 隐式：
+      - 商品域："还有别的颜色吗"、"多少钱"（指 last_focused_product）
+      - 实体域："副作用"、"功效"、"怎么用"、"成分"（指 last_knowledge_entities[0]）
 
-    如果工具返回 has_reference=False，说明没有检测到指代，按正常流程处理即可。
+    **解析优先级**：商品域先于实体域。同一句话同时有两种上下文时，
+    优先返回商品域结果（product_id 更结构化，且 shopping 场景对指代精度要求高）。
+
+    如果两域都没命中，has_reference=False。
 
     Args:
         query: 用户当前问题文本。
@@ -347,9 +502,13 @@ async def resolve_reference(query: str, runtime: ToolRuntime) -> Dict[str, Any]:
         dict: {
             "has_reference": bool,
             "resolved_query": str,          # 解析后的 query
-            "matched_product": dict|None,   # 匹配到的（首个）商品，兼容单数场景
-            "matched_products": list,        # 复数指代时为多款商品列表（plural / plural_compare）
-            "reference_type": str|None,     # ordinal | plural | plural_compare | pronominal | comparative | implicit
+            "matched_product": dict|None,   # 商品域命中的（首个）商品
+            "matched_products": list,        # 商品域复数
+            "matched_entity": str|None,      # 实体域命中的（首个）实体
+            "matched_entities": list,        # 实体域复数
+            "reference_type": str|None,     # ordinal | plural | plural_compare |
+                                            # pronominal | comparative | implicit |
+                                            # entity_ordinal | entity_plural | entity_implicit
             "hint": str,                    # 给 LLM 的提示（含后续动作建议）
         }
     """
@@ -361,47 +520,84 @@ async def resolve_reference(query: str, runtime: ToolRuntime) -> Dict[str, Any]:
         memory = await get_business_memory(cid, uid)
     except Exception:
         logger.warning("resolve_reference: Store 读取失败", exc_info=True)
-        return {
-            "has_reference": False,
-            "resolved_query": query,
-            "matched_product": None,
-            "reference_type": None,
-            "hint": "无法读取业务记忆，无法解析指代。请直接按原始 query 处理。",
-        }
+        return _no_reference_result(query, hint="无法读取业务记忆，无法解析指代。请直接按原始 query 处理。")
 
     last_cards: List[Dict[str, Any]] = memory.get("last_product_cards") or []
     focused: Optional[Dict[str, Any]] = memory.get("last_focused_product")
+    entities: List[str] = memory.get("last_knowledge_entities") or []
 
-    # 按优先级尝试各类型解析（序号 > 复数 > 代词 > 比较 > 隐式）
-    for resolver in (
-        _resolve_ordinal,
-        _resolve_plural,
-        _resolve_pronominal,
-        _resolve_comparative,
-        _resolve_implicit,
-    ):
-        if resolver is _resolve_ordinal:
-            result = resolver(query, last_cards)
-        elif resolver is _resolve_plural:
-            result = resolver(query, last_cards)
-        elif resolver is _resolve_pronominal:
-            result = resolver(query, focused, last_cards)
-        elif resolver is _resolve_comparative:
-            result = resolver(query, last_cards)
-        else:
-            result = resolver(query, focused)
+    # ── 商品域：按优先级尝试各类型解析（序号 > 复数 > 代词 > 比较 > 隐式）──
+    product_result = _try_product_resolvers(query, last_cards, focused)
+    if product_result is not None:
+        return _pad_result(product_result)
 
-        if result is not None:
-            return result
+    # ── 实体域：商品域没命中才尝试（序号 > 复数 > 隐式）──
+    entity_result = _try_entity_resolvers(query, entities)
+    if entity_result is not None:
+        return _pad_result(entity_result)
 
-    # 没有检测到任何指代
+    return _no_reference_result(query, hint="未检测到指代表达，请按正常流程处理。")
+
+
+def _try_product_resolvers(
+    query: str,
+    last_cards: List[Dict[str, Any]],
+    focused: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """按优先级跑商品域解析器，返回第一个命中结果或 None。"""
+    if r := _resolve_ordinal(query, last_cards):
+        return r
+    if r := _resolve_plural(query, last_cards):
+        return r
+    if r := _resolve_pronominal(query, focused, last_cards):
+        return r
+    if r := _resolve_comparative(query, last_cards):
+        return r
+    if r := _resolve_implicit(query, focused):
+        return r
+    return None
+
+
+def _try_entity_resolvers(
+    query: str,
+    entities: List[str],
+) -> Optional[Dict[str, Any]]:
+    """按优先级跑实体域解析器，返回第一个命中结果或 None。"""
+    if r := _resolve_entity_ordinal(query, entities):
+        return r
+    if r := _resolve_entity_plural(query, entities):
+        return r
+    if r := _resolve_entity_implicit(query, entities):
+        return r
+    return None
+
+
+def _pad_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """给命中结果补齐缺失字段，让上游拿到统一 shape。
+
+    保证 matched_product / matched_products / matched_entity / matched_entities
+    都存在（缺失的填 None / []），避免下游 KeyError。
+    """
+    result.setdefault("matched_product", None)
+    result.setdefault("matched_products", [])
+    result.setdefault("matched_entity", None)
+    result.setdefault("matched_entities", [])
+    return result
+
+
+def _no_reference_result(query: str, hint: str) -> Dict[str, Any]:
+    """构造未命中的统一返回结构。"""
     return {
         "has_reference": False,
         "resolved_query": query,
         "matched_product": None,
+        "matched_products": [],
+        "matched_entity": None,
+        "matched_entities": [],
         "reference_type": None,
-        "hint": "未检测到指代表达，请按正常流程处理。",
+        "hint": hint,
     }
+
 
 
 # ---- 工具集合 ---------------------------------------------------------------

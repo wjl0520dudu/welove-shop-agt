@@ -3,9 +3,12 @@
 数据按生命周期分两层存储：
 
 - **会话级** `("conversations", cid, "business")`：
-  - last_product_cards：最近推荐的商品卡片
-  - last_focused_product：用户当前关注的商品
+  - last_product_cards：最近推荐的商品卡片（shopping 侧）
+  - last_focused_product：用户当前关注的商品（shopping 侧）
   - pending_cart_action：待确认的购物车操作
+  - last_knowledge_entities：上一轮知识问答里出现的实体列表（knowledge 侧）
+    例："烟酰胺和视黄醇能一起用吗" → ["烟酰胺", "视黄醇"]
+    下一轮"第二个的成分是什么" → 通过 resolve_reference 命中 "视黄醇"
 
 - **用户级** `("users", uid, "profile")`：
   - user_preferences：肤质、性别、预算偏好等长期画像
@@ -150,3 +153,48 @@ async def remember_user_preferences(
     existing = await _get_user(user_id)
     existing.update(preferences)
     await _set_user(user_id, existing)
+
+
+# ---- 知识实体记忆（KnowledgeAgent 侧）------------------------------------
+
+# 保留最近多少个实体。太多会让"第几个"这类序号指代变得不精准；太少又会
+# 覆盖不到一轮内多次提到的实体。5 是经验值：一句话里通常最多 3-4 个成分名。
+_MAX_KNOWLEDGE_ENTITIES = 5
+
+
+async def remember_knowledge_entities(
+    conversation_id: Optional[str],
+    user_id: Optional[int | str],
+    entities: List[str],
+) -> None:
+    """记住上一轮知识问答里出现的实体（会话级）。
+
+    实体来源：
+    - 用户问题中被明确点名的对象（"烟酰胺"、"视黄醇"）
+    - 检索到的 knowledge 片段里的关键实体（可选）
+
+    覆盖式写入（不追加），只保留"最新一轮"的实体列表，避免跨轮混淆。
+    去重保序 + 截断到 _MAX_KNOWLEDGE_ENTITIES 条。
+    """
+    if not entities:
+        return
+
+    # 去重保序：dict.fromkeys 天然做到
+    unique = [e.strip() for e in entities if e and e.strip()]
+    unique = list(dict.fromkeys(unique))[:_MAX_KNOWLEDGE_ENTITIES]
+    if not unique:
+        return
+
+    memory = await _get_conversation(conversation_id)
+    memory["last_knowledge_entities"] = unique
+    await _set_conversation(conversation_id, memory)
+
+
+async def clear_knowledge_entities(
+    conversation_id: Optional[str],
+    user_id: Optional[int | str],
+) -> None:
+    """清除会话级知识实体记忆（用户切换话题时用）。"""
+    memory = await _get_conversation(conversation_id)
+    memory.pop("last_knowledge_entities", None)
+    await _set_conversation(conversation_id, memory)

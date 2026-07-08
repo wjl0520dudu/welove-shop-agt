@@ -35,7 +35,7 @@ _CARDS = [
 _FOCUSED = {"product_id": 2, "title": "粉底液B", "price": 299}
 
 
-def _mock_get_memory(*, cards=None, focused=None, prefs=None):
+def _mock_get_memory(*, cards=None, focused=None, prefs=None, entities=None):
     """构造 get_business_memory 的返回。"""
     memory = {}
     if cards is not None:
@@ -44,6 +44,8 @@ def _mock_get_memory(*, cards=None, focused=None, prefs=None):
         memory["last_focused_product"] = focused
     if prefs is not None:
         memory["user_preferences"] = prefs
+    if entities is not None:
+        memory["last_knowledge_entities"] = entities
     return AsyncMock(return_value=memory)
 
 
@@ -363,3 +365,168 @@ class TestGracefulDegradation:
         result = asyncio.run(run())
         assert result["has_reference"] is False
         assert "无法读取业务记忆" in result["hint"]
+
+
+# ---- 知识实体指代 ----------------------------------------------------------
+
+_ENTITIES = ["烟酰胺", "视黄醇", "透明质酸"]
+
+
+class TestEntityOrdinalReference:
+    """实体域序号指代：上一轮谈过烟酰胺/视黄醇，本轮问'第二个的成分'。"""
+
+    def test_second_entity_matches_index_1(self):
+        from tools.reference_tools import resolve_reference
+
+        async def run():
+            with patch("tools.reference_tools.get_business_memory",
+                       _mock_get_memory(entities=_ENTITIES)):
+                return await resolve_reference.ainvoke({
+                    "query": "第二个的成分是什么",
+                    "runtime": _make_runtime(),
+                })
+
+        result = asyncio.run(run())
+        assert result["has_reference"] is True
+        assert result["reference_type"] == "entity_ordinal"
+        assert result["matched_entity"] == "视黄醇"
+        assert result["matched_entities"] == ["视黄醇"]
+        assert result["matched_product"] is None
+        assert "「视黄醇」" in result["resolved_query"]
+
+    def test_last_entity_matches_end(self):
+        from tools.reference_tools import resolve_reference
+
+        async def run():
+            with patch("tools.reference_tools.get_business_memory",
+                       _mock_get_memory(entities=_ENTITIES)):
+                return await resolve_reference.ainvoke({
+                    "query": "最后一个功效",
+                    "runtime": _make_runtime(),
+                })
+
+        result = asyncio.run(run())
+        assert result["has_reference"] is True
+        assert result["matched_entity"] == "透明质酸"
+
+    def test_no_entities_returns_no_match(self):
+        from tools.reference_tools import resolve_reference
+
+        async def run():
+            with patch("tools.reference_tools.get_business_memory",
+                       _mock_get_memory(entities=[])):
+                return await resolve_reference.ainvoke({
+                    "query": "第二个的成分",
+                    "runtime": _make_runtime(),
+                })
+
+        result = asyncio.run(run())
+        assert result["has_reference"] is False
+
+
+class TestEntityPluralReference:
+    """实体域复数指代：'它们'、'这几个' → 上轮多个实体。"""
+
+    def test_them_all_matches_all_entities(self):
+        from tools.reference_tools import resolve_reference
+
+        async def run():
+            with patch("tools.reference_tools.get_business_memory",
+                       _mock_get_memory(entities=_ENTITIES)):
+                return await resolve_reference.ainvoke({
+                    "query": "它们的副作用有哪些",
+                    "runtime": _make_runtime(),
+                })
+
+        result = asyncio.run(run())
+        assert result["has_reference"] is True
+        assert result["reference_type"] == "entity_plural"
+        assert result["matched_entities"] == _ENTITIES
+
+    def test_three_entities_matches_first_three(self):
+        from tools.reference_tools import resolve_reference
+
+        async def run():
+            with patch("tools.reference_tools.get_business_memory",
+                       _mock_get_memory(entities=_ENTITIES)):
+                return await resolve_reference.ainvoke({
+                    "query": "这三个都能空腹用吗",
+                    "runtime": _make_runtime(),
+                })
+
+        result = asyncio.run(run())
+        assert result["has_reference"] is True
+        assert result["reference_type"] == "entity_plural"
+        assert len(result["matched_entities"]) == 3
+
+
+class TestEntityImplicitReference:
+    """实体域隐式指代：句里含'副作用/成分/怎么用'但无明确主语，指向 entities[0]。"""
+
+    def test_implicit_side_effect_matches_first_entity(self):
+        from tools.reference_tools import resolve_reference
+
+        async def run():
+            with patch("tools.reference_tools.get_business_memory",
+                       _mock_get_memory(entities=_ENTITIES)):
+                return await resolve_reference.ainvoke({
+                    "query": "副作用严重吗",
+                    "runtime": _make_runtime(),
+                })
+
+        result = asyncio.run(run())
+        assert result["has_reference"] is True
+        assert result["reference_type"] == "entity_implicit"
+        assert result["matched_entity"] == "烟酰胺"
+
+    def test_implicit_no_entities_returns_no_match(self):
+        from tools.reference_tools import resolve_reference
+
+        async def run():
+            with patch("tools.reference_tools.get_business_memory",
+                       _mock_get_memory(entities=[])):
+                return await resolve_reference.ainvoke({
+                    "query": "副作用严重吗",
+                    "runtime": _make_runtime(),
+                })
+
+        result = asyncio.run(run())
+        assert result["has_reference"] is False
+
+
+class TestProductWinsOverEntity:
+    """商品指代优先：同时有商品和实体上下文时，优先返回商品结果。"""
+
+    def test_product_ordinal_wins_over_entity(self):
+        """两域都有 last_XX，'第二个'先按商品定位。"""
+        from tools.reference_tools import resolve_reference
+
+        async def run():
+            with patch("tools.reference_tools.get_business_memory",
+                       _mock_get_memory(cards=_CARDS, entities=_ENTITIES)):
+                return await resolve_reference.ainvoke({
+                    "query": "第二个多少钱",
+                    "runtime": _make_runtime(),
+                })
+
+        result = asyncio.run(run())
+        assert result["reference_type"] == "ordinal"      # 商品域
+        assert result["matched_product"]["product_id"] == 2
+        # 实体字段被 pad 成空
+        assert result["matched_entity"] is None
+
+    def test_entity_wins_when_no_products(self):
+        """只有实体记忆时，'第二个'落到实体域。"""
+        from tools.reference_tools import resolve_reference
+
+        async def run():
+            with patch("tools.reference_tools.get_business_memory",
+                       _mock_get_memory(entities=_ENTITIES)):
+                return await resolve_reference.ainvoke({
+                    "query": "第二个的成分",
+                    "runtime": _make_runtime(),
+                })
+
+        result = asyncio.run(run())
+        assert result["reference_type"] == "entity_ordinal"
+        assert result["matched_entity"] == "视黄醇"

@@ -19,11 +19,43 @@ class Config:
     CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
 
     # 3.向量库和 embedding 配置
+    # ── OpenAI 兼容通道（历史遗留，暂不删）──
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
     OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+    # ── Milvus ──
     MILVUS_URL = os.getenv("MILVUS_URL", "http://127.0.0.1:19530")
     MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "my_rag_collection")
+    # 稠密向量维度：DashScope text-embedding-v4 支持 2048/1536/1024/768/512/256/128/64，
+    # 我们锁 1024（在检索质量和存储/召回速度间平衡最好）。
+    # 改这个字段前先跑 drop_milvus_collection.py 清库，否则 schema dim 不一致会插入失败。
+    MILVUS_DENSE_DIM = int(os.getenv("MILVUS_DENSE_DIM", "1024"))
+
+    # ── DashScope（阿里云百炼）text-embedding-v4 ──
+    # 现在是主用 embedding 通道（RAG 的 dense 向量走这里），OpenAI 通道保留仅供兼容。
+    DASH_SCOPE_API_KEY = os.getenv("DASH_SCOPE_API_KEY", "")
+    DASH_SCOPE_TEXT_EMBEDDING_MODEL = os.getenv("DASH_SCOPE_TEXT_EMBEDDING_MODEL", "text-embedding-v4")
+    # DashScope 单次最大 batch=10，超出会 400。
+    DASH_SCOPE_EMBEDDING_BATCH_SIZE = int(os.getenv("DASH_SCOPE_EMBEDDING_BATCH_SIZE", "10"))
+
+    # ── DashScope rerank（qwen3-rerank）──
+    # 两阶段检索用：Milvus hybrid 先召回 initial_top_k（20），再让 rerank 精排到 top_k（5）。
+    # 走 HTTP 直调 —— 官方给的就是 curl 例子，signature 简单。
+    #
+    # 端点选公共 dashscope.aliyuncs.com：专属部署（llm-ng848...maas.aliyuncs.com）
+    # 不带 rerank 服务，实测 400 InvalidParameter；用公共端点 qwen3-rerank 200 OK。
+    DASH_SCOPE_RERANK_URL = os.getenv(
+        "DASH_SCOPE_RERANK_URL",
+        "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+    )
+    DASH_SCOPE_TEXT_RERANK_MODEL = os.getenv("DASH_SCOPE_TEXT_RERANK_MODEL", "qwen3-rerank")
+    DASH_SCOPE_RERANK_TIMEOUT = float(os.getenv("DASH_SCOPE_RERANK_TIMEOUT", "5.0"))
+
+    # ── RAG 两阶段检索参数 ──
+    # 初始召回数：hybrid 从 Milvus 拿多少候选送给 rerank。20 是经验值——
+    # 太少（<10）rerank 挑不出好的；太多（>50）rerank 延迟涨得不划算。
+    RAG_INITIAL_TOP_K = int(os.getenv("RAG_INITIAL_TOP_K", "20"))
 
     # 4.MySQL 配置（历史遗留）
     # ai-service 主库已迁移到 PostgreSQL。这里保留仅供 sync_mysql_to_pg.py 从 MySQL 拉数据到 PG。
