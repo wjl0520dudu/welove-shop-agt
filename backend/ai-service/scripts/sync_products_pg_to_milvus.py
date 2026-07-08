@@ -185,6 +185,11 @@ async def _fetch_products_from_pg(
         since: 只返回 update_time > since 的记录（增量用）；None 表示全量
         product_id: 只返回这一个（单商品同步用）
         only_active: True 时 filter status=1；False 时全量（含下架，供 delete 判定用）
+
+    Note:
+        product.update_time 是 timezone-naive（PG TIMESTAMP WITHOUT TIME ZONE），
+        watermark 是 timezone-aware（TIMESTAMPTZ）。这里对齐前者，把 since 剥掉 tz
+        再传给 SQL，避免 asyncpg 抛 "can't subtract offset-naive and offset-aware"。
     """
     sf = get_session_factory()
     async with sf() as s:
@@ -197,6 +202,10 @@ async def _fetch_products_from_pg(
         if product_id is not None:
             stmt = stmt.where(ProductORM.id == product_id)
         if since is not None:
+            # tz-aware → tz-naive（对齐 product.update_time 的类型）
+            # 先转到 UTC 再剥 tz，保证语义一致
+            if since.tzinfo is not None:
+                since = since.astimezone(timezone.utc).replace(tzinfo=None)
             stmt = stmt.where(ProductORM.update_time > since)
 
         rows = (await s.execute(stmt)).all()
