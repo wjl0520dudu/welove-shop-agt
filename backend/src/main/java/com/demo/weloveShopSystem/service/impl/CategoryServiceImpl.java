@@ -2,9 +2,9 @@ package com.demo.weloveShopSystem.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 
-import com.demo.weloveShopSystem.controller.CategoryService;
 import com.demo.weloveShopSystem.entity.Category;
 import com.demo.weloveShopSystem.mapper.CategoryMapper;
+import com.demo.weloveShopSystem.service.CategoryService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 

@@ -1,7 +1,8 @@
-package com.demo.weloveShopSystem.service;
+package com.demo.weloveShopSystem.service.impl;
 
 
 import com.demo.weloveShopSystem.config.CacheConfig;
+import com.demo.weloveShopSystem.service.CacheService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;

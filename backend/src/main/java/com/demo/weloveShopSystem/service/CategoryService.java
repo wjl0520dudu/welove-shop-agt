@@ -1,4 +1,4 @@
-package com.demo.weloveShopSystem.controller;
+package com.demo.weloveShopSystem.service;
 
 import com.demo.weloveShopSystem.entity.Category;
 
@@ -10,6 +10,7 @@ import java.util.List;
 public interface CategoryService {
     /** 查询启用状态的分类列表。 */
     List<Category> listActive();
+
     /** 根据分类 ID 查询分类详情。 */
     Category getById(Long id);
 }

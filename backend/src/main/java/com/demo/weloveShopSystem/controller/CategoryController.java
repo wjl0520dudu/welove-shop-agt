@@ -3,6 +3,7 @@ package com.demo.weloveShopSystem.controller;
 
 import com.demo.weloveShopSystem.common.Result;
 import com.demo.weloveShopSystem.entity.Category;
+import com.demo.weloveShopSystem.service.CategoryService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
