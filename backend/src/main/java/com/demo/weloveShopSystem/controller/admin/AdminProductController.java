@@ -5,7 +5,9 @@ import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.demo.weloveShopSystem.common.Result;
 import com.demo.weloveShopSystem.entity.Product;
+import com.demo.weloveShopSystem.entity.ProductSku;
 import com.demo.weloveShopSystem.mapper.ProductMapper;
+import com.demo.weloveShopSystem.mapper.ProductSkuMapper;
 import com.demo.weloveShopSystem.service.ProductService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
@@ -29,6 +31,7 @@ public class AdminProductController {
 
     private final ProductService productService;
     private final ProductMapper productMapper;
+    private final ProductSkuMapper productSkuMapper;
 
     /**
      * 商品分页搜索。keyword 会联合搜 title/brand/tags 三个字段;
@@ -90,9 +93,11 @@ public class AdminProductController {
     }
 
     /**
-     * 商品状态概览 + 品牌/分类 Top10 分布。
-     * TODO: lowStock/outOfStock 目前用 Product 直接查,严格意义上库存应从
-     *       ProductSku 聚合,后续单独出一个统计接口。
+     * 商品状态概览 + 品牌/分类 Top10 分布 + 库存告警。
+     * <p>
+     * 库存字段挂在 ProductSku 上而不是 Product,所以 lowStock/outOfStock 走 SKU 表统计
+     * 的是"存在低库存/断货 SKU 的记录数",与前端 KPI 卡片语义一致;严格意义上后续如果
+     * 要统计"低库存商品数(去重 productId)"再改造为 SKU 聚合。
      */
     @GetMapping("/stats")
     public Result<Map<String, Object>> stats() {
@@ -100,6 +105,12 @@ public class AdminProductController {
         stats.put("total", productMapper.selectCount(null));
         stats.put("online", productMapper.selectCount(new QueryWrapper<Product>().eq("status", 1)));
         stats.put("offline", productMapper.selectCount(new QueryWrapper<Product>().eq("status", 0)));
+
+        // 库存告警:低库存 (0 < stock < 10) 与 断货 (stock = 0),按 SKU 维度计数
+        stats.put("lowStock", productSkuMapper.selectCount(
+                new QueryWrapper<ProductSku>().lt("stock", 10).gt("stock", 0)));
+        stats.put("outOfStock", productSkuMapper.selectCount(
+                new QueryWrapper<ProductSku>().eq("stock", 0)));
 
         QueryWrapper<Product> brandQw = new QueryWrapper<>();
         brandQw.select("brand, count(*) as count").groupBy("brand").orderByDesc("count").last("limit 10");
