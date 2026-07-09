@@ -3,6 +3,7 @@ package com.demo.weloveShopSystem.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.demo.weloveShopSystem.common.ErrorCode;
 import com.demo.weloveShopSystem.common.JwtUtil;
+import com.demo.weloveShopSystem.common.SensitiveWordUtil;
 import com.demo.weloveShopSystem.dto.UpdateUserRequest;
 import com.demo.weloveShopSystem.entity.User;
 import com.demo.weloveShopSystem.exception.BusinessException;
@@ -33,6 +34,7 @@ public class AuthServiceImpl implements AuthService {
     private final UserMapper userMapper;
     private final StringRedisTemplate redisTemplate;
     private final JwtUtil jwtUtil;
+    private final SensitiveWordUtil sensitiveWordUtil;
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     @Override
@@ -116,7 +118,9 @@ public class AuthServiceImpl implements AuthService {
         }
         // 只更新明确传入的字段,避免覆盖已有数据。
         if (StringUtils.hasText(request.getUsername())) {
-            // TODO: 待 SensitiveWordUtil 引入后加上用户名敏感词校验。
+            if (sensitiveWordUtil.contains(request.getUsername())) {
+                throw new BusinessException(ErrorCode.USERNAME_SENSITIVE);
+            }
             user.setUsername(request.getUsername());
         }
         if (StringUtils.hasText(request.getPassword())) {
@@ -170,9 +174,11 @@ public class AuthServiceImpl implements AuthService {
             throw new BusinessException(ErrorCode.PHONE_ALREADY_REGISTERED);
         }
 
-        // 4. 用户名兜底
+        // 4. 用户名兜底 + 敏感词校验
         String finalUsername = StringUtils.hasText(username) ? username : "User_" + phone.substring(7);
-        // TODO: 待 SensitiveWordUtil 引入后加上用户名敏感词校验。
+        if (sensitiveWordUtil.contains(finalUsername)) {
+            throw new BusinessException(ErrorCode.USERNAME_SENSITIVE);
+        }
 
         // 5. 创建用户
         User user = new User();
