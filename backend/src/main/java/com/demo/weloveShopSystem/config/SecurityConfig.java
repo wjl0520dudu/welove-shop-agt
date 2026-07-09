@@ -88,6 +88,8 @@ public class SecurityConfig {
                 .requestMatchers("/api/admin/login").permitAll()
                 // 其余全部要求 ADMIN 角色;AdminInterceptor 会再校验一次 token 里的 role
                 .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                // AdminChat 挂在 /api/admin-chat 不在 /api/admin/** 之下,单独收口
+                .requestMatchers("/api/admin-chat/**").hasRole("ADMIN")
                 // 缓存管理接口只给 ADMIN,不放在 admin 路径下所以单独收口
                 .requestMatchers("/api/cache/**").hasRole("ADMIN")
 
