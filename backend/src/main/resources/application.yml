@@ -53,13 +53,14 @@ aliyun:
     templateCode: ${ALIYUN_SMS_TEMPLATE_CODE:}
     # 如果未配置阿里云短信，则使用模拟模式（控制台输出验证码）
 
-# 七牛云配置
-qiniu:
-  accessKey: ${QINIU_ACCESS_KEY:}
-  secretKey: ${QINIU_SECRET_KEY:}
-  bucket: ${QINIU_BUCKET:}
-  domain: ${QINIU_DOMAIN:}
-  # 注意：生产环境必须配置七牛云AK/SK
+# 云存储配置(对象存储供应商待定,先用中性 key,后续切换厂商时无需改代码)
+cloud:
+  storage:
+    accessKey: ${CLOUD_STORAGE_ACCESS_KEY:}
+    secretKey: ${CLOUD_STORAGE_SECRET_KEY:}
+    bucket: ${CLOUD_STORAGE_BUCKET:}
+    domain: ${CLOUD_STORAGE_DOMAIN:}
+    # 未配置时,KnowledgeService 会自动降级到本地磁盘存储(upload.dir)
 
 logging:
   level:
