@@ -8,6 +8,7 @@
 /backend/src/main/resources/application-dev.yml
 /backend/src/main/java/com/demo/weloveShopSystem/controller/TestController.java
 /backend/volumes/
+/backend/ai-service/.env
 __pycache__/
 *.py[cod]
 *$py.class
