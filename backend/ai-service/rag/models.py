@@ -46,9 +46,18 @@ class RetrievalPlan(BaseModel):
     negative_requirements: List[str] = Field(default_factory=list)
 
     doc_types: List[str] = Field(default_factory=list)
-    chunk_types: List[str] = Field(default_factory=lambda: ["text"])
+    # 默认空 = 不过滤 chunk_type。原来默认 ["text"] 会把 marketing/faq/review 全过滤掉，
+    # 是历史 knowledge_doc 场景遗留（只有一种 chunk_type）。需要限制时由 agent 显式传入。
+    chunk_types: List[str] = Field(default_factory=list)
     top_k: int = 5
-    search_mode: str = "dense"  # dense | sparse | hybrid
+    # 默认 hybrid：dense + BM25 融合几乎总是优于任何单路
+    # dense / bm25 / hybrid —— bm25 也接受 "sparse" 作别名
+    search_mode: str = "hybrid"
+    # ── 两阶段检索（rerank）参数 ──
+    # 默认开 rerank：多一次 DashScope HTTP 调用 (~300ms)，换来质量显著提升
+    use_rerank: bool = True
+    # 初始召回数（送给 rerank 的候选量）。None → 走 config.RAG_INITIAL_TOP_K（默认 20）
+    initial_top_k: Optional[int] = None
 
 
 class MetadataFilter(BaseModel):
@@ -65,7 +74,8 @@ class SearchRequest(BaseModel):
     query: str
     top_k: int = 5
     filter: Optional[MetadataFilter] = None
-    search_mode: str = "dense"
+    # 默认 hybrid，与 RetrievalPlan 对齐
+    search_mode: str = "hybrid"
     similarity_threshold: float = 0.3
 
 

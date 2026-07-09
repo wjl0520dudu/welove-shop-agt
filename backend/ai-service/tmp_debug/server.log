@@ -1,0 +1,81 @@
+python-dotenv could not parse statement starting at line 15
+python-dotenv could not parse statement starting at line 18
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:129: PyMilvusDeprecationWarning: `connections.connect` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  connections.connect(uri=self.milvus_url)
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:139: PyMilvusDeprecationWarning: `Collection` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection = Collection(name=self.collection_name, schema=schema, consistency_level="Strong")
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:140: PyMilvusDeprecationWarning: `Collection.create_index` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection.create_index("sparse_vector", {"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "IP"})
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:141: PyMilvusDeprecationWarning: `Collection.create_index` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection.create_index("dense_vector",  {"index_type": "AUTOINDEX", "metric_type": "IP"})
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:142: PyMilvusDeprecationWarning: `Collection.load` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection.load()
+2026-07-07 20:14:40 [INFO] [-] uvicorn.error: Started server process [18468]
+2026-07-07 20:14:40 [INFO] [-] uvicorn.error: Waiting for application startup.
+2026-07-07 20:14:40 [WARNING] [-] ai-service.runtime: PostgreSQL Á¬½ÓÊ§°Ü£¬±£Áô InMemory: Psycopg cannot use the 'ProactorEventLoop' to run in async mode. Please use a compatible event loop, for instance by running 'asyncio.run(..., loop_factory=asyncio.SelectorEventLoop(selectors.SelectSelector()))'
+2026-07-07 20:14:40 [INFO] [-] uvicorn.error: Application startup complete.
+2026-07-07 20:14:40 [INFO] [-] uvicorn.error: Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+2026-07-07 20:14:50 [INFO] [d2628c7c6c2244d893fe641146db1318] httpx: HTTP Request: GET http://localhost:8888/api/health/live "HTTP/1.1 200 "
+2026-07-07 20:14:50 [INFO] [-] uvicorn.access: 127.0.0.1:62818 - "GET /health HTTP/1.1" 200
+2026-07-07 20:15:14 [INFO] [qw-shop-001] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:15:15 [INFO] [qw-shop-001] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:15:16 [INFO] [qw-shop-001] httpx: HTTP Request: POST https://api.openai-proxy.org/v1/embeddings "HTTP/1.1 200 OK"
+2026-07-07 20:15:18 [INFO] [qw-shop-001] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:15:18 [INFO] [qw-shop-001] httpx: HTTP Request: POST https://api.openai-proxy.org/v1/embeddings "HTTP/1.1 200 OK"
+2026-07-07 20:15:19 [INFO] [qw-shop-001] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:15:19 [INFO] [qw-shop-001] httpx: HTTP Request: GET http://localhost:8888/api/product/search?keyword=%E5%B9%B2%E7%9A%AE%E7%B2%89%E5%BA%95%E6%B6%B2+%E4%BF%9D%E6%B9%BF&limit=5 "HTTP/1.1 200 "
+2026-07-07 20:15:23 [INFO] [qw-shop-001] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:15:24 [INFO] [qw-shop-001] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:15:24 [INFO] [qw-shop-001] httpx: HTTP Request: GET http://localhost:8888/api/product/search?keyword=%E5%B9%B2%E7%9A%AE%E9%80%82%E7%94%A8%E7%B2%89%E5%BA%95%E6%B6%B2&limit=5 "HTTP/1.1 200 "
+2026-07-07 20:15:30 [INFO] [qw-shop-001] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:15:37 [INFO] [qw-shop-001] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:15:37 [INFO] [qw-shop-001] ai-service.access: POST /api/assistant/run -> 200 24365.3ms
+2026-07-07 20:15:37 [INFO] [-] uvicorn.access: 127.0.0.1:57610 - "POST /api/assistant/run HTTP/1.1" 200
+2026-07-07 20:16:22 [INFO] [e866c2f8525b4553856aa0e8f1a8cd90] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:16:22 [INFO] [e866c2f8525b4553856aa0e8f1a8cd90] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:129: PyMilvusDeprecationWarning: `connections.connect` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  connections.connect(uri=self.milvus_url)
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:139: PyMilvusDeprecationWarning: `Collection` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection = Collection(name=self.collection_name, schema=schema, consistency_level="Strong")
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:140: PyMilvusDeprecationWarning: `Collection.create_index` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection.create_index("sparse_vector", {"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "IP"})
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:141: PyMilvusDeprecationWarning: `Collection.create_index` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection.create_index("dense_vector",  {"index_type": "AUTOINDEX", "metric_type": "IP"})
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:142: PyMilvusDeprecationWarning: `Collection.load` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection.load()
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:225: PyMilvusDeprecationWarning: `Collection` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection = Collection(self.collection_name)
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:226: PyMilvusDeprecationWarning: `Collection.load` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection.load()
+2026-07-07 20:16:24 [INFO] [e866c2f8525b4553856aa0e8f1a8cd90] httpx: HTTP Request: POST https://api.openai-proxy.org/v1/embeddings "HTTP/1.1 200 OK"
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:243: PyMilvusDeprecationWarning: `Collection.hybrid_search` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  results = collection.hybrid_search(
+2026-07-07 20:16:25 [INFO] [e866c2f8525b4553856aa0e8f1a8cd90] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:225: PyMilvusDeprecationWarning: `Collection` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection = Collection(self.collection_name)
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:226: PyMilvusDeprecationWarning: `Collection.load` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  collection.load()
+2026-07-07 20:16:25 [INFO] [e866c2f8525b4553856aa0e8f1a8cd90] httpx: HTTP Request: POST https://api.openai-proxy.org/v1/embeddings "HTTP/1.1 200 OK"
+D:\dev\project\py\welove-shop-agt\backend\ai-service\rag\vector_store.py:243: PyMilvusDeprecationWarning: `Collection.hybrid_search` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  results = collection.hybrid_search(
+2026-07-07 20:16:38 [INFO] [e866c2f8525b4553856aa0e8f1a8cd90] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:16:38 [ERROR] [e866c2f8525b4553856aa0e8f1a8cd90] ai-service.nodes: knowledge node failed
+Traceback (most recent call last):
+  File "D:\dev\project\py\welove-shop-agt\backend\ai-service\assistant\nodes.py", line 77, in knowledge_node
+    result = await get_knowledge().run(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\dev\project\py\welove-shop-agt\backend\ai-service\knowledge\agent.py", line 120, in run
+    result = await self._get_agent().ainvoke(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\dev\env\conda_envs\wlagt\Lib\site-packages\langgraph\pregel\main.py", line 4105, in ainvoke
+    async for chunk in self.astream(
+  File "D:\dev\env\conda_envs\wlagt\Lib\site-packages\langgraph\pregel\main.py", line 3507, in astream
+    raise GraphRecursionError(msg)
+langgraph.errors.GraphRecursionError: Recursion limit of 8 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.
+For troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT
+2026-07-07 20:16:38 [INFO] [e866c2f8525b4553856aa0e8f1a8cd90] ai-service.access: POST /api/assistant/run -> 200 17828.9ms
+2026-07-07 20:16:38 [INFO] [-] uvicorn.access: 127.0.0.1:62911 - "POST /api/assistant/run HTTP/1.1" 200
+2026-07-07 20:16:39 [INFO] [a44411c4920b4c6eb4d210ffe3a6bb73] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:16:41 [INFO] [a44411c4920b4c6eb4d210ffe3a6bb73] httpx: HTTP Request: POST https://llm-ng848jmrmf7rhtea.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+2026-07-07 20:16:41 [INFO] [a44411c4920b4c6eb4d210ffe3a6bb73] ai-service.access: POST /api/assistant/run -> 200 3006.1ms
+2026-07-07 20:16:41 [INFO] [-] uvicorn.access: 127.0.0.1:62298 - "POST /api/assistant/run HTTP/1.1" 200

@@ -5,13 +5,14 @@ import logging
 from typing import AsyncIterator, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import Field
 
 from api.response_adapter import build_error_response, normalize_ai_response
 from api.schemas import AIResponse, ChatRequest
 from assistant.graph import AssistantGraph
+from core.errors import ErrorCode
 from core.llm import get_llm
 
 
@@ -39,14 +40,15 @@ def _parse_user_id(value: Optional[str]) -> Optional[int]:
 
 
 @router.post("/run", response_model=AIResponse)
-async def run_assistant(request: AssistantRunRequest) -> AIResponse:
+async def run_assistant(request: AssistantRunRequest, http_request: Request) -> AIResponse:
     llm = get_llm()
-    trace_id = str(uuid4())
+    # 优先复用中间件生成/透传的 traceId；没有则新建（防御性，正常不会走到）
+    trace_id = getattr(http_request.state, "trace_id", None) or str(uuid4())
     if llm is None:
         return build_error_response(
             "LLM 未配置，统一 Agent 暂不可用。",
             trace_id=trace_id,
-            error_code="AI_LLM_NOT_CONFIGURED",
+            error_code=ErrorCode.LLM_NOT_CONFIGURED,
             task_type="unknown",
             answer="当前 AI 服务还没有配置模型，无法运行 Agent。",
         )
@@ -59,13 +61,14 @@ async def run_assistant(request: AssistantRunRequest) -> AIResponse:
             conversation_id=request.conversation_id,
             user_id=_parse_user_id(request.user_id),
             jwt_token=request.jwt_token,
+            trace_id=trace_id,
         )
     except Exception:
         logger.exception("Assistant agent run failed")
         return build_error_response(
             "AI Agent 处理失败。",
             trace_id=trace_id,
-            error_code="AI_ASSISTANT_ERROR",
+            error_code=ErrorCode.ASSISTANT_ERROR,
             task_type="unknown",
             answer="AI Agent 暂时不可用，请稍后再试。",
         )
@@ -82,7 +85,7 @@ def _sse_frame(event_type: str, data: dict) -> str:
 
 
 @router.post("/stream")
-async def stream_assistant(request: AssistantRunRequest):
+async def stream_assistant(request: AssistantRunRequest, http_request: Request):
     """流式版本 /run，返回 SSE 事件流。
 
     事件类型：start / route / token / tool_call / tool_result / final / error / done。
@@ -95,13 +98,13 @@ async def stream_assistant(request: AssistantRunRequest):
         es.addEventListener('done', () => es.close())
     """
     llm = get_llm()
-    trace_id = str(uuid4())
+    trace_id = getattr(http_request.state, "trace_id", None) or str(uuid4())
 
     async def event_stream() -> AsyncIterator[bytes]:
         if llm is None:
             yield _sse_frame("error", {
                 "trace_id": trace_id,
-                "error_code": "AI_LLM_NOT_CONFIGURED",
+                "error_code": ErrorCode.LLM_NOT_CONFIGURED,
                 "message": "当前 AI 服务还没有配置模型，无法运行 Agent。",
             }).encode("utf-8")
             yield _sse_frame("done", {}).encode("utf-8")
@@ -122,7 +125,7 @@ async def stream_assistant(request: AssistantRunRequest):
             logger.exception("Assistant stream failed")
             yield _sse_frame("error", {
                 "trace_id": trace_id,
-                "error_code": "AI_ASSISTANT_ERROR",
+                "error_code": ErrorCode.ASSISTANT_ERROR,
                 "message": str(e),
             }).encode("utf-8")
             yield _sse_frame("done", {}).encode("utf-8")
@@ -135,5 +138,7 @@ async def stream_assistant(request: AssistantRunRequest):
             "Connection": "keep-alive",
             # Nginx 反向代理时必须，防止代理缓冲整个流
             "X-Accel-Buffering": "no",
+            # 让前端/Java 网关能拿到当前流的 traceId 做关联
+            "X-Trace-Id": trace_id,
         },
     )
