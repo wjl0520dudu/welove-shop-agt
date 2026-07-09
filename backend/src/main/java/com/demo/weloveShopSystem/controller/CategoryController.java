@@ -25,4 +25,14 @@ public class CategoryController {
         return Result.success(categoryService.listActive());
     }
 
+    /** 查询分类详情。 */
+    @GetMapping("/{id}")
+    public Result<Category> getById(@PathVariable Long id) {
+        Category category = categoryService.getById(id);
+        if (category == null) {
+            return Result.error("品类不存在");
+        }
+        return Result.success(category);
+    }
+
 }

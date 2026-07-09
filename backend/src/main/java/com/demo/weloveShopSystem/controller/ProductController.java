@@ -5,6 +5,7 @@ import com.demo.weloveShopSystem.common.Result;
 import com.demo.weloveShopSystem.entity.*;
 import com.demo.weloveShopSystem.service.*;
 import lombok.RequiredArgsConstructor;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -80,6 +81,20 @@ public class ProductController {
             @PathVariable Long id,
             @RequestParam(defaultValue = "10") int limit) {
         return Result.success(productReviewService.listByProductId(id, limit));
+    }
+
+    /**
+     * 当前用户提交商品评价。
+     * <p>
+     * userId 从 SecurityContext 中的 JWT 主体解析,不信任任何客户端传入的用户身份。
+     */
+    @PostMapping("/{id}/reviews")
+    public Result<ProductReview> submitReview(
+            @PathVariable Long id,
+            @RequestParam Integer rating,
+            @RequestParam String content) {
+        Long userId = Long.parseLong(SecurityContextHolder.getContext().getAuthentication().getName());
+        return Result.success(productReviewService.submitReview(userId, id, rating, content));
     }
 
     /** 查询商品常见问答。 */
