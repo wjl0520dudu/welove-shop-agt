@@ -3,6 +3,7 @@ package com.demo.weloveShopSystem.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.demo.weloveShopSystem.common.ErrorCode;
 import com.demo.weloveShopSystem.common.JwtUtil;
+import com.demo.weloveShopSystem.dto.UpdateUserRequest;
 import com.demo.weloveShopSystem.entity.User;
 import com.demo.weloveShopSystem.exception.BusinessException;
 import com.demo.weloveShopSystem.mapper.UserMapper;
@@ -105,6 +106,105 @@ public class AuthServiceImpl implements AuthService {
             log.error("Token refresh failed: {}", e.getMessage());
         }
         throw new BusinessException(ErrorCode.INVALID_TOKEN);
+    }
+
+    @Override
+    public User updateUserInfo(UpdateUserRequest request) {
+        User user = userMapper.selectById(request.getUserId());
+        if (user == null) {
+            throw new BusinessException(ErrorCode.USER_NOT_FOUND);
+        }
+        // 只更新明确传入的字段,避免覆盖已有数据。
+        if (StringUtils.hasText(request.getUsername())) {
+            // TODO: 待 SensitiveWordUtil 引入后加上用户名敏感词校验。
+            user.setUsername(request.getUsername());
+        }
+        if (StringUtils.hasText(request.getPassword())) {
+            user.setPassword(passwordEncoder.encode(request.getPassword()));
+        }
+        if (request.getAvatarUrl() != null) {
+            user.setAvatarUrl(request.getAvatarUrl());
+        }
+        if (request.getGender() != null) {
+            user.setGender(request.getGender());
+        }
+        if (request.getAgeRange() != null) {
+            user.setAgeRange(request.getAgeRange());
+        }
+        if (request.getSkinType() != null) {
+            user.setSkinType(request.getSkinType());
+        }
+        if (request.getPreferenceTags() != null) {
+            user.setPreferenceTags(request.getPreferenceTags());
+        }
+        user.setUpdateTime(LocalDateTime.now());
+        userMapper.updateById(user);
+        return user;
+    }
+
+    @Override
+    public Map<String, Object> register(String phone, String code, String password, String username) {
+        // 1. 基础校验
+        if (!isValidPhone(phone)) {
+            throw new BusinessException(ErrorCode.INVALID_PHONE_FORMAT);
+        }
+        if (!StringUtils.hasText(code)) {
+            throw new BusinessException(ErrorCode.VERIFICATION_CODE_REQUIRED);
+        }
+        if (!StringUtils.hasText(password) || password.length() < 6) {
+            throw new BusinessException(ErrorCode.PASSWORD_TOO_SHORT);
+        }
+
+        // 2. 校验验证码
+        String cachedCode = redisTemplate.opsForValue().get(SMS_CODE_PREFIX + phone);
+        if (cachedCode == null) {
+            throw new BusinessException(ErrorCode.VERIFICATION_CODE_EXPIRED);
+        }
+        if (!cachedCode.equals(code)) {
+            throw new BusinessException(ErrorCode.INVALID_VERIFICATION_CODE);
+        }
+
+        // 3. 检查手机号是否已存在
+        User existingUser = userMapper.selectOne(new LambdaQueryWrapper<User>().eq(User::getPhone, phone));
+        if (existingUser != null) {
+            throw new BusinessException(ErrorCode.PHONE_ALREADY_REGISTERED);
+        }
+
+        // 4. 用户名兜底
+        String finalUsername = StringUtils.hasText(username) ? username : "User_" + phone.substring(7);
+        // TODO: 待 SensitiveWordUtil 引入后加上用户名敏感词校验。
+
+        // 5. 创建用户
+        User user = new User();
+        user.setPhone(phone);
+        user.setPassword(passwordEncoder.encode(password));
+        user.setUsername(finalUsername);
+        user.setStatus(1);
+        user.setCreateTime(LocalDateTime.now());
+        user.setUpdateTime(LocalDateTime.now());
+        userMapper.insert(user);
+
+        // 6. 注册成功后清理验证码
+        redisTemplate.delete(SMS_CODE_PREFIX + phone);
+
+        return generateTokenResponse(user);
+    }
+
+    @Override
+    public void changePassword(Long userId, String oldPassword, String newPassword) {
+        User user = userMapper.selectById(userId);
+        if (user == null) {
+            throw new BusinessException(ErrorCode.USER_NOT_FOUND);
+        }
+        if (!StringUtils.hasText(oldPassword) || !passwordEncoder.matches(oldPassword, user.getPassword())) {
+            throw new BusinessException(ErrorCode.OLD_PASSWORD_WRONG);
+        }
+        if (!StringUtils.hasText(newPassword) || newPassword.length() < 6) {
+            throw new BusinessException(ErrorCode.PASSWORD_TOO_SHORT);
+        }
+        user.setPassword(passwordEncoder.encode(newPassword));
+        user.setUpdateTime(LocalDateTime.now());
+        userMapper.updateById(user);
     }
 
     private User createUser(String phone) {
