@@ -106,6 +106,14 @@
                 <scope>import</scope>
             </dependency>
 
+            <!--
+              注:Spring Cloud 2022.0.x 起,bootstrap.yml 加载机制被弱化;
+                  Spring Boot 3.x 推荐使用 spring.config.import 直接在 application.yml
+                  中加载 Nacos config(spring-cloud-starter-alibaba-nacos-config 自带
+                  NacosConfigDataLoader,无需 bootstrap starter)。
+                  故不在此处统一管理 spring-cloud-starter-bootstrap。
+            -->
+
             <!-- MyBatis-Plus(适配 SpringBoot 3) -->
             <dependency>
                 <groupId>com.baomidou</groupId>

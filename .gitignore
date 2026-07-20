@@ -159,9 +159,17 @@ admin-bff/target/
 # 说明:.idea/target/android/volumes/__pycache__ 等已在上文覆盖,此段仅补差异项
 # ============================================================================
 
-# infra/ 下的中间件运行数据 + 单体 dev yml(不入库)
+# infra/ 下的中间件运行数据(不入库)
 /infra/volumes/
-/infra/application-dev.yml
+
+# -------- application-dev.yml(本地开发覆盖配置,不入库) --------
+# 所有人共用 application.yml 的默认值,本地差异项(端口/DB密码/mock开关)放
+# application-dev.yml 各自维护。部署时用 SPRING_PROFILES_ACTIVE=prod 覆盖。
+# 见 services/*/src/main/resources/application.yml 末尾的 profiles.active
+**/application-dev.yml
+**/application-dev.yaml
+**/application-local.yml
+**/application-local.yaml
 
 # ai-service/ 正式入库,仅排除临时调试文件
 /ai-service/tmp_debug/

@@ -33,6 +33,11 @@
             <groupId>com.alibaba.cloud</groupId>
             <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>
         </dependency>
+        <!--
+          Nacos config 加载方式:Spring Cloud Alibaba 2023 自带 NacosConfigDataLoader,
+          在 application.yml 中通过 spring.config.import: optional:nacos:xxx 加载,
+          无需 bootstrap starter。
+        -->
         <dependency>
             <groupId>org.springframework.cloud</groupId>
             <artifactId>spring-cloud-starter-openfeign</artifactId>
