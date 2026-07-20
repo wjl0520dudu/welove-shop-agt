@@ -208,6 +208,41 @@ public class OrderServiceImpl implements OrderService {
 
     @Override
     @Transactional
+    public void markPaidByCallback(String outTradeNo, String tradeNo, String totalAmount, String channel) {
+        if (outTradeNo == null || outTradeNo.isEmpty()) {
+            throw new BizException(TradeErrorCode.PAY_NOTIFY_INVALID, "out_trade_no 缺失");
+        }
+        Order order = orderMapper.selectOne(
+                new LambdaQueryWrapper<Order>().eq(Order::getOrderNo, outTradeNo));
+        if (order == null) {
+            throw new BizException(TradeErrorCode.ORDER_NOT_FOUND, "订单不存在:" + outTradeNo);
+        }
+        // 金额校验(防伪造)
+        if (totalAmount != null && !totalAmount.isEmpty()
+                && new BigDecimal(totalAmount).compareTo(order.getPayAmount()) != 0) {
+            log.warn("[order-callback] amount mismatch, orderNo={}, notify={}, local={}",
+                    outTradeNo, totalAmount, order.getPayAmount());
+            throw new BizException(TradeErrorCode.PAY_NOTIFY_INVALID, "金额不一致");
+        }
+        // 幂等:仅 status=0 时更新,已处理直接跳过
+        if (order.getStatus() != 0) {
+            log.info("[order-callback] already processed, orderNo={}, status={}",
+                    outTradeNo, order.getStatus());
+            return;
+        }
+        LocalDateTime now = LocalDateTime.now();
+        order.setStatus(1);
+        order.setPayTime(now);
+        order.setUpdateTime(now);
+        order.setTradeNo(tradeNo);
+        order.setPayChannel(channel);
+        orderMapper.updateById(order);
+        log.info("[order-callback] order paid, orderNo={}, tradeNo={}, channel={}",
+                outTradeNo, tradeNo, channel);
+    }
+
+    @Override
+    @Transactional
     public void cancelOrder(Long userId, Long orderId) {
         Order order = requireOwnedOrder(userId, orderId);
         if (order.getStatus() != 0) {
@@ -250,6 +285,14 @@ public class OrderServiceImpl implements OrderService {
         order.setStatus(status);
         order.setUpdateTime(LocalDateTime.now());
         orderMapper.updateById(order);
+    }
+
+    @Override
+    public Long findIdByOrderNo(String orderNo) {
+        if (orderNo == null || orderNo.isEmpty()) return null;
+        Order order = orderMapper.selectOne(
+                new LambdaQueryWrapper<Order>().eq(Order::getOrderNo, orderNo));
+        return order != null ? order.getId() : null;
     }
 
     // ---------- 内部工具 ----------

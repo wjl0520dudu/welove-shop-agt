@@ -104,6 +104,27 @@ trade-service:
     pay-timeout-minutes: 10                     # 订单超时未支付分钟数(与 monolith 一致)
     timeout-scan-cron: "0 * * * * ?"            # 定时扫描 cron:每分钟第 0 秒
 
+# ---------- 支付宝支付 ----------
+# 沙箱环境(开发期),上线后切换 gateway / app-id / 公私钥
+# ALIPAY_ENABLED=false 时 PaymentService 走降级"模拟支付"路径,便于本地无配置时跑通
+alipay:
+  enabled: ${ALIPAY_ENABLED:false}
+  app-id: ${ALIPAY_APP_ID:2021000123456789}
+  app-private-key: ${ALIPAY_APP_PRIVATE_KEY:}
+  alipay-public-key: ${ALIPAY_ALIPAY_PUBLIC_KEY:}
+  gateway-url: ${ALIPAY_GATEWAY:https://openapi-sandbox.dl.alipaydev.com/gateway.do}
+  # wap=手机 H5 支付(默认),page=电脑网站支付兼容模式
+  pay-mode: ${ALIPAY_PAY_MODE:wap}
+  protocol: https
+  sign-type: RSA2
+  charset: UTF-8
+  # 回调地址必须公网 HTTPS,内网穿透方案见 docs/plan/alipay-sandbox-payment.md §6
+  notify-url: ${ALIPAY_NOTIFY_URL:https://pay-dev.example.com/api/trade/alipay/notify}
+  return-url: ${ALIPAY_RETURN_URL:https://pay-dev.example.com/api/trade/alipay/return}
+  quit-url: ${ALIPAY_QUIT_URL:http://localhost:5173/#/pages/order-list/order-list}
+  # 支付完成后同步回跳到前端 H5 结果页,前端会轮询异步通知更新后的订单状态
+  h5-return-url: ${ALIPAY_H5_RETURN_URL:http://localhost:5173/#/pages/payment/result}
+
 # ---------- 管理端点 ----------
 management:
   endpoints:

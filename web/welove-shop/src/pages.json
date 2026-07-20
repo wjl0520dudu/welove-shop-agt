@@ -77,6 +77,13 @@
       }
     },
     {
+      "path": "pages/payment/result",
+      "style": {
+        "navigationBarTitleText": "支付结果",
+        "navigationStyle": "custom"
+      }
+    },
+    {
       "path": "pages/address-list/address-list",
       "style": {
         "navigationBarTitleText": "地址管理",

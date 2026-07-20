@@ -24,6 +24,8 @@ public class WebMvcConfig implements WebMvcConfigurer {
     /** 免鉴权路径。 */
     private static final List<String> WHITELIST = List.of(
             "/internal/**",       // 内部统计接口(admin-bff Dashboard Feign 调)
+            "/alipay/notify",     // 支付宝异步通知(公网 POST,无 JWT)
+            "/alipay/return",     // 支付宝同步跳转(浏览器 GET,无 JWT)
             "/actuator/**",
             "/error"
     );

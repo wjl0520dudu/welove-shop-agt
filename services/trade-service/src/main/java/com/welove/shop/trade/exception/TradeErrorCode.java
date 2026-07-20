@@ -24,4 +24,11 @@ public final class TradeErrorCode {
     public static final int PRODUCT_OFF_SHELF = 40202;
     public static final int SKU_NOT_FOUND_REMOTE = 40203;
     public static final int ADDRESS_NOT_FOUND_REMOTE = 40204;
+
+    // ---------- 支付域(403xx) ----------
+    public static final int PAY_CREATE_FAILED = 40301;   // 发起支付失败
+    public static final int PAY_NOTIFY_INVALID = 40302;  // 回调参数非法/验签失败/金额不一致
+    public static final int PAY_QUERY_FAILED = 40303;    // 查询失败
+    public static final int PAY_CLOSE_FAILED = 40304;    // 关闭失败
+    public static final int PAY_DISABLED = 40305;        // 沙箱未启用
 }

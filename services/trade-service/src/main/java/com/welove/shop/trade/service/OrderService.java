@@ -34,6 +34,19 @@ public interface OrderService {
     /** 支付:0 → 1。 */
     void payOrder(Long userId, Long orderId);
 
+    /**
+     * 支付宝异步通知触发的状态变更(0 → 1)。
+     * <p>
+     * 与 {@link #payOrder(Long, Long)} 的区别:本方法
+     * <ul>
+     *   <li>由支付网关回调触发,而不是用户主动调用</li>
+     *   <li>不校验 userId(回调无 JWT,凭 out_trade_no 定位订单)</li>
+     *   <li><b>幂等</b>:仅 status=0 时更新,已处理直接跳过</li>
+     *   <li>同时写 tradeNo / payChannel 字段</li>
+     * </ul>
+     */
+    void markPaidByCallback(String outTradeNo, String tradeNo, String totalAmount, String channel);
+
     /** 取消:仅 status=0 可取消,0 → 4。 */
     void cancelOrder(Long userId, Long orderId);
 
@@ -45,4 +58,14 @@ public interface OrderService {
 
     /** 供 OrderTimeoutTask 使用:按 id 更新订单状态 + updateTime。 */
     void updateStatus(Order order, Integer status);
+
+    /**
+     * 按 orderNo 查 orderId(支付宝 returnUrl 同步跳转时用)。
+     * <p>
+     * 不做权限校验:returnUrl 是公开入口,后端拿到 orderNo 后会 302 到前端 H5,
+     * 前端会拿 orderId 调 /alipay/status/{orderId},该接口会校验 userId。
+     *
+     * @return orderId;查不到返回 null
+     */
+    Long findIdByOrderNo(String orderNo);
 }

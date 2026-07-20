@@ -93,6 +93,13 @@
             <groupId>cn.hutool</groupId>
             <artifactId>hutool-all</artifactId>
         </dependency>
+
+        <!-- 支付宝 EasySDK(沙箱/生产通用,2026 新接入首选,链式 API) -->
+        <dependency>
+            <groupId>com.alipay.sdk</groupId>
+            <artifactId>alipay-easysdk</artifactId>
+            <version>2.2.2</version>
+        </dependency>
     </dependencies>
 
     <build>

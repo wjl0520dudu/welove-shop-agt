@@ -69,4 +69,10 @@ public class Order implements Serializable {
     private LocalDateTime receiveTime;
 
     private LocalDateTime updateTime;
+
+    /** 支付渠道:MOCK(模拟)/ALIPAY_SANDBOX(支付宝沙箱)/未来加 WECHAT/ALIPAY_PROD 等。 */
+    private String payChannel;
+
+    /** 支付宝交易号(异步通知里回传)。 */
+    private String tradeNo;
 }
