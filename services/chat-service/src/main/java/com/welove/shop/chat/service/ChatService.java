@@ -20,7 +20,7 @@ public interface ChatService {
     Message sendMessage(Long userId, Long conversationId, String content, String jwtToken);
     /** 流式发送消息(SSE) —— 返回 SseEmitter,Controller 层用。 */
     org.springframework.web.servlet.mvc.method.annotation.SseEmitter sendStreamMessage(
-            Long userId, Long conversationId, String content, String username,
+            Long userId, Long conversationId, String content, String imageUrl, String username,
             String jwtToken, String gender, String skinType, java.util.List<String> preferenceTags,
             boolean retry);
     /**
@@ -29,7 +29,7 @@ public interface ChatService {
      * <ul>
      *   <li>额外接收 {@code imageUrl}(先走 /chat/upload/image 拿到的 OSS URL)</li>
      *   <li>{@code content} 允许为空("纯图搜索"场景)</li>
-     *   <li>转发到 ai-service /assistant/multimodal/stream 而非 /assistant/stream</li>
+     *   <li>与文本请求共用 ai-service /assistant/stream，是否带图由 imageUrl 决定</li>
      *   <li>user 消息落库时 message_type=multimodal_image 且写入 image_url</li>
      * </ul></p>
      */

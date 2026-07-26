@@ -112,7 +112,7 @@ ai:
 # ---------- 云存储(本服务差异化;其他默认值从 cloud-storage-shared.yml 继承) ----------
 cloud:
   storage:
-    key-prefix: weloveshop/knowledge_docs/   # 知识库文档 OSS 存储路径
+    key-prefix: weloveshop/chat/   # 聊天图片与知识库文档分目录存放
 
 # ---------- 业务开关 ----------
 chat-service:

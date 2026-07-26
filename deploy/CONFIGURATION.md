@@ -27,6 +27,26 @@ cd /opt/welove-shop
 docker compose --env-file config/production.env --env-file secrets/production.secrets.env -f docker-compose.prod.yml up -d
 ```
 
+## 聊天图片对象存储
+
+聊天图片必须上传到 AI 服务与 DashScope 都能访问的公开 URL；容器本地磁盘地址不能用于多模态检索。在服务器的
+`secrets/production.secrets.env` 中填写：
+
+```dotenv
+CLOUD_STORAGE_ACCESS_KEY=<阿里云 RAM AccessKeyId>
+CLOUD_STORAGE_SECRET_KEY=<阿里云 RAM AccessKeySecret>
+CLOUD_STORAGE_BUCKET=<OSS Bucket 名称>
+CLOUD_STORAGE_DOMAIN=https://<Bucket 公共访问域名或 CDN 域名>
+```
+
+在 `config/production.env` 中填写 Bucket 所在地域的非敏感 endpoint，例如杭州：
+
+```dotenv
+CLOUD_STORAGE_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
+```
+
+RAM 凭证至少需要该 Bucket 的 `PutObject` 权限；`CLOUD_STORAGE_DOMAIN` 必须可从公网 HTTPS 访问。它用于聊天上传，和商品图片的 `IMAGE_BASE_URL` 是两项不同配置。聊天文件会写入 `weloveshop/chat/`，不会再与知识库文档混在同一前缀。
+
 ## 前端的特殊点
 
 商城与管理端的 API 都是相对路径，因此域名变化无需重建前端镜像。商品图片域名由前端容器启动时生成 `/runtime-config.js`；修改服务器 `IMAGE_BASE_URL` 后执行一次 Compose 更新即可生效，不需要重新构建前端镜像。该文件会被浏览器下载，因此只能包含公开配置，严禁写入 token 或任何密钥。

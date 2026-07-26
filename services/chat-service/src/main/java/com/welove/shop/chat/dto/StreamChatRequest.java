@@ -12,6 +12,8 @@ public class StreamChatRequest implements Serializable {
     private Long userId;
     private Long conversationId;
     private String content;
+    /** Optional OSS image URL. The AI service selects the retrieval paths from this field. */
+    private String imageUrl;
     private String username;
     private boolean isAdmin;
     private String gender;

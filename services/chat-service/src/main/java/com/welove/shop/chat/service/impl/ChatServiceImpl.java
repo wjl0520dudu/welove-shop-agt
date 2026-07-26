@@ -12,6 +12,7 @@ import com.welove.shop.chat.mapper.QaLogMapper;
 import com.welove.shop.chat.service.AiService;
 import com.welove.shop.chat.service.ConversationContextService;
 import com.welove.shop.chat.service.ChatService;
+import com.welove.shop.common.core.exception.BizException;
 import com.welove.shop.common.storage.service.StorageService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -115,9 +116,15 @@ public class ChatServiceImpl implements ChatService {
 
     // ---------- SSE stream ----------
     @Override public SseEmitter sendStreamMessage(Long userId, Long conversationId, String content,
-                                                   String username, String jwtToken,
+                                                   String imageUrl, String username, String jwtToken,
                                                    String gender, String skinType, java.util.List<String> preferenceTags,
                                                    boolean retry) {
+        if (imageUrl != null && !imageUrl.isBlank()) {
+            return sendMultimodalStreamMessage(
+                    userId, conversationId, content, imageUrl, username, jwtToken,
+                    gender, skinType, preferenceTags, retry
+            );
+        }
         SseEmitter emitter = new SseEmitter(sseTimeout);
         final long streamStartMs = System.currentTimeMillis();
         // 用 AtomicBoolean 标记是否已正常完成,防止多个回调同时触发写库双写。
@@ -349,7 +356,7 @@ public class ChatServiceImpl implements ChatService {
      * 用 "MM-DIFF" 标记,便于对照:
      * <ul>
      *   <li>MM-DIFF-1:aiBody 多带一个 image_url</li>
-     *   <li>MM-DIFF-2:WebClient uri 走 /assistant/multimodal/stream</li>
+     *   <li>MM-DIFF-2:WebClient 与文本请求共用 /assistant/stream，携带 image_url</li>
      *   <li>MM-DIFF-3:saveUserMessage 传 imageUrl,落 message_type=multimodal_image</li>
      *   <li>MM-DIFF-4:content 允许为空(纯图搜索);dedup 用带 [MM] 前缀区分</li>
      * </ul>
@@ -431,7 +438,7 @@ public class ChatServiceImpl implements ChatService {
                 org.springframework.core.ParameterizedTypeReference<org.springframework.http.codec.ServerSentEvent<String>> sseType =
                         new org.springframework.core.ParameterizedTypeReference<>() {};
                 Flux<org.springframework.http.codec.ServerSentEvent<String>> flux = webClient.post()
-                        .uri("/assistant/multimodal/stream")  // MM-DIFF-2
+                        .uri("/assistant/stream")
                         .accept(org.springframework.http.MediaType.TEXT_EVENT_STREAM)
                         .bodyValue(aiBody)
                         .retrieve().bodyToFlux(sseType);
@@ -600,8 +607,19 @@ public class ChatServiceImpl implements ChatService {
             throw new IllegalArgumentException("不支持的图片类型:" + contentType + ",允许:" + normalized);
         }
         // 3) 存 OSS
-        String objectKey = storageService.put(file);
-        String url = storageService.getUrl(objectKey);
+        String objectKey;
+        String url;
+        try {
+            objectKey = storageService.put(file);
+            url = storageService.getUrl(objectKey);
+        } catch (RuntimeException ex) {
+            log.error("[uploadChatImage] object storage upload failed, mime={}, size={}",
+                    contentType, size, ex);
+            throw new BizException("图片上传失败，请检查对象存储配置、写入权限和 Bucket 地域");
+        }
+        if (url.contains("localhost") || url.contains("127.0.0.1")) {
+            throw new BizException("图片上传未启用可公开访问的对象存储，请配置 CLOUD_STORAGE_ACCESS_KEY、CLOUD_STORAGE_SECRET_KEY、CLOUD_STORAGE_BUCKET 和 CLOUD_STORAGE_DOMAIN");
+        }
         log.info("[uploadChatImage] key={} url={} size={} mime={}", objectKey, url, size, contentType);
         Map<String, Object> res = new java.util.HashMap<>();
         res.put("objectKey", objectKey);

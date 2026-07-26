@@ -27,6 +27,8 @@ INSERT_FIELDS_THREE_PATH = [
 class ProductMilvusThreePathStore(ProductMilvusStoreV2):
     """复用 v2 的 dense/BM25/image 检索实现，仅替换 schema 与写入字段。"""
 
+    is_three_path_collection = True
+
     def __init__(self, collection_name: Optional[str] = None):
         self.collection_name = collection_name or config.MILVUS_PRODUCT_THREE_PATH_COLLECTION
         self.milvus_url = config.MILVUS_URL

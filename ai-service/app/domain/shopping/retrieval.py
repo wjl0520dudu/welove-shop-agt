@@ -54,8 +54,14 @@ class ShoppingRetriever:
 
     def _get_milvus_store(self):
         if self._milvus_store is None:
-            from app.infrastructure.vectorstores.product.vector_store import get_product_milvus_store
-            self._milvus_store = get_product_milvus_store()
+            if config.SHOPPING_MULTIMODAL_USE_THREE_PATH_COLLECTION:
+                from app.infrastructure.vectorstores.product.vector_store_three_path import (
+                    get_product_milvus_store_three_path,
+                )
+                self._milvus_store = get_product_milvus_store_three_path()
+            else:
+                from app.infrastructure.vectorstores.product.vector_store import get_product_milvus_store
+                self._milvus_store = get_product_milvus_store()
         return self._milvus_store
 
     def _get_pg_store(self):
@@ -69,6 +75,12 @@ class ShoppingRetriever:
             from app.infrastructure.retrieval.reranker import get_reranker
             self._reranker = get_reranker()
         return self._reranker
+
+    @staticmethod
+    def _uses_three_path_store(store) -> bool:
+        return bool(config.SHOPPING_MULTIMODAL_USE_THREE_PATH_COLLECTION) and (
+            getattr(store, "is_three_path_collection", False) is True
+        )
 
     # ── 主入口 ──────────────────────────────────────────────
     async def retrieve(
@@ -146,15 +158,29 @@ class ShoppingRetriever:
 
         # Phase 1b 支持三路开关（默认 hybrid）
         mode = _pick_search_mode(plan, need)
-        results = store.search(
-            query=query,
-            mode=mode,
-            filters=filters,
-            top_k=recall_top_k,
-        )
-        _tag_recall_source(results, mode)
-        trace.append({"source": f"milvus_{mode}", "status": "ok", "count": len(results),
-                      "filters": filters, "query": query})
+        uses_three_path = self._uses_three_path_store(store)
+        if uses_three_path:
+            results = self._three_path_text_search(
+                store, query, mode=mode, filters=filters, top_k=recall_top_k,
+            )
+            trace.append({
+                "source": f"milvus_three_path_{mode}",
+                "status": "ok",
+                "count": len(results),
+                "filters": filters,
+                "query": query,
+                "paths": ["text_dense", "bm25"] if mode == "hybrid" else [mode],
+            })
+        else:
+            results = store.search(
+                query=query,
+                mode=mode,
+                filters=filters,
+                top_k=recall_top_k,
+            )
+            _tag_recall_source(results, mode)
+            trace.append({"source": f"milvus_{mode}", "status": "ok", "count": len(results),
+                          "filters": filters, "query": query})
 
         # ── category 兜底：filter 里带了 category 但零命中 → 去掉 category 再来一次 ──
         # 场景：LLM 抽出的 category 词跟库里两级类目都对不上（如 "护肤品" vs 库里
@@ -162,12 +188,17 @@ class ShoppingRetriever:
         # 死板的 filter 拦掉了 —— 松掉 filter 让 hybrid 语义救场。
         if not results and filters.get("category"):
             no_cat_filters = {k: v for k, v in filters.items() if k not in ("category", "sub_category")}
-            fallback_results = store.search(
-                query=query,
-                mode=mode,
-                filters=no_cat_filters,
-                top_k=recall_top_k,
-            )
+            if uses_three_path:
+                fallback_results = self._three_path_text_search(
+                    store, query, mode=mode, filters=no_cat_filters, top_k=recall_top_k,
+                )
+            else:
+                fallback_results = store.search(
+                    query=query,
+                    mode=mode,
+                    filters=no_cat_filters,
+                    top_k=recall_top_k,
+                )
             if fallback_results:
                 _tag_recall_source(fallback_results, f"{mode}_no_cat")
                 trace.append({"source": f"milvus_{mode}_no_cat", "status": "ok",
@@ -187,6 +218,31 @@ class ShoppingRetriever:
 
         # 不 rerank：按向量分数排序截 top_k
         return sorted(results, key=lambda r: r.get("score", 0), reverse=True)[:final_top_k]
+
+    @staticmethod
+    def _three_path_text_search(
+        store,
+        query: str,
+        *,
+        mode: str,
+        filters: Dict[str, Any],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        """Use the text fields of the evaluated three-path production schema."""
+        if mode == "dense":
+            return store.dense_search(query, filters=filters, top_k=top_k)
+        if mode in ("bm25", "sparse"):
+            return store.bm25_search(query, filters=filters, top_k=top_k)
+
+        from app.domain.shopping.multimodal_search import recall_three_path_candidates
+
+        return recall_three_path_candidates(
+            query_text=query,
+            filters=filters,
+            store=store,
+            top_k=top_k,
+            candidate_top_k=top_k,
+        )
 
     def _apply_rerank(
         self,
@@ -234,7 +290,16 @@ class ShoppingRetriever:
         for relaxed in plan.relaxed_filters:
             filters = _relaxed_to_milvus_filters(relaxed)
             try:
-                results = store.hybrid_search(query, filters=filters, top_k=plan.top_k)
+                if self._uses_three_path_store(store):
+                    results = self._three_path_text_search(
+                        store,
+                        query,
+                        mode="hybrid",
+                        filters=filters,
+                        top_k=plan.top_k,
+                    )
+                else:
+                    results = store.hybrid_search(query, filters=filters, top_k=plan.top_k)
                 if results:
                     return results
             except Exception as e:  # noqa: BLE001

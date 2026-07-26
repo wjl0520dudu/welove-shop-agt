@@ -45,11 +45,27 @@ def _parse_user_id(value: Optional[str]) -> Optional[int]:
         return None
 
 
+def _raise_multimodal_image_error(trace_id: str, error: MultimodalImageError) -> None:
+    logger.warning("trace=%s DashScope rejected image: %s", trace_id, error)
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error_code": ErrorCode.MULTIMODAL_IMAGE_INVALID,
+            "message": f"图片无法识别：{error.reason}",
+        },
+    )
+
+
 @router.post("/run", response_model=AIResponse)
 async def run_assistant(request: AssistantRunRequest, http_request: Request) -> AIResponse:
-    llm = get_llm()
-    # 优先复用中间件生成/透传的 traceId；没有则新建（防御性，正常不会走到）
     trace_id = getattr(http_request.state, "trace_id", None) or str(uuid4())
+    image_url = None
+    if request.image_url:
+        image_url = _validate_image_url(request.image_url)
+        await _precheck_image_reachable(image_url, trace_id)
+
+    llm = get_llm()
+    # trace_id is assigned before optional image validation so errors retain it.
     if llm is None:
         return build_error_response(
             "LLM 未配置，统一 Agent 暂不可用。",
@@ -72,7 +88,10 @@ async def run_assistant(request: AssistantRunRequest, http_request: Request) -> 
             preference_tags=request.preference_tags,
             conversation_history=request.conversation_history,
             trace_id=trace_id,
+            image_url=image_url,
         )
+    except MultimodalImageError as e:
+        _raise_multimodal_image_error(trace_id, e)
     except Exception:
         logger.exception("Assistant agent run failed")
         return build_error_response(
@@ -112,8 +131,13 @@ async def stream_assistant(request: AssistantRunRequest, http_request: Request):
         es.addEventListener('final', e => renderCards(JSON.parse(e.data).product_cards))
         es.addEventListener('done', () => es.close())
     """
-    llm = get_llm()
     trace_id = getattr(http_request.state, "trace_id", None) or str(uuid4())
+    image_url = None
+    if request.image_url:
+        image_url = _validate_image_url(request.image_url)
+        await _precheck_image_reachable(image_url, trace_id)
+
+    llm = get_llm()
 
     async def event_stream() -> AsyncIterator[bytes]:
         if llm is None:
@@ -138,6 +162,7 @@ async def stream_assistant(request: AssistantRunRequest, http_request: Request):
                 preference_tags=request.preference_tags,
                 conversation_history=request.conversation_history,
                 trace_id=trace_id,
+                image_url=image_url,
             ):
                 # 客户端断开后提前停 LLM,避免空跑 token
                 if await http_request.is_disconnected():
@@ -147,6 +172,14 @@ async def stream_assistant(request: AssistantRunRequest, http_request: Request):
                     )
                     break
                 yield _sse_frame(event["type"], event.get("data") or {}).encode("utf-8")
+        except MultimodalImageError as e:
+            logger.warning("trace=%s DashScope rejected image: %s", trace_id, e)
+            yield _sse_frame("error", {
+                "trace_id": trace_id,
+                "error_code": ErrorCode.MULTIMODAL_IMAGE_INVALID,
+                "message": f"图片无法识别：{e.reason}",
+            }).encode("utf-8")
+            yield _sse_frame("done", {}).encode("utf-8")
         except Exception as e:  # noqa: BLE001
             logger.exception("Assistant stream failed")
             yield _sse_frame("error", {
@@ -284,6 +317,10 @@ async def run_multimodal_assistant(
     - DashScope MultimodalImageError（图片格式非法、拒绝识别）
     任一失败都返回 HTTP 400 + error_code=AI_MULTIMODAL_IMAGE_INVALID
     """
+    # Compatibility alias.  The primary /run endpoint now accepts an optional
+    # image_url and owns validation, graph invocation, and error semantics.
+    return await run_assistant(request, http_request)
+
     image_url = _validate_image_url(request.image_url)
 
     llm = get_llm()
@@ -354,6 +391,9 @@ async def stream_multimodal_assistant(
     - 开流后 DashScope 拒识别 → 发 error 事件（error_code=IMAGE_INVALID）
       再 done，SSE 语义完整
     """
+    # Compatibility alias.  New callers use /stream with an optional image_url.
+    return await stream_assistant(request, http_request)
+
     image_url = _validate_image_url(request.image_url)
 
     llm = get_llm()

@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 
-from app.infrastructure.retrieval.embeddings import get_embeddings
 from app.infrastructure.retrieval.multimodal_embeddings import (
     embed_fusion,
     embed_image,
@@ -178,8 +177,7 @@ def _recall_paths(
         text = query_text.strip()
 
         def dense_path():
-            query_vec = get_embeddings().embed_query(text)
-            return store.text_dense_search_by_vector(query_vec, filters=filters, top_k=recall_top_k)
+            return store.dense_search(text, filters=filters, top_k=recall_top_k)
 
         groups.append(_safe_path("text_dense", dense_path))
         groups.append(_safe_path("bm25", lambda: store.bm25_search(text, filters=filters, top_k=recall_top_k)))
@@ -207,6 +205,34 @@ def _recall_paths(
     return groups
 
 
+def recall_three_path_candidates(
+    query_text: str,
+    query_image_url: str | None = None,
+    *,
+    top_k: int = 10,
+    filters: Optional[Dict[str, Any]] = None,
+    store=None,
+    candidate_top_k: int | None = None,
+) -> List[Dict[str, Any]]:
+    """Recall available production paths and fuse them with RRF.
+
+    Text only uses dense plus BM25, image only uses the image vector, and a
+    text/image request uses all three paths.  Reranking stays with the caller:
+    text requests use qwen3-rerank and image requests use qwen3-vl-rerank.
+    """
+    top_k = max(int(top_k or 10), 1)
+    groups = _recall_paths(
+        query_text=query_text,
+        query_image_url=query_image_url,
+        top_k=top_k,
+        filters=filters,
+        include_multimodal=False,
+        store=store,
+    )
+    fused = rrf_fusion(groups, k=60)
+    return fused[:max(int(candidate_top_k or top_k), 1)]
+
+
 async def search_multimodal_v1(
     query_text: str,
     query_image_url: str,
@@ -222,16 +248,14 @@ async def search_multimodal_v1(
         if config.SHOPPING_MULTIMODAL_USE_THREE_PATH_COLLECTION
         else get_product_milvus_store_v2()
     )
-    groups = _recall_paths(
+    candidates = recall_three_path_candidates(
         query_text=query_text,
         query_image_url=query_image_url,
         top_k=top_k,
         filters=filters,
-        include_multimodal=False,
         store=store,
+        candidate_top_k=top_k * 2,
     )
-    fused = rrf_fusion(groups, k=60)
-    candidates = fused[: top_k * 2]
     return multimodal_rerank(
         query_text=query_text,
         query_image_url=query_image_url,

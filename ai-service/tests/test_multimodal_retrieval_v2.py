@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from app.infrastructure.retrieval.embeddings import _build_search_text_v2
 from app.infrastructure.retrieval.multimodal_embeddings import DashScopeMultimodalEmbeddings
-from app.domain.shopping.multimodal_search import rrf_fusion, weighted_rerank
+from app.domain.shopping.multimodal_search import recall_three_path_candidates, rrf_fusion, weighted_rerank
 from app.infrastructure.vectorstores.product.vector_store_v2 import INSERT_FIELDS_V2, OUTPUT_FIELDS_V2, _build_fields_v2
 
 
@@ -90,6 +90,27 @@ class TestFusionRanking:
         assert ranked[0]["product_id"] == 2
         assert ranked[0]["weighted_score"] == 0.3
         assert "weighted_ranker" in ranked[0]["recall_sources"]
+
+    def test_three_path_recall_selects_only_text_fields_without_image(self):
+        store = MagicMock()
+        store.dense_search.return_value = [
+            {"product_id": 1, "score": 0.9, "recall_sources": ["text_dense"]},
+        ]
+        store.bm25_search.return_value = [
+            {"product_id": 1, "score": 10.0, "recall_sources": ["bm25"]},
+        ]
+
+        out = recall_three_path_candidates(
+            query_text="小棕瓶精华",
+            top_k=5,
+            store=store,
+        )
+
+        assert [item["product_id"] for item in out] == [1]
+        assert set(out[0]["recall_sources"]) == {"text_dense", "bm25"}
+        store.dense_search.assert_called_once()
+        store.bm25_search.assert_called_once()
+        assert not store.image_vector_search.called
 
 
 class TestMultimodalRerank:

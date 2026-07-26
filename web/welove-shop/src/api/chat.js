@@ -65,23 +65,13 @@ export function streamMessage(payload, cb = {}) {
 }
 
 /**
- * 多模态图文流式发送消息（SSE）
+ * 兼容旧调用的图文流式函数。实际统一调用 streamMessage，imageUrl 为可选字段。
  *
- * 与 streamMessage 唯一差异：URL 改到 /chat/multimodal/stream/messages,
- * payload 必须带 imageUrl (先调 uploadChatImage 拿到)。content 可为空。
- *
- * @param {object} payload  同 streamMessage,额外必填 imageUrl(OSS URL);
- *                          content 允许为空(纯图搜索)
+ * @param {object} payload  同 streamMessage；带 imageUrl 时 content 可为空（纯图搜索）
  * @param {object} cb       同 streamMessage
  */
 export function streamMultimodalMessage(payload, cb = {}) {
-  const token = getToken()
-  return postEventStream('/api/chat/chat/multimodal/stream/messages', {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-    body: payload,
-    onOpen: cb.onOpen,
-    onEvent: (frame) => dispatchChatEvent(frame, cb)
-  })
+  return streamMessage(payload, cb)
 }
 
 /**

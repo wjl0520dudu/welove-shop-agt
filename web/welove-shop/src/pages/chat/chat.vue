@@ -138,7 +138,6 @@ import { refreshAccessToken } from '../../utils/request'
 import { buildRecommendedQuestions } from '../../utils/chatRecommend'
 import {
   streamMessage,
-  streamMultimodalMessage,
   uploadChatImage,
   sendMessage,
   getMessages,
@@ -440,6 +439,13 @@ export default {
     async runStream(conversationId, content, assistant, allowAuthRetry, retry = false, imageUrl = '') {
       this._streamingConvId = conversationId
       if (!supportsEventStream()) {
+        if (imageUrl) {
+          assistant.pending = false
+          assistant.streaming = false
+          assistant.errored = true
+          uni.showToast({ title: '当前环境不支持图片检索', icon: 'none' })
+          return
+        }
         const ok = await this.fallbackSend(conversationId, content, assistant)
         if (!ok) this.markErrored(assistant, conversationId)
         return
@@ -447,6 +453,7 @@ export default {
 
       const payload = this.buildPayload(conversationId, content, retry, imageUrl)
       let gotText = false
+      let streamError = null
       const callbacks = {
         onText: (delta) => {
           if (!delta) return
@@ -497,7 +504,7 @@ export default {
             chatStore.markNewMessage(conversationId)
           }
         },
-        onError: () => {
+        onError: (error) => {
           // 注意:AbortError 路径不会走这里——chat.vue 已在 runStream 的 catch 里显式 return。
           // 走到 onError 一定是后端真正发了 error 事件(LLM 异常 / ai-service 5xx 等)。
           assistant.pending = false
@@ -506,9 +513,8 @@ export default {
             // 没有任何 token 才标 errored,提示用户「回复中断」
             assistant.errored = true
           }
+          streamError = error || { message: '回复失败' }
           this.syncCurrentStreaming()
-          const record = chatStore.getStream(conversationId)
-          if (record && record.handle) record.handle.abort()
         }
       }
 
@@ -520,17 +526,22 @@ export default {
       })
       this.syncCurrentStreaming()
 
-      // 有图 → 走多模态流式接口(POST /chat/multimodal/stream/messages);
-      // 无图 → 走纯文本流式接口。两个端点 payload 差别就是 imageUrl 字段,
-      // buildPayload 已经在最外面拼好了。
-      const handle = imageUrl
-        ? streamMultimodalMessage(payload, callbacks)
-        : streamMessage(payload, callbacks)
+      // The main stream endpoint accepts an optional imageUrl and selects the
+      // text-only, image-only, or text-image retrieval path on the backend.
+      const handle = streamMessage(payload, callbacks)
       if (streamRecord) streamRecord.handle = handle
       this.streamHandle = handle
       try {
         await handle.promise
-        if (assistant.streaming) this.finishStream(assistant, {}, conversationId)
+        if (streamError) {
+          if (imageUrl) {
+            const message = streamError.message || streamError.content || '图片检索失败，请更换图片后重试'
+            uni.showToast({ title: String(message).slice(0, 40), icon: 'none' })
+          }
+          this.markErrored(assistant, conversationId)
+        } else if (assistant.streaming) {
+          this.finishStream(assistant, {}, conversationId)
+        }
       } catch (err) {
         if (err && err.name === 'AbortError') {
           // 用户主动中止:保留已收 token,标 stopped,主动把半成品发给后端落库。
@@ -556,9 +567,12 @@ export default {
           toLogin('/pages/chat/chat')
           return
         }
-        if (!gotText) {
+        if (!gotText && !imageUrl) {
           const ok = await this.fallbackSend(conversationId, content, assistant)
           if (ok) return
+        }
+        if (imageUrl) {
+          uni.showToast({ title: '图片检索失败，请更换图片后重试', icon: 'none' })
         }
         this.markErrored(assistant, conversationId)
       } finally {

@@ -15,7 +15,7 @@ import java.io.Serial;
  * </ul>
  *
  * <p>不合并到 {@link StreamChatRequest}:让"纯文"和"图文"两条 SSE 链路端点、
- * 转发目标(ai-service /assistant/stream vs /assistant/multimodal/stream)、
+ * 现在由主流式入口统一转发至 ai-service /assistant/stream，
  * 落库 message_type(text vs multimodal_image) 都明确分开,方便后续扩展视频、
  * 音频等其他多模态形式。</p>
  */

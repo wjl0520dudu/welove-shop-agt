@@ -7,7 +7,7 @@ Milvus/reranker 全 mock，pgvector 只在测降级路径时用。
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.domain.shopping.retrieval import (
     ShoppingRetriever,
@@ -19,6 +19,7 @@ from app.domain.shopping.retrieval import (
     build_retrieval_plan,
 )
 from app.domain.shopping.schemas import ShoppingNeed, ShoppingRetrievalPlan
+from app.infrastructure.config import config
 
 
 # ---- build_retrieval_plan ------------------------------------------------
@@ -267,6 +268,32 @@ class TestShoppingRetriever:
 
         # search 被调用时 mode=dense
         assert milvus.search.call_args.kwargs["mode"] == "dense"
+
+    def test_three_path_hybrid_uses_text_dense_and_bm25_before_rerank(self):
+        store = MagicMock()
+        store.is_three_path_collection = True
+        store.dense_search.return_value = [
+            {"product_id": 1, "title": "A", "score": 0.9, "recall_sources": ["text_dense"]},
+            {"product_id": 2, "title": "B", "score": 0.8, "recall_sources": ["text_dense"]},
+        ]
+        store.bm25_search.return_value = [
+            {"product_id": 2, "title": "B", "score": 9.0, "recall_sources": ["bm25"]},
+            {"product_id": 1, "title": "A", "score": 8.0, "recall_sources": ["bm25"]},
+        ]
+        rerank = self._rerank_mock([(1, 0.9), (0, 0.8)])
+        retriever = ShoppingRetriever(milvus_store=store, reranker=rerank)
+
+        with patch.object(config, "SHOPPING_MULTIMODAL_USE_THREE_PATH_COLLECTION", True):
+            out, trace = asyncio.run(retriever.retrieve(
+                ShoppingRetrievalPlan(top_k=2, initial_top_k=2, use_rerank=True),
+                ShoppingNeed(category="防晒"),
+            ))
+
+        assert [item["product_id"] for item in out] == [2, 1]
+        assert set(out[0]["recall_sources"]) >= {"text_dense", "bm25", "rerank"}
+        store.dense_search.assert_called_once()
+        store.bm25_search.assert_called_once()
+        assert any(item["source"] == "milvus_three_path_hybrid" for item in trace)
 
     def test_category_fallback_when_filter_returns_zero(self):
         """category filter 命中 0 条时，去掉 category 再来一次（"护肤品"这类泛化词兜底）。"""
