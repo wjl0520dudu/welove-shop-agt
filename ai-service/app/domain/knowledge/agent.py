@@ -15,12 +15,11 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from app.infrastructure.persistence.memory import get_business_memory, remember_knowledge_entities
+from app.infrastructure.persistence.memory import remember_knowledge_entities
 from app.infrastructure.llm.middleware import build_summarization_middleware
 from app.prompts.prompts import KNOWLEDGE_PROMPT
 from app.application.assistant.state import KnowledgeAgentState
 from app.infrastructure.retrieval.retriever import get_retriever
-from app.application.assistant.reference_tools import resolve_reference
 
 logger = logging.getLogger("ai-service.knowledge.agent")
 
@@ -364,7 +363,7 @@ _ENTITY_EXTRACT_PROMPT = """从用户的知识问答问题中提取关键实体�
 
 规则：
 1. 只提取本轮问题中明确提到的实体，不要从上下文推断
-2. 如果问题只是指代（"第二个""它的副作用"等），不要提取——因为这些指代会在指代消解环节处理
+2. 当前问题应已由主路由改写为完整表达；不要从历史猜测未出现在本轮的问题实体
 3. 保序去重，最多 5 个
 4. 没有实体时返回空列表
 5. 示例：
@@ -541,21 +540,17 @@ _UNGROUNDED_FALLBACK_ANSWER = (
 
 
 class KnowledgeAgent:
-    """知识问答 agent：create_agent + search_knowledge + resolve_reference。
+    """知识问答 agent：create_agent + search_knowledge。
 
-    ## 变更（2026-07-08）
-    - 挂上 resolve_reference：支持"第二个的成分是什么"这类跨轮指代
-      （通过 last_knowledge_entities 定位到上一轮谈过的成分/产品名）
-    - 每次 run 时读 business_memory 并注入 prompt：LLM 能看到上轮实体
-    - 检索完成后把候选实体写回 Store：下一轮就能被 resolve_reference 定位
+    The main Intent Router owns cross-turn reference resolution.  This Agent
+    receives a self-contained question and does not read historical entities or
+    expose a second reference-resolution tool to its model loop.
 
     ## 独立 checkpointer
     每次调用传唯一 thread_id 避免内部 tool_call 消息污染下一次调用。
 
     ## 对话级缓存
-    同一问题（hash 去重）直接返回缓存结果，避免重复 RAG。**但要注意**：
-    命中缓存时也要更新 last_knowledge_entities，否则用户连问两次同样的问题、
-    第三次追问"第二个"时会读到过期实体列表。
+    同一问题（hash 去重）直接返回缓存结果，避免重复 RAG。
 
     实例懒构造，直到首次调用时才创建底层 agent。
     """
@@ -572,19 +567,16 @@ class KnowledgeAgent:
             #   为什么不给 LLM search_web 独立工具：中等模型有"偷懒"倾向，
             #   拿到不相关的 Milvus 结果会用训练知识编答案，而不是主动改调 search_web。
             #   干脆把决策权从 LLM 手里拿走，全靠程序判断阈值。
-            # - resolve_reference：跨轮指代消解（"第二个"/"它们"）
             #
             # ToolCallLimit(search_knowledge, 2, continue)：
             #   超限后注入错误 ToolMessage，让模型用已有内容答（不硬停）
             # ModelCallLimit(5) 硬顶兜底，防弱模型死循环；recursion_limit 再兜一层
             #
-            # state_schema=KnowledgeAgentState：让 resolve_reference 能通过
-            # runtime.state 拿到 conversation_id / user_id 去读 Store。
             self._agent = create_agent(
                 model=self._llm,
                 checkpointer=_knowledge_checkpointer,
                 system_prompt=KNOWLEDGE_PROMPT,
-                tools=[search_knowledge, resolve_reference],
+                tools=[search_knowledge],
                 state_schema=KnowledgeAgentState,
                 middleware=[
                     build_summarization_middleware(),
@@ -598,23 +590,6 @@ class KnowledgeAgent:
             )
         return self._agent
 
-    def _build_prompt_with_memory(self, memory: Dict[str, Any]) -> Optional[str]:
-        """把知识实体记忆拼到 system_prompt 尾部，作为额外一条 SystemMessage。
-
-        没有实体时返回 None，避免注入空段落。
-        """
-        entities: List[str] = memory.get("last_knowledge_entities") or []
-        if not entities:
-            return None
-        lines = [f"  {i}. {e}" for i, e in enumerate(entities, 1)]
-        return (
-            "## 上一轮谈到的知识实体\n\n"
-            + "\n".join(lines)
-            + "\n\n如果本轮问题里含'第二个'、'它们'、'副作用/成分/怎么用'等指代，"
-              "**必须先调 resolve_reference**，让它把指代解析到具体实体，"
-              "再基于实体名做 search_knowledge。"
-        )
-
     async def run(
         self,
         *,
@@ -625,11 +600,9 @@ class KnowledgeAgent:
         """执行知识问答。
 
         Args:
-            messages: 来自 supervisor 共享记忆的消息列表（含对话历史 + 当前问题）。
-                      格式为 langchain_core.messages 对象列表。
-            conversation_id: 会话 ID，用于业务记忆隔离 + 对话级缓存。
-            user_id: 用户 ID（可选），传给工具用（当前 knowledge 没有用户维度工具，
-                     但保留字段让 resolve_reference 未来接实体 → user_prefs 关联时用得上）。
+            messages: 路由后当前问题的消息列表；不包含完整对话历史。
+            conversation_id: 会话 ID，用于对话级缓存和实体写回。
+            user_id: 用户 ID（可选），用于实体写回时的会话隔离。
 
         Returns:
             包含 answer、sources、confidence、task_type 等字段的字典。
@@ -653,32 +626,15 @@ class KnowledgeAgent:
                 question = content.strip()
                 break
 
-        # 读业务记忆，为本轮 prompt 注入 last_knowledge_entities
-        try:
-            memory = await get_business_memory(conversation_id, user_id)
-        except Exception:  # noqa: BLE001
-            logger.warning("knowledge: 读取 business_memory 失败，退化为无记忆模式", exc_info=True)
-            memory = {}
-
-        # 把上轮实体拼进 messages（作为一条 SystemMessage 追加在原 prompt 之后）。
-        # 注意：create_agent 已经把 KNOWLEDGE_PROMPT 作为首条 SystemMessage 塞进去了，
-        # 这里再追加一条 SystemMessage 让 LLM 看到"上一轮谈过什么"。
-        memory_block = self._build_prompt_with_memory(memory)
-        if memory_block:
-            from langchain_core.messages import SystemMessage
-            messages = [SystemMessage(content=memory_block), *messages]
-
         # 对话级缓存：同一对话 + 同一问题，直接返回缓存
         cache_key = f"{conversation_id}:{hashlib.md5(question.encode()).hexdigest()}" if question else ""
         if cache_key and cache_key in _knowledge_cache:
             cached = _knowledge_cache[cache_key]
-            # 命中缓存也要更新实体记忆，避免过时（用户连问同样的问题两次时不会漏）
             await self._persist_entities(conversation_id, user_id, question, cached.get("sources") or [])
             return cached
 
         # 每次调用使用唯一 thread_id，确保不受内部 tool_call 消息污染。
-        # recursion_limit=20：跨轮指代 case（resolve_reference → search_knowledge → 再答）
-        # 需要 model+tool 各 3-4 次往返，加上 middleware 也算 step，12 步不够。
+        # recursion_limit=12：单个检索工具的受控 Agent loop。
         # ModelCallLimit(run_limit=5, exit_behavior="end") 兜底防真死循环。
         # 观测：正常单轮问答 5-6 步，跨轮指代 8-10 步，20 有充裕余量。
         result = await self._get_agent().ainvoke(
@@ -689,7 +645,7 @@ class KnowledgeAgent:
             },
             config={
                 "configurable": {"thread_id": str(uuid4())},
-                "recursion_limit": 20,
+                "recursion_limit": 12,
             },
         )
 
@@ -724,7 +680,7 @@ class KnowledgeAgent:
         else:
             logger.info("knowledge: 自评通过 reason=%s", grounding_reason)
 
-        # 抽取本轮候选实体并写回 Store，供下一轮 resolve_reference 定位
+        # 抽取本轮候选实体并写回 Store，供下一轮主路由绑定。
         await self._persist_entities(conversation_id, user_id, question, sources)
 
         output = {
@@ -782,7 +738,7 @@ class KnowledgeAgent:
         """从当前 question + sources 抽取候选实体，写回 Store。
 
         query 抽取优先，sources 抽取兜底（覆盖不到时补充）。
-        写入失败不阻塞主流程 —— 记忆缺失最多是下一轮 resolve_reference 失效。
+        写入失败不阻塞主流程 —— 记忆缺失最多让下一轮主路由无法绑定历史实体。
         """
         try:
             # LLM 优先，正则兜底

@@ -11,7 +11,7 @@ IMAGE_CARDS = [
 ]
 
 
-def test_compare_reference_prefers_latest_multimodal_message_artifact():
+def test_preparation_prefers_latest_multimodal_message_artifact():
     result = resolve_turn_context(
         question="这两款对比一下",
         business_memory={"last_product_cards": TEXT_CARDS},
@@ -26,9 +26,10 @@ def test_compare_reference_prefers_latest_multimodal_message_artifact():
     assert result["context_resolution"]["reference_message_id"] == 3
     assert result["business_memory"]["last_product_cards"] == IMAGE_CARDS
     assert result["business_memory"]["active_product_set"]["source_type"] == "multimodal_retrieval"
+    assert result["context_resolution"]["candidate_product_ids"] == [21, 22]
 
 
-def test_two_product_reference_is_clarified_when_source_has_three_cards():
+def test_preparation_never_interprets_reference_or_clarifies():
     result = resolve_turn_context(
         question="那两款哪个好？",
         business_memory={},
@@ -37,23 +38,24 @@ def test_two_product_reference_is_clarified_when_source_has_three_cards():
         ],
     )
 
-    assert result["context_resolution"]["needs_clarification"] is True
-    assert result["business_memory"].get("last_product_cards") is None
+    assert result["context_resolution"]["needs_clarification"] is False
+    assert result["context_resolution"]["has_reference"] is False
+    assert result["business_memory"]["last_product_cards"] == IMAGE_CARDS + [{"product_id": 23, "title": "图片命中 C"}]
 
 
-def test_non_reference_does_not_replace_existing_product_memory():
+def test_preparation_uses_latest_rendered_cards_without_semantic_detection():
     result = resolve_turn_context(
         question="敏感肌要注意什么？",
         business_memory={"last_product_cards": TEXT_CARDS},
         conversation_history=[{"id": 3, "role": "assistant", "product_cards": IMAGE_CARDS}],
     )
 
-    assert result["business_memory"]["last_product_cards"] == TEXT_CARDS
+    assert result["business_memory"]["last_product_cards"] == IMAGE_CARDS
     assert result["context_resolution"]["has_reference"] is False
 
 
-def test_ordinal_reference_preserves_product_memory_and_sets_has_reference():
-    """场景 3: '第二个多少钱' — 引用上轮推荐中的具体商品序号。"""
+def test_ordinal_text_only_exposes_candidate_set_to_router():
+    """“第二个多少钱”由 Router LLM 解析，Preparation 只暴露候选集合。"""
     result = resolve_turn_context(
         question="第二个多少钱",
         business_memory={"last_product_cards": TEXT_CARDS},
@@ -62,7 +64,7 @@ def test_ordinal_reference_preserves_product_memory_and_sets_has_reference():
         ],
     )
 
-    assert result["context_resolution"]["has_reference"] is True
+    assert result["context_resolution"]["has_reference"] is False
     assert result["context_resolution"]["reference_source"] == "message_artifact"
     assert result["context_resolution"]["reference_message_id"] == 1
     assert result["context_resolution"]["needs_clarification"] is False
@@ -71,8 +73,7 @@ def test_ordinal_reference_preserves_product_memory_and_sets_has_reference():
     assert result["business_memory"]["active_product_set"]["source_type"] == "recommendation"
 
 
-def test_ordinal_reference_matches_singleton():
-    """场景 3: '第一个适合什么肤质' — 单数序号仍触发指代。"""
+def test_ordinal_text_does_not_change_prepared_set():
     result = resolve_turn_context(
         question="第一个适合什么肤质",
         business_memory={"last_product_cards": TEXT_CARDS},
@@ -81,12 +82,11 @@ def test_ordinal_reference_matches_singleton():
         ],
     )
 
-    assert result["context_resolution"]["has_reference"] is True
+    assert result["context_resolution"]["has_reference"] is False
     assert result["context_resolution"]["needs_clarification"] is False
 
 
-def test_context_query_without_reference_preserves_business_memory():
-    """场景 3: '适合什么肤质'（无序号/指代词）— has_reference=False，business_memory 不丢失。"""
+def test_preparation_does_not_depend_on_question_wording():
     result = resolve_turn_context(
         question="适合什么肤质",
         business_memory={"last_product_cards": IMAGE_CARDS},
@@ -94,5 +94,4 @@ def test_context_query_without_reference_preserves_business_memory():
     )
 
     assert result["context_resolution"]["has_reference"] is False
-    # 非指代性问题不会覆盖 business_memory
-    assert result["business_memory"]["last_product_cards"] == IMAGE_CARDS
+    assert result["business_memory"]["last_product_cards"] == TEXT_CARDS

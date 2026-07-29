@@ -124,13 +124,6 @@ class AssistantGraph:
     async def _analyze_request(self, state: AssistantState) -> dict:
         """判断本轮是否需要 Orchestrator，并在需要时生成任务议程。"""
         question = state.get("question") or ""
-        resolution = state.get("context_resolution") or {}
-        if resolution.get("needs_clarification"):
-            return {
-                "original_question": question,
-                "orchestrator_mode": "simple",
-                "orchestrator_reason": "上下文指代不唯一，先澄清商品集合",
-            }
         if not question.strip():
             return {
                 "original_question": question,
@@ -670,16 +663,6 @@ class AssistantGraph:
 
     async def _route(self, state: AssistantState) -> dict:
         question = (state.get("question") or "").strip()
-        resolution = state.get("context_resolution") or {}
-        if resolution.get("needs_clarification"):
-            return _route_result(
-                route="unknown",
-                confidence=1.0,
-                source="context_resolver",
-                reason="上下文中的商品指代不唯一",
-                clarification=str(resolution.get("clarification") or clarification_for_low_confidence(question)),
-            )
-
         active_task = state.get("active_subtask") or {}
         image_url = (state.get("image_url") or "").strip()
         task_uses_image = bool(active_task.get("use_image")) if active_task else False
@@ -758,15 +741,9 @@ class AssistantGraph:
                 rule=rule,
             )
 
-        if rule.matched and rule.confidence >= config.ROUTER_RULE_MIN_CONFIDENCE:
-            return _route_result(
-                route=rule.route,
-                confidence=rule.confidence,
-                source="rule",
-                reason=rule.reason,
-                rule=rule,
-            )
-
+        # The LLM is the primary semantic decision-maker.  Rules above are kept
+        # only as observations and failure fallbacks; otherwise they would bypass
+        # the one component responsible for cross-turn resolution.
         # ROUTER_PROMPT 作为首条 system 消息置顶；会话上下文作为第二条 system 消息追加。
         # with_structured_output 直链，不再需要 checkpointer / thread_id / recursion_limit。
         router_messages: list = [SystemMessage(content=ROUTER_PROMPT)]
@@ -775,15 +752,7 @@ class AssistantGraph:
         router_messages.extend(history_messages)
 
         if self._router_llm is None:
-            return _route_result(
-                route="unknown",
-                confidence=0.0,
-                source="fallback",
-                reason="规则未命中且路由模型未配置",
-                rule=rule,
-                fallback_used=True,
-                clarification=clarification_for_low_confidence(question),
-            )
+            return _rule_or_unknown_fallback(question, rule, "路由模型未配置")
 
         # with_structured_output 默认 include_raw=False，解析失败会抛异常；
         # 这里兜住，分类失败一律归 unknown，不阻塞主图。
@@ -794,45 +763,23 @@ class AssistantGraph:
             )
         except Exception:  # noqa: BLE001
             logger.warning("router: 结构化分类失败，退化到 unknown", exc_info=True)
-            return _route_result(
-                route="unknown",
-                confidence=0.0,
-                source="fallback",
-                reason="结构化路由调用失败",
-                rule=rule,
-                fallback_used=True,
-                clarification=clarification_for_low_confidence(question),
-            )
+            return _rule_or_unknown_fallback(question, rule, "结构化路由调用失败")
         if decision is None:
-            return _route_result(
-                route="unknown",
-                confidence=0.0,
-                source="fallback",
-                reason="结构化路由返回空结果",
-                rule=rule,
-                fallback_used=True,
-                clarification=clarification_for_low_confidence(question),
-            )
+            return _rule_or_unknown_fallback(question, rule, "结构化路由返回空结果")
 
         try:
             normalized = normalize_llm_decision(decision)
         except Exception:  # noqa: BLE001
             logger.warning("router: 结构化分类结果校验失败，进入澄清兜底", exc_info=True)
-            return _route_result(
-                route="unknown",
-                confidence=0.0,
-                source="fallback",
-                reason="结构化路由结果不符合 IntentDecision 契约",
-                rule=rule,
-                fallback_used=True,
-                clarification=clarification_for_low_confidence(question),
-            )
+            return _rule_or_unknown_fallback(question, rule, "结构化路由结果不符合 IntentDecision 契约")
         llm_trace = {
             "route": normalized.task_type,
             "confidence": normalized.confidence,
             "reason": normalized.reason,
         }
         if (
+            normalized.needs_clarification
+            or
             normalized.task_type == "unknown"
             or normalized.confidence < config.ROUTER_LOW_CONFIDENCE_THRESHOLD
         ):
@@ -847,7 +794,28 @@ class AssistantGraph:
                 rule=rule,
                 llm=llm_trace,
                 fallback_used=True,
-                clarification=clarification_for_low_confidence(question),
+                clarification=normalized.clarification or clarification_for_low_confidence(question),
+            )
+
+        try:
+            bound = _bind_router_context(
+                question=question,
+                canonical_question=normalized.canonical_question,
+                product_ids=normalized.resolved_product_ids,
+                knowledge_entities=normalized.resolved_knowledge_entities,
+                memory=memory,
+            )
+        except ValueError as exc:
+            logger.warning("router returned untrusted entity binding: %s", exc)
+            return _route_result(
+                route="unknown",
+                confidence=0.0,
+                source="fallback",
+                reason=f"路由实体绑定校验失败: {exc}",
+                rule=rule,
+                llm=llm_trace,
+                fallback_used=True,
+                clarification="我没能可靠定位你指的是哪一项。请直接说商品名或序号，我再继续。",
             )
         return _route_result(
             route=normalized.task_type,
@@ -856,6 +824,8 @@ class AssistantGraph:
             reason=normalized.reason or "LLM structured router",
             rule=rule,
             llm=llm_trace,
+            canonical_question=bound["canonical_question"],
+            business_memory=bound["business_memory"],
         )
 
     def _make_initial_state(self, **kwargs) -> tuple[AssistantState, str, str]:
@@ -993,7 +963,7 @@ class AssistantGraph:
         async for chunk in self.graph.astream(
             state,
             config={"configurable": {"thread_id": conversation_id}},
-            stream_mode=["updates", "messages"],
+            stream_mode=["updates", "messages", "custom"],
             subgraphs=True,
         ):
             # 兼容 subgraphs=True/False 两种输出结构
@@ -1010,6 +980,14 @@ class AssistantGraph:
                 msg_chunk, meta = payload
                 async for event in self._translate_message_event(msg_chunk, meta, namespace):
                     yield event
+
+            elif mode == "custom":
+                # Domain nodes publish genuine model chunks through
+                # langgraph.config.get_stream_writer().
+                if isinstance(payload, dict) and payload.get("type") == "token":
+                    data = payload.get("data") or {}
+                    if isinstance(data, dict) and data.get("content"):
+                        yield {"type": "token", "data": {"content": str(data["content"])}}
 
             elif mode == "updates":
                 # payload = {node_name: {state_delta_key: value, ...}}
@@ -1170,11 +1148,13 @@ def _route_result(
     llm: dict[str, Any] | None = None,
     fallback_used: bool = False,
     clarification: str = "",
+    canonical_question: str = "",
+    business_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one stable routing trace for graph state, API and offline evals."""
     rule_data = rule.to_dict() if rule is not None else {}
     llm_data = llm or {}
-    return {
+    result = {
         "route": route,
         "route_reason": reason,
         "route_confidence": max(0.0, min(1.0, float(confidence or 0.0))),
@@ -1188,6 +1168,94 @@ def _route_result(
         "route_fallback_used": bool(fallback_used),
         "route_clarification": clarification,
     }
+    if canonical_question:
+        # Replacing state.question here is intentional: child Agents receive the
+        # already-resolved turn, not raw conversational shorthand.
+        result["question"] = canonical_question
+        result["canonical_question"] = canonical_question
+    if business_memory is not None:
+        result["business_memory"] = business_memory
+    return result
+
+
+def _rule_or_unknown_fallback(question: str, rule, failure_reason: str) -> dict[str, Any]:
+    """Use a deterministic route only when the LLM router itself is unavailable."""
+    if rule is not None and rule.matched:
+        return _route_result(
+            route=rule.route,
+            confidence=rule.confidence,
+            source="rule_fallback",
+            reason=f"{failure_reason}; {rule.reason}",
+            rule=rule,
+            fallback_used=True,
+        )
+    return _route_result(
+        route="unknown",
+        confidence=0.0,
+        source="fallback",
+        reason=failure_reason,
+        rule=rule,
+        fallback_used=True,
+        clarification=clarification_for_low_confidence(question),
+    )
+
+
+def _bind_router_context(
+    *,
+    question: str,
+    canonical_question: str,
+    product_ids: list[int],
+    knowledge_entities: list[str],
+    memory: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate LLM bindings against the Preparation snapshot.
+
+    Semantic selection stays in the Router LLM.  This code only protects the
+    system boundary: an LLM may choose an offered item, never invent one.
+    """
+    canonical = (canonical_question or question).strip()
+    if not canonical:
+        raise ValueError("canonical_question is empty")
+
+    bound_memory = dict(memory or {})
+    cards = [card for card in (bound_memory.get("last_product_cards") or []) if isinstance(card, dict)]
+    card_by_id: dict[int, dict[str, Any]] = {}
+    for card in cards:
+        raw_id = card.get("product_id", card.get("id"))
+        try:
+            if raw_id is not None:
+                card_by_id[int(raw_id)] = card
+        except (TypeError, ValueError):
+            continue
+
+    unique_product_ids = list(dict.fromkeys(int(pid) for pid in (product_ids or [])))
+    unknown_ids = [pid for pid in unique_product_ids if pid not in card_by_id]
+    if unknown_ids:
+        raise ValueError(f"unknown product ids: {unknown_ids}")
+    if unique_product_ids:
+        selected_cards = [card_by_id[pid] for pid in unique_product_ids]
+        previous_set = dict(bound_memory.get("active_product_set") or {})
+        bound_memory["last_product_cards"] = selected_cards
+        bound_memory["active_product_set"] = {
+            **previous_set,
+            "product_ids": unique_product_ids,
+        }
+        if len(selected_cards) == 1:
+            bound_memory["last_focused_product"] = selected_cards[0]
+
+    available_entities = {
+        str(entity).strip()
+        for entity in (bound_memory.get("last_knowledge_entities") or [])
+        if str(entity).strip()
+    }
+    unique_entities = list(dict.fromkeys(str(entity).strip() for entity in (knowledge_entities or []) if str(entity).strip()))
+    unknown_entities = [entity for entity in unique_entities if entity not in available_entities]
+    if unknown_entities:
+        raise ValueError(f"unknown knowledge entities: {unknown_entities}")
+    if unique_entities:
+        bound_memory["resolved_knowledge_entities"] = unique_entities
+
+    return {"canonical_question": canonical, "business_memory": bound_memory}
 
 
 def _decision_value(decision: Any, key: str, default: Any = None) -> Any:

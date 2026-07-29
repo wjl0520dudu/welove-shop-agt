@@ -43,23 +43,27 @@ def test_mixed_signal_is_deferred_to_llm():
     assert decision.route == "unknown"
 
 
-def test_rule_route_skips_structured_llm(monkeypatch):
-    monkeypatch.setattr("assistant.graph.config.ROUTER_RULE_MIN_CONFIDENCE", 0.90)
+def test_llm_is_primary_even_when_a_rule_would_match(monkeypatch):
+    monkeypatch.setattr("app.application.assistant.graph.config.ROUTER_LOW_CONFIDENCE_THRESHOLD", 0.65)
     async def run():
-        router = FakeStructuredRouter(error=AssertionError("LLM should not be called"))
+        router = FakeStructuredRouter(IntentDecision(
+            task_type="shopping", confidence=0.98, reason="明确商品推荐",
+            canonical_question="推荐一款防晒",
+        ))
         graph = _graph_with_router(router)
         result = await graph._route({"question": "推荐一款防晒", "messages": []})
         assert result["route"] == "shopping"
-        assert result["route_source"] == "rule"
+        assert result["route_source"] == "llm"
         assert result["rule_route"] == "shopping"
-        assert result["llm_route"] is None
-        assert router.calls == 0
+        assert result["llm_route"] == "shopping"
+        assert result["question"] == "推荐一款防晒"
+        assert router.calls == 1
 
     asyncio.run(run())
 
 
 def test_unresolved_rule_uses_confident_llm_route(monkeypatch):
-    monkeypatch.setattr("assistant.graph.config.ROUTER_LOW_CONFIDENCE_THRESHOLD", 0.65)
+    monkeypatch.setattr("app.application.assistant.graph.config.ROUTER_LOW_CONFIDENCE_THRESHOLD", 0.65)
     async def run():
         router = FakeStructuredRouter(IntentDecision(
             task_type="knowledge", confidence=0.86, reason="用户在询问选择方法",
@@ -80,7 +84,7 @@ def test_unresolved_rule_uses_confident_llm_route(monkeypatch):
 
 
 def test_low_confidence_llm_asks_for_clarification(monkeypatch):
-    monkeypatch.setattr("assistant.graph.config.ROUTER_LOW_CONFIDENCE_THRESHOLD", 0.65)
+    monkeypatch.setattr("app.application.assistant.graph.config.ROUTER_LOW_CONFIDENCE_THRESHOLD", 0.65)
     async def run():
         router = FakeStructuredRouter(IntentDecision(
             task_type="shopping", confidence=0.42, reason="表达含糊",
@@ -92,6 +96,49 @@ def test_low_confidence_llm_asks_for_clarification(monkeypatch):
         assert result["llm_route"] == "shopping"
         assert result["route_fallback_used"] is True
         assert "请补充" in result["route_clarification"]
+
+    asyncio.run(run())
+
+
+def test_router_binds_only_offered_product_ids():
+    async def run():
+        router = FakeStructuredRouter(IntentDecision(
+            task_type="shopping", confidence=0.91, reason="商品追问",
+            canonical_question="介绍商品 A 和商品 C 的差异",
+            resolved_product_ids=[11, 13],
+        ))
+        graph = _graph_with_router(router)
+        result = await graph._route({
+            "question": "第一款和第三款呢？",
+            "messages": [],
+            "business_memory": {"last_product_cards": [
+                {"product_id": 11, "title": "商品 A"},
+                {"product_id": 12, "title": "商品 B"},
+                {"product_id": 13, "title": "商品 C"},
+            ]},
+        })
+        assert result["route"] == "shopping"
+        assert result["question"] == "介绍商品 A 和商品 C 的差异"
+        assert [card["product_id"] for card in result["business_memory"]["last_product_cards"]] == [11, 13]
+
+    asyncio.run(run())
+
+
+def test_router_rejects_hallucinated_product_id():
+    async def run():
+        router = FakeStructuredRouter(IntentDecision(
+            task_type="shopping", confidence=0.91, reason="商品追问",
+            canonical_question="介绍不存在的商品",
+            resolved_product_ids=[999],
+        ))
+        graph = _graph_with_router(router)
+        result = await graph._route({
+            "question": "第一款呢？",
+            "messages": [],
+            "business_memory": {"last_product_cards": [{"product_id": 11, "title": "商品 A"}]},
+        })
+        assert result["route"] == "unknown"
+        assert result["route_fallback_used"] is True
 
     asyncio.run(run())
 

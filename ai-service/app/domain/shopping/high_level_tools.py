@@ -49,6 +49,13 @@ async def recommend_products(
     - 用户想对比已有商品 → 应调用 compare_products
     - 用户追问某个商品的价格/规格/库存 → 应调用 answer_product_detail
 
+    典型示例：
+    - “预算 300 元，给通勤用推荐一副降噪耳机” → 调用本工具，query 保留完整预算和场景。
+    - “夏天出油多，想要清爽的防晒” → 调用本工具，query 保留肤质和使用感偏好。
+    - “送朋友的生日礼物，想要实用一点的咖啡机” → 调用本工具。
+    - “比较 A 和 B 哪个好” → 不调用本工具，改用 compare_products。
+    - “A 还有没有货” → 不调用本工具，改用 answer_product_detail。
+
     Args:
         query: 用户当前原话，保留完整自然语言。
         limit: 返回商品卡片数量，默认 3。
@@ -85,18 +92,24 @@ async def compare_products(
     """对比多个真实商品，给出多维对比表和最佳选择建议。
 
     适用于：
-    - 用户问"这两个哪个好""他们三对比一下"
-    - 用户问"第二个和第三个哪个更适合敏感肌"
+    - 用户问已绑定商品之间哪个好、需要横向比较
     - 用户想按价格/评分/销量/成分/肤质等维度横向比较
 
     不适用于：
     - 用户想重新找商品 → 应调用 recommend_products
     - 用户只问单个商品的价格/库存/详情 → 应调用 answer_product_detail
 
+    典型示例：
+    - “比较这两款耳机的降噪、续航和通话效果” → 调用本工具。
+    - “这几款跑鞋哪双更适合日常通勤” → 调用本工具。
+    - “A 和 B 哪个性价比更高” → 调用本工具。
+    - “推荐一款适合通勤的耳机” → 不调用本工具，改用 recommend_products。
+    - “A 的价格是多少” → 不调用本工具，改用 answer_product_detail。
+
     Args:
         query: 用户当前原话。
-        product_ids: 可选，明确要对比的商品 ID 列表。不传时会从 query 的指代词
-                     ("第二个/他们三")或上一轮 last_product_cards 自动解析。
+    product_ids: 可选，明确要对比的商品 ID 列表。通常由主路由在运行时
+                 绑定到当前商品集合，Agent 无需从自然语言解析跨轮指代。
 
     Returns:
         dict 结构：
@@ -132,19 +145,24 @@ async def answer_product_detail(
     """回答某个商品的价格、库存、规格、成分、适合人群、详情等追问。
 
     适用于：
-    - "第二个多少钱""这个多少钱"
-    - "刚才那个还有货吗""有其他规格吗"
-    - "讲讲第一款""详细介绍下这个"
+    - 已绑定商品的价格、库存、规格、成分、适配性追问
     - "这个适合我吗""含什么成分"
 
     不适用于：
     - 用户想找新商品 → 应调用 recommend_products
     - 用户想对比多个商品 → 应调用 compare_products
 
+    典型示例：
+    - “这款精华有什么规格，哪个规格更划算” → 调用本工具。
+    - “这双跑鞋现在有货吗，尺码怎么选” → 调用本工具。
+    - “这台相机的重量和续航怎么样” → 调用本工具。
+    - “给我推荐一台旅行相机” → 不调用本工具，改用 recommend_products。
+    - “这两台相机哪个更适合旅行” → 不调用本工具，改用 compare_products。
+
     Args:
         query: 用户当前原话。
-        product_id: 可选，明确指定商品 ID。不传时会从 query 的指代词
-                    ("第二个/刚才那个/它")或 last_focused_product 自动解析。
+    product_id: 可选，明确指定商品 ID。通常由主路由在运行时绑定；
+                Agent 不需要从原始对话中自行消解指代。
 
     Returns:
         dict 结构：
@@ -186,6 +204,11 @@ async def get_user_shopping_context(
     不适用于：
     - 普通商品推荐/对比/追问，先直接用 recommend_products/compare_products/
       answer_product_detail，不需要先调本工具。
+
+    典型示例：
+    - “按我的肤质推荐防晒” → 先调用本工具（include_favorites=false 等），再调用 recommend_products。
+    - “根据我收藏过的商品推荐” → 先调用本工具（include_favorites=true），再调用 recommend_products。
+    - “推荐一款 300 元以内的耳机” → 不调用本工具，直接 recommend_products。
 
     Args:
         include_favorites: 是否包含收藏摘要（MVP stub，尚未实现）。

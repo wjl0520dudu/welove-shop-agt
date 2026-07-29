@@ -230,7 +230,17 @@ def normalize_llm_decision(decision: Any) -> IntentDecision:
     if route not in VALID_ROUTES:
         route = "unknown"
     confidence = max(0.0, min(1.0, float(normalized.confidence or 0.0)))
-    return IntentDecision(task_type=route, confidence=confidence, reason=normalized.reason)
+    canonical_question = str(normalized.canonical_question or "").strip()
+    return IntentDecision(
+        task_type=route,
+        confidence=confidence,
+        reason=normalized.reason,
+        canonical_question=canonical_question,
+        resolved_product_ids=list(normalized.resolved_product_ids or []),
+        resolved_knowledge_entities=list(normalized.resolved_knowledge_entities or []),
+        needs_clarification=bool(normalized.needs_clarification),
+        clarification=str(normalized.clarification or "").strip(),
+    )
 
 
 def clarification_for_low_confidence(question: str) -> str:

@@ -32,6 +32,7 @@ class AssistantState(TypedDict):
     # ContextResolver consumes the structured cards/image metadata first.
     conversation_history: NotRequired[list[dict[str, Any]]]
     context_resolution: NotRequired[dict[str, Any]]
+    canonical_question: NotRequired[str]
 
     # ── 路由节点产出 ──
     route: NotRequired[str]
@@ -98,14 +99,9 @@ class ShoppingAgentState(AgentState):
 
 
 class KnowledgeAgentState(AgentState):
-    """KnowledgeAgent 内部 state：继承 AgentState（含 messages），额外携带
-    conversation_id / user_id 给 ToolRuntime 里的工具读取。
+    """KnowledgeAgent 内部 state：仅携带当前问题的会话隔离信息。
 
-    KnowledgeAgent 也挂了 resolve_reference（跨 shopping/knowledge 的指代消解），
-    resolve_reference 要从 runtime.state 拿 conversation_id 去读 Store 里的
-    last_knowledge_entities / last_product_cards。
-
-    KnowledgeAgent 不调 Java 后端，所以不需要 jwt_token。
+    跨轮实体消解由主路由完成；KnowledgeAgent 不读取历史业务记忆。
     """
     conversation_id: NotRequired[str]
     user_id: NotRequired[int | str]

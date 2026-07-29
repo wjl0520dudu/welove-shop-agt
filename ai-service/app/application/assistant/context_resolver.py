@@ -7,12 +7,7 @@ overwriting the product set referred to by "这两款".
 """
 from __future__ import annotations
 
-import re
 from typing import Any, Mapping
-
-
-_REFERENCE_RE = re.compile(r"这(?:两|2)款|那(?:两|2)款|它们|他们|这几个|那几个|第[一二三四五六七八九123456789]+个")
-_COMPARE_RE = re.compile(r"对比|比较|哪个好|哪款好|性价比")
 
 
 def _as_cards(message: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -37,54 +32,40 @@ def resolve_turn_context(
     conversation_history: list[Mapping[str, Any]] | None,
     business_memory: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Resolve product references from persisted message artifacts.
+    """Prepare a bounded context snapshot for the LLM router.
 
-    The message artifact is authoritative for a follow-up.  ``last_product_cards``
-    remains a compatibility cache, but may not replace an immediately preceding
-    multimodal recommendation.
+    This function intentionally does no linguistic work: no regular-expression
+    reference detection, product selection, intent inference, or clarification.
+    Its sole job is to expose the latest rendered product set as an authoritative
+    candidate set.  The structured Intent Router is responsible for deciding
+    whether words such as “第一款” or “它们” refer to it.
     """
     history = list(conversation_history or [])
     memory = dict(business_memory or {})
     artifact, cards = _latest_product_artifact(history)
-    text = (question or "").strip()
-    is_reference = bool(_REFERENCE_RE.search(text))
-    is_compare = bool(_COMPARE_RE.search(text))
-
     result: dict[str, Any] = {
-        "has_reference": is_reference,
+        "has_reference": False,
         "reference_source": "none",
         "reference_message_id": None,
         "resolved_product_ids": [],
         "needs_clarification": False,
         "clarification": "",
     }
-    if not cards or not (is_reference or is_compare):
+    if not cards:
         return {"business_memory": memory, "context_resolution": result}
 
-    # "这两款" is only deterministic when the referenced response itself has two
-    # cards.  Selecting the first two out of three would be a silent hallucination.
-    asks_for_two = bool(re.search(r"(?:这|那)(?:两|2)款", text))
-    if asks_for_two and len(cards) != 2:
-        result.update({
-            "reference_source": "message_artifact",
-            "reference_message_id": artifact.get("id") if artifact else None,
-            "needs_clarification": True,
-            "clarification": "我看到上一条推荐里不止两款商品。你想对比哪两款？可以直接说商品名或序号。",
-        })
-        return {"business_memory": memory, "context_resolution": result}
-
-    selected = cards[:2] if asks_for_two else cards
-    memory["last_product_cards"] = selected
-    if len(selected) == 1:
-        memory["last_focused_product"] = selected[0]
+    # Persisted card artifacts are more trustworthy than the mutable Store slot.
+    # Keep the complete sequence intact; selecting a subset is an LLM router
+    # decision and happens only after its IDs are validated against this set.
+    memory["last_product_cards"] = cards
     memory["active_product_set"] = {
         "source_message_id": artifact.get("id") if artifact else None,
         "source_type": "multimodal_retrieval" if artifact and artifact.get("image_url") else "recommendation",
-        "product_ids": [card.get("product_id") or card.get("id") for card in selected],
+        "product_ids": [card.get("product_id") or card.get("id") for card in cards],
     }
     result.update({
         "reference_source": "message_artifact",
         "reference_message_id": artifact.get("id") if artifact else None,
-        "resolved_product_ids": memory["active_product_set"]["product_ids"],
+        "candidate_product_ids": memory["active_product_set"]["product_ids"],
     })
     return {"business_memory": memory, "context_resolution": result}

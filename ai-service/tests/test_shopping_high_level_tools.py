@@ -62,7 +62,7 @@ class TestBuildShoppingContextFromRuntime:
             "user_preferences": {"skin_type": "油皮"},
         }
         with patch(
-            "shopping.context.get_business_memory",
+            "app.domain.shopping.context.get_business_memory",
             new=AsyncMock(return_value=mock_memory),
         ):
             ctx = asyncio.run(build_shopping_context_from_runtime(runtime))
@@ -78,7 +78,7 @@ class TestBuildShoppingContextFromRuntime:
         runtime = MagicMock()
         runtime.state = {"conversation_id": "c1"}
         with patch(
-            "shopping.context.get_business_memory",
+            "app.domain.shopping.context.get_business_memory",
             new=AsyncMock(return_value={}),
         ):
             ctx = asyncio.run(build_shopping_context_from_runtime(runtime))
@@ -89,7 +89,7 @@ class TestBuildShoppingContextFromRuntime:
         runtime = MagicMock()
         runtime.state = {"conversation_id": "c1", "user_id": 1}
         with patch(
-            "shopping.context.get_business_memory",
+            "app.domain.shopping.context.get_business_memory",
             new=AsyncMock(side_effect=RuntimeError("store down")),
         ):
             ctx = asyncio.run(build_shopping_context_from_runtime(runtime))

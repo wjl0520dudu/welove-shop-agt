@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+import json
 import logging
-from uuid import uuid4
 from typing import Any, Callable, Dict, List, Optional
-from langchain.agents import create_agent
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.config import get_stream_writer
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from app.application.assistant.state import AssistantState
 from app.infrastructure.persistence.memory import get_business_memory, remember_product_cards
@@ -17,7 +16,6 @@ from app.domain.knowledge.agent import KnowledgeAgent
 logger = logging.getLogger("ai-service.nodes")
 
 # 闲聊 agent 专用独立 checkpointer，与主图 checkpointer 完全隔离
-_chitchat_checkpointer = InMemorySaver()
 
 
 # ---- 多模态 shopping 推荐话术 prompt --------------------------------
@@ -75,6 +73,7 @@ async def _multimodal_shopping(
     image_url: str,
     top_k: int = 5,
     business_memory: Optional[Dict[str, Any]] = None,
+    token_sink: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """有图 shopping 分支：直接调 search_multimodal_v1，然后让 LLM 写推荐话术。
 
@@ -157,8 +156,18 @@ async def _multimodal_shopping(
             ),
         )
         try:
-            resp = await llm.ainvoke(prompt)
-            answer = str(getattr(resp, "content", "") or "").strip()
+            if token_sink is None:
+                resp = await llm.ainvoke(prompt)
+                answer = str(getattr(resp, "content", "") or "").strip()
+            else:
+                chunks: list[str] = []
+                async for chunk in llm.astream(prompt):
+                    content = _stream_text_content(getattr(chunk, "content", ""))
+                    if not content:
+                        continue
+                    chunks.append(content)
+                    _emit_stream_token(token_sink, content)
+                answer = "".join(chunks).strip()
         except Exception as e:  # noqa: BLE001
             logger.warning("multimodal shopping 生成推荐话术失败：%s", e)
             answer = ""
@@ -207,11 +216,41 @@ async def _multimodal_shopping(
     }
 
 
+def _stream_text_content(content: Any) -> str:
+    """Extract user-visible text from a LangChain stream chunk."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part["text"])
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+        )
+    return ""
+
+
+def _emit_stream_token(token_sink: Callable[[str], None], content: str) -> None:
+    try:
+        token_sink(content)
+    except Exception:  # noqa: BLE001
+        logger.debug("stream token sink unavailable", exc_info=True)
+
+
+def _graph_token_sink(content: str) -> None:
+    """Publish a real model chunk from a graph node to the SSE adapter."""
+    if not content:
+        return
+    try:
+        get_stream_writer()({"type": "token", "data": {"content": content}})
+    except Exception:  # noqa: BLE001
+        # Graph.run() uses ainvoke rather than a custom stream writer.
+        logger.debug("graph token writer unavailable", exc_info=True)
+
+
 def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                knowledge_agent: Optional[KnowledgeAgent] = None) -> Dict[str, Callable]:
     _shopping_holder: Dict[str, Any] = {"agent": shopping_agent}
     _knowledge_holder: Dict[str, Any] = {"agent": knowledge_agent}
-    _chitchat_holder: Dict[str, Any] = {"agent": None}
 
     def get_shopping():
         if _shopping_holder["agent"] is None:
@@ -222,20 +261,6 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         if _knowledge_holder["agent"] is None:
             _knowledge_holder["agent"] = KnowledgeAgent(llm)
         return _knowledge_holder["agent"]
-
-    def _get_chitchat_agent():
-        if _chitchat_holder["agent"] is None:
-            from app.infrastructure.llm.middleware import build_summarization_middleware
-            # 不挂 response_format：让 answer 走纯文本 content，才能被
-            # graph.astream 的 messages 流逐 token 吐给前端（豆包式打字机）。
-            # ToolStrategy 会把答案塞进 tool_call.args，content 为空，流式被废。
-            _chitchat_holder["agent"] = create_agent(
-                model=llm,
-                checkpointer=_chitchat_checkpointer,
-                system_prompt=CHITCHAT_PROMPT,
-                middleware=[build_summarization_middleware()],
-            )
-        return _chitchat_holder["agent"]
 
     async def shopping_node(state: AssistantState) -> dict:
         # 多模态分支：state 里有 image_url 时走图文多模态检索，
@@ -259,6 +284,7 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 image_url=image_url,
                 top_k=5,
                 business_memory=business_memory,
+                token_sink=_graph_token_sink,
             )
             # Make image retrieval behave exactly like text recommendation on
             # the next turn.  Without this, "这两款对比" falls back to stale
@@ -280,11 +306,15 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         try:
             result = await get_shopping().run(
                 question=state.get("question", ""),
-                messages=_history_messages(state),
+                # The Router already resolved cross-turn context and rewrote the
+                # question.  Do not hand raw history to the domain tool loop and
+                # accidentally create a second, competing reference resolver.
+                messages=[{"role": "user", "content": state.get("question", "")}],
                 business_memory=state.get("business_memory", {}),
                 conversation_id=state.get("conversation_id"),
                 user_id=state.get("user_id"),
                 jwt_token=state.get("jwt_token"),
+                token_sink=_graph_token_sink,
             )
         except Exception as e:
             logger.exception("shopping node failed")
@@ -301,7 +331,10 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
 
     async def knowledge_node(state: AssistantState) -> dict:
         try:
-            messages = _build_agent_messages(state)
+            # KnowledgeAgent receives the canonical current question only.  Its
+            # prior entity binding is already represented in that question by
+            # the Router, so no full history or secondary context resolver is needed.
+            messages = [HumanMessage(content=state.get("question", ""))]
             result = await get_knowledge().run(
                 messages=messages,
                 conversation_id=state.get("conversation_id", ""),
@@ -342,16 +375,19 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 "error_code": ErrorCode.LLM_NOT_CONFIGURED,
             }
         try:
-            messages = _build_agent_messages(state)
-            agent = _get_chitchat_agent()
+            messages = [
+                SystemMessage(content=CHITCHAT_PROMPT.format(**_build_chitchat_prompt_context(state))),
+                *_build_agent_messages(state),
+            ]
+            chunks: list[str] = []
             # recursion_limit=5：chitchat 正常 1-2 步就出结果，5 步防死循环
-            result = await agent.ainvoke(
-                {"messages": messages},
-                config={
-                    "configurable": {"thread_id": str(uuid4())},
-                    "recursion_limit": 5,
-                },
-            )
+            async for chunk in llm.astream(messages):
+                content = _stream_text_content(getattr(chunk, "content", ""))
+                if not content:
+                    continue
+                chunks.append(content)
+                _graph_token_sink(content)
+            result = {"messages": [AIMessage(content="".join(chunks))]}
             # answer 直接从最后一条 AI 消息 content 提取（纯文本，可流式）。
             # 去 ToolStrategy 后不再有 structured_response，这里就是主路径。
             answer = ""
@@ -436,10 +472,11 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
 
 
 def _build_agent_messages(state: AssistantState) -> list:
-    """从共享 state 构建传给子 agent 的消息列表。
+    """Build the recent message list for Chitchat only.
 
-    子 agent（knowledge/shopping/chitchat）通过 create_agent 运行，需要 {"messages": [...]} 格式。
-    这里从 state["messages"] 中提取，带上完整对话历史，实现多 agent 共享记忆。
+    Shopping and Knowledge receive their Router-normalized question through
+    dedicated paths; Chitchat keeps dialogue messages for natural conversation
+    and explicit conversation-recall requests.
     """
     messages = state.get("messages") or []
     out = []
@@ -457,6 +494,47 @@ def _build_agent_messages(state: AssistantState) -> list:
             elif mtype == "system":
                 out.append(SystemMessage(content=content))
     return out
+
+
+def _build_chitchat_prompt_context(state: AssistantState) -> dict[str, str]:
+    """Return values for the explicit Chitchat prompt template.
+
+    Prompt instructions and section layout intentionally remain in
+    ``app.prompts.prompts.CHITCHAT_PROMPT``.  This helper only serializes the
+    bounded turn data that is safe for the Chitchat Agent to read.
+    """
+    preferences = dict((state.get("business_memory") or {}).get("user_preferences") or {})
+    profile = {
+        "gender": state.get("gender") or preferences.get("gender") or "",
+        "skin_type": state.get("skin_type") or preferences.get("skin_type") or "",
+        "preference_tags": state.get("preference_tags") or preferences.get("preference_tags") or [],
+    }
+    profile = {key: value for key, value in profile.items() if value not in (None, "", [])}
+
+    history_lines: list[str] = []
+    for message in (state.get("messages") or [])[-10:]:
+        if isinstance(message, dict):
+            role = str(message.get("role") or "")
+            content = str(message.get("content") or "").strip()
+        else:
+            role = str(getattr(message, "type", "") or "")
+            content = str(getattr(message, "content", "") or "").strip()
+        if role in {"human", "user"}:
+            label = "用户"
+        elif role in {"ai", "assistant"}:
+            label = "助手"
+        else:
+            continue
+        if content:
+            history_lines.append(f"{label}：{content[:300]}")
+
+    current_question = str(state.get("question") or "").strip()
+    history_text = "\n".join(history_lines) if history_lines else "暂无"
+    return {
+        "user_profile": json.dumps(profile, ensure_ascii=False) if profile else "暂无",
+        "recent_conversation": history_text,
+        "current_question": current_question or "暂无",
+    }
 
 
 def _merge_result(result: Dict[str, Any], *, task_type: str,

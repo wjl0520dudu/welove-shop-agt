@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -37,6 +38,8 @@ _SHOPPING_MIDDLEWARE = [
 
 logger = logging.getLogger("ai-service.shopping.agent")
 
+TokenSink = Callable[[str], None]
+
 # ShoppingAgent 独立 checkpointer，跟主图/router/knowledge 隔离。
 _shopping_checkpointer = InMemorySaver()
 
@@ -60,49 +63,14 @@ class ShoppingAgent:
         self._llm = llm
 
     def _build_system_prompt(self, business_memory: Dict[str, Any]) -> str:
-        """把业务记忆注入 system prompt。
+        """Return a domain-only prompt.
 
-        新 prompt 里已经不再让 LLM 自己解析指代词（那是 Capability 内部函数的活），
-        但仍需要让 LLM 知道"上一轮有什么商品"，才能判断该走 compare/detail 还是
-        重新 recommend。
+        The Router has already expanded cross-turn references into the current
+        question and has bound any product set in ``business_memory`` for tools.
+        Do not expose raw history or product candidates to the Shopping LLM a
+        second time: that would recreate a competing context resolver.
         """
-        memory_lines: List[str] = []
-        last_cards = business_memory.get("last_product_cards") or []
-        if last_cards:
-            # 只保留每张卡的 id/title/price 供 LLM 判断有无历史候选
-            slim = [
-                {
-                    "product_id": c.get("product_id"),
-                    "title": c.get("title"),
-                    "price": c.get("price"),
-                }
-                for c in last_cards[:5]
-            ]
-            memory_lines.append("上一轮推荐商品（供选择工具时参考，不要复制到回答里）：\n"
-                                + json.dumps(slim, ensure_ascii=False, indent=2))
-        focused = business_memory.get("last_focused_product")
-        if focused:
-            memory_lines.append(
-                "当前关注商品："
-                + json.dumps({
-                    "product_id": focused.get("product_id"),
-                    "title": focused.get("title"),
-                }, ensure_ascii=False)
-            )
-        prefs = business_memory.get("user_preferences") or {}
-        if prefs:
-            memory_lines.append("用户偏好：" + json.dumps(prefs, ensure_ascii=False))
-        pending = business_memory.get("pending_shopping_need")
-        if pending:
-            memory_lines.append(
-                "有待补全的购物需求（如用户在回答上轮追问，请调 recommend_products，工具会自动合并）："
-                + json.dumps({
-                    "missing_slots": pending.get("missing_slots"),
-                    "last_clarify_question": pending.get("last_clarify_question"),
-                }, ensure_ascii=False)
-            )
-        memory_block = "\n\n".join(memory_lines) if memory_lines else "（暂无历史推荐）"
-        return f"{SHOPPING_AGENT_PROMPT}\n\n## 业务记忆\n{memory_block}"
+        return SHOPPING_AGENT_PROMPT
 
     def _build_messages(
         self, question: str, messages: List[Dict[str, Any]]
@@ -137,6 +105,7 @@ class ShoppingAgent:
         conversation_id: Optional[str] = None,
         user_id: Optional[int] = None,
         jwt_token: Optional[str] = None,
+        token_sink: Optional[TokenSink] = None,
     ) -> dict:
         """执行导购推荐。
 
@@ -168,6 +137,7 @@ class ShoppingAgent:
                 user_id=user_id,
                 jwt_token=jwt_token,
                 business_memory=effective_memory,
+                token_sink=token_sink,
             )
 
         system_prompt = self._build_system_prompt(effective_memory)
@@ -270,6 +240,7 @@ class ShoppingAgent:
         user_id: Optional[int],
         jwt_token: Optional[str],
         business_memory: Dict[str, Any],
+        token_sink: Optional[TokenSink] = None,
     ) -> dict:
         """Execute one capability without an LLM tool-selection loop."""
         if decision.capability == "transaction_unsupported":
@@ -305,6 +276,7 @@ class ShoppingAgent:
         return {
             "answer": await _compose_capability_answer(
                 self._llm, decision.capability, question, payload,
+                token_sink=token_sink,
             ),
             "task_type": "shopping",
             "product_cards": payload.get("product_cards") or [],
@@ -336,6 +308,8 @@ async def _compose_capability_answer(
     capability: str,
     question: str,
     payload: Dict[str, Any],
+    *,
+    token_sink: Optional[TokenSink] = None,
 ) -> str:
     """A grounded deterministic fallback; the capability owns all business facts."""
     if payload.get("clarify_question"):
@@ -381,16 +355,61 @@ async def _compose_capability_answer(
         f"用户问题：{question}\n能力：{capability}\n事实："
         + json.dumps(evidence, ensure_ascii=False, default=str)
     )
+    messages = [
+        SystemMessage(content="你只能根据提供的事实生成自然、简洁的中文回答。"),
+        HumanMessage(content=prompt),
+    ]
+    if token_sink is None:
+        try:
+            response = await llm.ainvoke(messages)
+            answer = str(getattr(response, "content", "") or "").strip()
+            return answer or fallback
+        except Exception:  # noqa: BLE001
+            logger.warning("dispatched capability answer rendering failed", exc_info=True)
+            return fallback
+
+    # This is the public SSE path: stream genuine provider chunks.  Do not wait
+    # for ainvoke() and simulate a typewriter from the final string.
+    chunks: list[str] = []
     try:
-        response = await llm.ainvoke([
-            SystemMessage(content="你只能根据提供的事实生成自然、简洁的中文回答。"),
-            HumanMessage(content=prompt),
-        ])
-        answer = str(getattr(response, "content", "") or "").strip()
+        async for chunk in llm.astream(messages):
+            content = _stream_text_content(getattr(chunk, "content", ""))
+            if not content:
+                continue
+            chunks.append(content)
+            _emit_token(token_sink, content)
+        answer = "".join(chunks).strip()
         return answer or fallback
     except Exception:  # noqa: BLE001
-        logger.warning("dispatched capability answer rendering failed", exc_info=True)
-        return fallback
+        logger.warning("dispatched capability answer streaming failed", exc_info=True)
+        if not chunks:
+            return fallback
+        # Persist exactly what the user has already seen if a provider stream
+        # breaks after emitting partial text.
+        suffix = "\n\n抱歉，回复生成中断了；你可以再试一次。"
+        _emit_token(token_sink, suffix)
+        return "".join(chunks).strip() + suffix
+
+
+def _stream_text_content(content: Any) -> str:
+    """Extract user-visible text from a provider stream chunk."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part["text"])
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+        )
+    return ""
+
+
+def _emit_token(token_sink: TokenSink, content: str) -> None:
+    try:
+        token_sink(content)
+    except Exception:  # noqa: BLE001
+        # Client disconnection must not invalidate the completed business result.
+        logger.debug("shopping token sink unavailable", exc_info=True)
 
 
 def _extract_tool_calls(messages: list) -> List[Dict[str, Any]]:
