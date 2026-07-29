@@ -204,9 +204,10 @@ class CompareCapability:
         # ── 1. resolve products ──
         products: List[Dict[str, Any]] = []
 
-        if product_ids:
-            products = await _load_products_by_ids(product_ids)
-            trace.append({"step": "resolve", "output": {"source": "product_ids", "count": len(products)}})
+        requested_ids = product_ids or context.selected_product_ids
+        if requested_ids:
+            products = await _load_products_by_ids(requested_ids)
+            trace.append({"step": "resolve", "output": {"source": "selected_product_ids", "count": len(products)}})
         else:
             # 尝试从 query 里解析指代
             resolved = _resolve_products_from_query(query, context)

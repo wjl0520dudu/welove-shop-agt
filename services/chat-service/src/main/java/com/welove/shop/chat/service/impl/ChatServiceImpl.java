@@ -248,7 +248,7 @@ public class ChatServiceImpl implements ChatService {
                             // ai-service 的 final data 即完整 AIResponse，字段在顶层(非嵌套 response)
                             Object finalAnswer = event.get("answer");
                             String finalTaskType = String.valueOf(event.getOrDefault("task_type", ""));
-                            if ("orchestrator".equals(finalTaskType)
+                            if (isComplexTask(finalTaskType)
                                     && finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
                                 // 编排模式的 token 主要是子任务流；最终聚合答案必须作为持久化权威结果。
                                 answerBuilder.setLength(0);
@@ -478,7 +478,7 @@ public class ChatServiceImpl implements ChatService {
                             captureFinalAgentMeta(event, agentMeta[0]);
                             Object finalAnswer = event.get("answer");
                             String finalTaskType = String.valueOf(event.getOrDefault("task_type", ""));
-                            if ("orchestrator".equals(finalTaskType)
+                            if (isComplexTask(finalTaskType)
                                     && finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
                                 // 图文场景也可能进入编排链路，最终聚合答案不能被子任务 token 覆盖。
                                 answerBuilder.setLength(0);
@@ -773,12 +773,20 @@ public class ChatServiceImpl implements ChatService {
     }
 
     private static void captureFinalAgentMeta(Map<String, Object> event, Map<String, Object> agentMeta) {
-        if (!"orchestrator".equals(String.valueOf(event.getOrDefault("task_type", "")))) return;
+        if (!isComplexTask(String.valueOf(event.getOrDefault("task_type", "")))) return;
         agentMeta.put("orchestratorMode", event.getOrDefault("orchestrator_mode", "complex"));
         agentMeta.put("orchestratorReason", event.get("orchestrator_reason"));
         agentMeta.put("subQuestions", event.getOrDefault("sub_questions", List.of()));
         agentMeta.put("subResults", event.getOrDefault("sub_results", List.of()));
         agentMeta.put("taskLevels", event.getOrDefault("task_levels", List.of()));
+    }
+
+    /**
+     * ``orchestrator`` is the legacy internal node label.  New AI Service
+     * responses expose the Router semantic result as ``complex`` instead.
+     */
+    private static boolean isComplexTask(String taskType) {
+        return "complex".equals(taskType) || "orchestrator".equals(taskType);
     }
 
     private void saveQaLog(Long userId, Long convId, String question, String answer, String taskType, long duration) {

@@ -1,13 +1,8 @@
 import asyncio
 
-from app.application.assistant.schemas import IntentDecision
 from app.application.assistant import AssistantGraph
-from app.application.assistant.router import (
-    can_short_circuit_orchestrator,
-    classify_high_confidence_rule,
-    normalize_llm_decision,
-)
-from evals.router_metrics import calculate_router_metrics
+from app.application.assistant.schemas import IntentDecision
+from app.application.assistant.router import normalize_llm_decision
 
 
 class FakeStructuredRouter:
@@ -15,9 +10,11 @@ class FakeStructuredRouter:
         self.decision = decision
         self.error = error
         self.calls = 0
+        self.messages = []
 
-    async def ainvoke(self, *args, **kwargs):
+    async def ainvoke(self, messages, **kwargs):
         self.calls += 1
+        self.messages = messages
         if self.error:
             raise self.error
         return self.decision
@@ -29,156 +26,124 @@ def _graph_with_router(router):
     return graph
 
 
-def test_high_certainty_rules_cover_core_domains():
-    assert classify_high_confidence_rule("推荐一款防晒").route == "shopping"
-    assert classify_high_confidence_rule("这个商品有货吗").route == "shopping"
-    assert classify_high_confidence_rule("烟酰胺有什么功效").route == "knowledge"
-    assert classify_high_confidence_rule("你好").route == "chitchat"
-    assert classify_high_confidence_rule("找同款", has_image=True).route == "shopping"
-
-
-def test_mixed_signal_is_deferred_to_llm():
-    decision = classify_high_confidence_rule("我想买防晒，但不知道应该怎么选")
-    assert decision.matched is False
-    assert decision.route == "unknown"
-
-
-def test_llm_is_primary_even_when_a_rule_would_match(monkeypatch):
-    monkeypatch.setattr("app.application.assistant.graph.config.ROUTER_LOW_CONFIDENCE_THRESHOLD", 0.65)
+def test_router_uses_llm_for_simple_shopping_and_rewrites_question():
     async def run():
         router = FakeStructuredRouter(IntentDecision(
-            task_type="shopping", confidence=0.98, reason="明确商品推荐",
-            canonical_question="推荐一款防晒",
-        ))
-        graph = _graph_with_router(router)
-        result = await graph._route({"question": "推荐一款防晒", "messages": []})
-        assert result["route"] == "shopping"
-        assert result["route_source"] == "llm"
-        assert result["rule_route"] == "shopping"
-        assert result["llm_route"] == "shopping"
-        assert result["question"] == "推荐一款防晒"
-        assert router.calls == 1
-
-    asyncio.run(run())
-
-
-def test_unresolved_rule_uses_confident_llm_route(monkeypatch):
-    monkeypatch.setattr("app.application.assistant.graph.config.ROUTER_LOW_CONFIDENCE_THRESHOLD", 0.65)
-    async def run():
-        router = FakeStructuredRouter(IntentDecision(
-            task_type="knowledge", confidence=0.86, reason="用户在询问选择方法",
+            mode="simple",
+            task_type="shopping",
+            confidence=0.98,
+            reason="明确商品推荐",
+            canonical_question="推荐一款适合通勤、预算 500 元以内的耳机",
         ))
         graph = _graph_with_router(router)
         result = await graph._route({
-            "question": "我想买防晒，但不知道应该怎么选",
+            "question": "推荐通勤耳机，500 内",
             "messages": [],
+            "business_memory": {},
         })
-        assert result["route"] == "knowledge"
+        assert result["route"] == "shopping"
+        assert result["orchestrator_mode"] == "simple"
         assert result["route_source"] == "llm"
-        assert result["llm_route"] == "knowledge"
-        assert result["llm_confidence"] == 0.86
-        assert result["route_fallback_used"] is False
+        assert result["question"] == "推荐一款适合通勤、预算 500 元以内的耳机"
         assert router.calls == 1
 
     asyncio.run(run())
 
 
-def test_low_confidence_llm_asks_for_clarification(monkeypatch):
-    monkeypatch.setattr("app.application.assistant.graph.config.ROUTER_LOW_CONFIDENCE_THRESHOLD", 0.65)
+def test_router_marks_compound_request_complex_without_generating_dag():
     async def run():
         router = FakeStructuredRouter(IntentDecision(
-            task_type="shopping", confidence=0.42, reason="表达含糊",
+            mode="complex",
+            task_type="unknown",
+            confidence=0.93,
+            reason="商品推荐和知识解释是独立目标",
+            canonical_question="推荐适合通勤的耳机，并解释开放式耳机与入耳式耳机的区别",
         ))
         graph = _graph_with_router(router)
-        result = await graph._route({"question": "帮我看看这个", "messages": []})
+        result = await graph._route({
+            "question": "推荐耳机，同时解释开放式和入耳式区别",
+            "messages": [],
+            "business_memory": {},
+        })
+        assert result["orchestrator_mode"] == "complex"
+        assert result["route"] == "unknown"
+        assert graph._after_route(result) == "complex"
+        assert result["question"].startswith("推荐适合通勤")
+
+    asyncio.run(run())
+
+
+def test_router_keeps_full_card_set_without_entity_validation_or_slicing():
+    async def run():
+        cards = [
+            {"product_id": index, "title": f"商品 {index}", "price": index * 10}
+            for index in range(1, 8)
+        ]
+        router = FakeStructuredRouter(IntentDecision(
+            mode="simple",
+            task_type="shopping",
+            confidence=0.9,
+            reason="商品追问",
+            canonical_question="介绍商品 1 和商品 7 的差异",
+            resolved_product_ids=[1, 7],
+        ))
+        graph = _graph_with_router(router)
+        result = await graph._route({
+            "question": "第一款和第七款呢？",
+            "messages": [],
+            "business_memory": {"last_product_cards": cards},
+        })
+        assert result["route"] == "shopping"
+        assert result["business_memory"]["last_product_cards"] == cards
+        assert result["business_memory"]["selected_product_ids"] == [1, 7]
+        prompt_text = "\n".join(str(getattr(message, "content", "")) for message in router.messages)
+        assert "商品 7" in prompt_text
+
+    asyncio.run(run())
+
+
+def test_router_uses_llm_for_image_input_instead_of_rule_shortcut():
+    async def run():
+        router = FakeStructuredRouter(IntentDecision(
+            mode="simple",
+            task_type="shopping",
+            confidence=0.97,
+            reason="图片相似商品检索",
+            canonical_question="根据图片检索相似商品",
+        ))
+        graph = _graph_with_router(router)
+        result = await graph._route({
+            "question": "",
+            "image_url": "/weloveshop/products/p.jpg",
+            "messages": [],
+            "business_memory": {},
+        })
+        assert result["route"] == "shopping"
+        assert router.calls == 1
+        assert any("上传了参考图片" in str(getattr(message, "content", "")) for message in router.messages)
+
+    asyncio.run(run())
+
+
+def test_router_unknown_and_transport_failures_use_unknown_fallback():
+    async def run():
+        unknown = _graph_with_router(FakeStructuredRouter(IntentDecision(
+            mode="simple", task_type="unknown", confidence=0.2, reason="需求不明确",
+        )))
+        result = await unknown._route({"question": "随便看看", "messages": [], "business_memory": {}})
+        assert result["route"] == "unknown"
+        assert result["route_fallback_used"] is True
+
+        failed = _graph_with_router(FakeStructuredRouter(error=RuntimeError("network")))
+        result = await failed._route({"question": "推荐耳机", "messages": [], "business_memory": {}})
         assert result["route"] == "unknown"
         assert result["route_source"] == "fallback"
-        assert result["llm_route"] == "shopping"
-        assert result["route_fallback_used"] is True
-        assert "请补充" in result["route_clarification"]
 
     asyncio.run(run())
-
-
-def test_router_binds_only_offered_product_ids():
-    async def run():
-        router = FakeStructuredRouter(IntentDecision(
-            task_type="shopping", confidence=0.91, reason="商品追问",
-            canonical_question="介绍商品 A 和商品 C 的差异",
-            resolved_product_ids=[11, 13],
-        ))
-        graph = _graph_with_router(router)
-        result = await graph._route({
-            "question": "第一款和第三款呢？",
-            "messages": [],
-            "business_memory": {"last_product_cards": [
-                {"product_id": 11, "title": "商品 A"},
-                {"product_id": 12, "title": "商品 B"},
-                {"product_id": 13, "title": "商品 C"},
-            ]},
-        })
-        assert result["route"] == "shopping"
-        assert result["question"] == "介绍商品 A 和商品 C 的差异"
-        assert [card["product_id"] for card in result["business_memory"]["last_product_cards"]] == [11, 13]
-
-    asyncio.run(run())
-
-
-def test_router_rejects_hallucinated_product_id():
-    async def run():
-        router = FakeStructuredRouter(IntentDecision(
-            task_type="shopping", confidence=0.91, reason="商品追问",
-            canonical_question="介绍不存在的商品",
-            resolved_product_ids=[999],
-        ))
-        graph = _graph_with_router(router)
-        result = await graph._route({
-            "question": "第一款呢？",
-            "messages": [],
-            "business_memory": {"last_product_cards": [{"product_id": 11, "title": "商品 A"}]},
-        })
-        assert result["route"] == "unknown"
-        assert result["route_fallback_used"] is True
-
-    asyncio.run(run())
-
-
-def test_rule_can_override_conflicting_orchestrator_hint():
-    async def run():
-        graph = _graph_with_router(FakeStructuredRouter())
-        result = await graph._route({
-            "question": "烟酰胺有什么功效",
-            "messages": [],
-            "active_subtask": {"intent_hint": "shopping", "use_image": False},
-        })
-        assert result["route"] == "knowledge"
-        assert result["route_source"] == "rule_override"
-
-    asyncio.run(run())
-
-
-def test_obvious_single_intent_can_skip_orchestrator():
-    assert can_short_circuit_orchestrator("你好") is True
-    assert can_short_circuit_orchestrator("推荐面霜，然后解释烟酰胺功效") is False
-    assert can_short_circuit_orchestrator("介绍图片里的成分", has_image=True) is False
-    assert can_short_circuit_orchestrator("推荐 iPhone 和 MacBook 各一款") is False
-    assert can_short_circuit_orchestrator("推荐一款面霜、一款防晒") is False
 
 
 def test_historical_cart_route_is_normalized_to_shopping():
     decision = normalize_llm_decision({
-        "task_type": "cart", "confidence": 0.9, "reason": "历史模型输出",
+        "mode": "simple", "task_type": "cart", "confidence": 0.9, "reason": "历史模型输出",
     })
     assert decision.task_type == "shopping"
-
-
-def test_router_metrics_separate_safe_fallback_from_misroute():
-    metrics = calculate_router_metrics([
-        {"expected_route": "shopping", "predicted_route": "shopping", "route_source": "rule"},
-        {"expected_route": "knowledge", "predicted_route": "shopping", "route_source": "llm"},
-        {"expected_route": "knowledge", "predicted_route": "unknown", "route_source": "fallback", "fallback_used": True},
-    ])
-    assert metrics["route_accuracy"] == 0.3333
-    assert metrics["misroute_rate"] == 0.3333
-    assert metrics["low_confidence_rate"] == 0.3333
-    assert metrics["rule_direct_rate"] == 0.3333

@@ -257,6 +257,7 @@ class ShoppingAgent:
             conversation_id=conversation_id, user_id=user_id, jwt_token=jwt_token,
             is_logged_in=bool(user_id), business_memory=business_memory,
             last_product_cards=list(business_memory.get("last_product_cards") or []),
+            selected_product_ids=list(business_memory.get("selected_product_ids") or []),
             last_focused_product=business_memory.get("last_focused_product"),
             user_preferences=dict(business_memory.get("user_preferences") or {}),
         )

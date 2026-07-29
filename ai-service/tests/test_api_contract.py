@@ -102,11 +102,12 @@ class TestNormalizeAIResponse:
         assert resp.run_id == "r0"
         assert resp.error is False
 
-    def test_orchestrator_metadata_preserved(self):
+    def test_complex_task_metadata_preserved(self):
         resp = normalize_ai_response(
             {
                 "answer": "分三部分回答",
-                "task_type": "orchestrator",
+                "task_type": "complex",
+                "route": "complex",
                 "orchestrator_mode": "complex",
                 "orchestrator_reason": "多任务",
                 "sub_questions": [{"id": "t1", "question": "推荐防晒"}],
@@ -115,7 +116,8 @@ class TestNormalizeAIResponse:
             run_id="r-orch",
             trace_id="t-orch",
         )
-        assert resp.task_type == "orchestrator"
+        assert resp.task_type == "complex"
+        assert resp.route == "complex"
         assert resp.orchestrator_mode == "complex"
         assert resp.sub_questions[0]["id"] == "t1"
         assert resp.sub_results[0]["answer"] == "找到商品"

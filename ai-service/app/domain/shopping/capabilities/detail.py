@@ -70,6 +70,9 @@ def _resolve_product_id(
     if product_id:
         return int(product_id)
 
+    if len(ctx.selected_product_ids) == 1:
+        return int(ctx.selected_product_ids[0])
+
     if ctx.last_product_cards:
         # 序号
         r = _resolve_ordinal(query, ctx.last_product_cards)

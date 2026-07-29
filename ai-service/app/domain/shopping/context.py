@@ -51,6 +51,7 @@ async def build_shopping_context_from_runtime(runtime: ToolRuntime) -> ShoppingC
         is_logged_in=bool(user_id),
         business_memory=memory,
         last_product_cards=list(memory.get("last_product_cards") or []),
+        selected_product_ids=list(memory.get("selected_product_ids") or []),
         last_focused_product=memory.get("last_focused_product"),
         user_preferences=dict(memory.get("user_preferences") or {}),
     )

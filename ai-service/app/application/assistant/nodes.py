@@ -420,9 +420,7 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         }
 
     async def unknown_node(state: AssistantState) -> dict:
-        msg = state.get("route_clarification") or (
-            "我可以帮你找商品、推荐，或回答商品知识问题，请告诉我你的需求。"
-        )
+        msg = "我还不确定你的需求，请清楚描述想找的商品或想了解的问题。"
         return {
             "answer": msg,
             "task_type": "unknown",

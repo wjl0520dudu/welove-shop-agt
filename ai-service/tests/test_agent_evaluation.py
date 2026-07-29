@@ -10,7 +10,7 @@ def _case(**expected):
 
 def test_contract_accepts_complete_multi_agent_result():
     case = _case(
-        routes=["orchestrator"], task_types=["orchestrator"],
+        routes=["complex"], task_types=["complex"],
         subtask_routes=["shopping", "knowledge"], required_tools=["search_*"],
         require_product_cards=True, product_categories=["防晒"], require_sse=True,
         max_latency_ms=1000,
@@ -19,7 +19,7 @@ def test_contract_accepts_complete_multi_agent_result():
         "latency_ms": 800,
         "sse_events": ["start", "final", "done"],
         "response": {
-            "route": "orchestrator", "task_type": "orchestrator", "answer": "已完成推荐和说明。",
+            "route": "complex", "task_type": "complex", "answer": "已完成推荐和说明。",
             "product_cards": [{"product_id": 1, "title": "清爽防晒", "sub_category": "防晒"}],
             "sub_results": [
                 {"route": "shopping", "status": "success", "answer": "已推荐商品", "tool_calls": [{"tool_name": "search_products", "input_params": {}}]},

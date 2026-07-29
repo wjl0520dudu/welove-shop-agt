@@ -39,6 +39,7 @@ class ShoppingContext(BaseModel):
 
     # 常用快捷字段，避免每个 Capability 都 memory.get(...)
     last_product_cards: List[Dict[str, Any]] = Field(default_factory=list)
+    selected_product_ids: List[int] = Field(default_factory=list)
     last_focused_product: Optional[Dict[str, Any]] = None
     user_preferences: Dict[str, Any] = Field(default_factory=dict)
 

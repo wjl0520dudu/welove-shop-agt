@@ -4,19 +4,32 @@ from pydantic import BaseModel, Field
 
 # 主图只产 shopping|knowledge|chitchat|unknown；cart 仅为兼容旧购物车库保留。
 TaskType = Literal["shopping", "knowledge", "chitchat", "unknown", "cart"]
+RouteMode = Literal["simple", "complex"]
 OrchestratorIntentHint = Literal["shopping", "knowledge", "chitchat", "unknown"]
 
 
 class IntentDecision(BaseModel):
-    """The single semantic decision made before a domain Agent is invoked.
+    """The single semantic decision made before planning or domain execution.
 
-    The router owns cross-turn understanding.  Domain Agents deliberately only
-    receive ``canonical_question`` plus code-validated bound entities, so they
-    do not have to (and must not) resolve references from raw chat history.
+    The Router owns cross-turn understanding.  It resolves the current turn,
+    determines whether it is a simple or complex request, and selects a domain
+    only for simple requests.  Domain Agents receive the canonical question
+    rather than re-reading raw chat history for reference resolution.
     """
+    mode: RouteMode = Field(
+        "simple",
+        description=(
+            "simple=直接交给一个领域 Agent；complex=需要 Planner 拆分 DAG。"
+            "complex 时 task_type 必须为 unknown。"
+        ),
+    )
     task_type: TaskType = Field(
         ...,
-        description="意图分类: shopping=搜索/推荐/比较具体商品, knowledge=了解知识/用法/成分/适合什么(即使提到商品名), chitchat=闲聊/问候/元问题(关于对话本身), unknown=无法判断",
+        description=(
+            "simple 时的领域：shopping=搜索/推荐/比较具体商品，"
+            "knowledge=商品知识/用法/成分/原理，chitchat=普通聊天或对话回顾；"
+            "complex 或无法判断时为 unknown。"
+        ),
     )
     confidence: float = Field(0.0, ge=0.0, le=1.0, description="分类置信度")
     reason: str = Field("", description="分类理由")
@@ -29,17 +42,12 @@ class IntentDecision(BaseModel):
     )
     resolved_product_ids: List[int] = Field(
         default_factory=list,
-        description="仅可选择会话上下文提供的商品 ID；无商品指代时为空。",
+        description="Router 从会话上下文理解出的商品引用；无商品指代时为空。",
     )
     resolved_knowledge_entities: List[str] = Field(
         default_factory=list,
-        description="从会话上下文绑定的知识实体；无知识指代时为空。",
+        description="Router 从会话上下文理解出的知识实体；无知识指代时为空。",
     )
-    needs_clarification: bool = Field(
-        False,
-        description="上下文不足或指代不唯一，无法安全改写为完整问题时为 true。",
-    )
-    clarification: str = Field("", description="needs_clarification=true 时唯一且具体的追问。")
 
 
 class OrchestratorTask(BaseModel):
@@ -49,7 +57,7 @@ class OrchestratorTask(BaseModel):
     question: str = Field(..., description="可以独立交给某个业务 Agent 处理的子问题")
     intent_hint: Optional[OrchestratorIntentHint] = Field(
         None,
-        description="可选意图提示，最终仍由 route_intent 复核",
+        description="该子任务应直接执行的领域：shopping、knowledge、chitchat 或 unknown。",
     )
     depends_on: List[str] = Field(
         default_factory=list,

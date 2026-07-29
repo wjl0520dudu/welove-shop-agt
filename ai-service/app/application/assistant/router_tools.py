@@ -139,8 +139,8 @@ def format_business_memory_for_router(memory: Optional[Dict[str, Any]]) -> str:
     Router 分类时把这段文本塞进 messages 前面（作为 SystemMessage 或注释），
     让 Router 能看到"上轮推荐了什么"，正确处理"第二个""刚才那个"类问题。
 
-    只保留 Router 需要的关键字段，避免 prompt 过长：
-    - 最多 5 个 last_product_cards（超过截断，仅保留可绑定 ID、title、price）
+    保留 Router 需要的关键字段：
+    - 完整 last_product_cards 顺序（仅保留可绑定 ID、title、price）
     - last_focused_product 完整字段
     - user_preferences 精简字段
 
@@ -157,16 +157,14 @@ def format_business_memory_for_router(memory: Optional[Dict[str, Any]]) -> str:
 
     last_cards = memory.get("last_product_cards") or []
     if last_cards:
-        # 只保留前 5 个，且只留必要字段，避免 token 爆炸
+        # 保留完整顺序，让 Router 可以理解“第六款”“最后一款”等引用。
         card_lines: list[str] = []
-        for i, card in enumerate(last_cards[:5], 1):
+        for i, card in enumerate(last_cards, 1):
             product_id = card.get("product_id", card.get("id"))
             title = card.get("title") or f"商品{product_id or 'N/A'}"
             price = card.get("price")
             price_str = f"¥{price}" if price is not None else "价格未知"
             card_lines.append(f"  {i}. [product_id={product_id}] {title}（{price_str}）")
-        if len(last_cards) > 5:
-            card_lines.append(f"  … 另有 {len(last_cards) - 5} 个未列出")
         parts.append("[上轮推荐商品]\n" + "\n".join(card_lines))
 
     focused = memory.get("last_focused_product")

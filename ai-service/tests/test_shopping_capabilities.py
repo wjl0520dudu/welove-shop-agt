@@ -61,7 +61,7 @@ class TestCompareCapability:
         ctx = _ctx(last_product_cards=[{"product_id": 1, "title": "只有一个"}])
 
         with patch(
-            "shopping.capabilities.compare._extract_product_features",
+            "app.domain.shopping.capabilities.compare._extract_product_features",
             new=AsyncMock(return_value={}),
         ):
             result = asyncio.run(cap.run(query="哪个好", context=ctx))
@@ -81,7 +81,7 @@ class TestCompareCapability:
             2: ProductFeatures(core_ingredients=["B 成分"], suitable_skin=["干皮"]),
         }
         with patch(
-            "shopping.capabilities.compare._extract_product_features",
+            "app.domain.shopping.capabilities.compare._extract_product_features",
             new=AsyncMock(return_value=features),
         ):
             result = asyncio.run(cap.run(query="这两个对比一下", context=ctx))
@@ -95,6 +95,32 @@ class TestCompareCapability:
         # A 应该被选中
         assert result.suggestion["recommended_product_id"] == 1
 
+    def test_compare_uses_router_selected_product_ids(self):
+        ctx = _ctx(
+            last_product_cards=[
+                {"product_id": 1, "title": "A"},
+                {"product_id": 2, "title": "B"},
+                {"product_id": 3, "title": "C"},
+            ],
+            selected_product_ids=[1, 3],
+        )
+        rows = [
+            {"product_id": 1, "title": "A", "price": 100, "rating": 4.5, "sales_count": 100},
+            {"product_id": 3, "title": "C", "price": 200, "rating": 4.7, "sales_count": 200},
+        ]
+        cap = CompareCapability()
+        with patch(
+            "app.domain.shopping.capabilities.compare._load_products_by_ids",
+            new=AsyncMock(return_value=rows),
+        ) as load, patch(
+            "app.domain.shopping.capabilities.compare._extract_product_features",
+            new=AsyncMock(return_value={}),
+        ):
+            result = asyncio.run(cap.run("比较这两款", ctx))
+
+        assert result.action == "compare"
+        load.assert_awaited_once_with([1, 3])
+
     def test_compare_focus_price_picks_cheapest(self):
         cards = [
             {"product_id": 1, "title": "贵", "price": 500, "rating": 4.9, "sales_count": 100},
@@ -104,7 +130,7 @@ class TestCompareCapability:
         cap = CompareCapability()
 
         with patch(
-            "shopping.capabilities.compare._extract_product_features",
+            "app.domain.shopping.capabilities.compare._extract_product_features",
             new=AsyncMock(return_value={}),
         ):
             result = asyncio.run(cap.run(query="哪个便宜", context=ctx))
@@ -120,10 +146,10 @@ class TestCompareCapability:
             {"product_id": 11, "title": "P11", "price": 200, "rating": 4.7, "sales_count": 200},
         ]
         with patch(
-            "shopping.capabilities.compare._load_products_by_ids",
+            "app.domain.shopping.capabilities.compare._load_products_by_ids",
             new=AsyncMock(return_value=rows),
         ), patch(
-            "shopping.capabilities.compare._extract_product_features",
+            "app.domain.shopping.capabilities.compare._extract_product_features",
             new=AsyncMock(return_value={}),
         ):
             result = asyncio.run(cap.run(
@@ -158,10 +184,10 @@ class TestDetailCapability:
             "description": "aaa", "tags": "tagB", "skus": [],
         }
         with patch(
-            "shopping.capabilities.detail._load_product_detail_raw",
+            "app.domain.shopping.capabilities.detail._load_product_detail_raw",
             new=AsyncMock(return_value=product_detail),
         ), patch(
-            "shopping.capabilities.detail.remember_focused_product",
+            "app.domain.shopping.capabilities.detail.remember_focused_product",
             new=AsyncMock(),
         ):
             result = asyncio.run(DetailCapability().run(query="第二个多少钱", context=ctx))
@@ -179,10 +205,10 @@ class TestDetailCapability:
         ]
         product = {"product_id": 1, "title": "A", "price": 100, "skus": skus}
         with patch(
-            "shopping.capabilities.detail._load_product_detail_raw",
+            "app.domain.shopping.capabilities.detail._load_product_detail_raw",
             new=AsyncMock(return_value=product),
         ), patch(
-            "shopping.capabilities.detail.remember_focused_product",
+            "app.domain.shopping.capabilities.detail.remember_focused_product",
             new=AsyncMock(),
         ):
             result = asyncio.run(DetailCapability().run(
@@ -197,13 +223,13 @@ class TestDetailCapability:
         product = {"product_id": 5, "title": "A", "description": "含烟酰胺 5%"}
         features = {5: ProductFeatures(core_ingredients=["烟酰胺"], concentration="5%")}
         with patch(
-            "shopping.capabilities.detail._load_product_detail_raw",
+            "app.domain.shopping.capabilities.detail._load_product_detail_raw",
             new=AsyncMock(return_value=product),
         ), patch(
-            "shopping.capabilities.detail._extract_product_features",
+            "app.domain.shopping.capabilities.detail._extract_product_features",
             new=AsyncMock(return_value=features),
         ), patch(
-            "shopping.capabilities.detail.remember_focused_product",
+            "app.domain.shopping.capabilities.detail.remember_focused_product",
             new=AsyncMock(),
         ):
             result = asyncio.run(DetailCapability().run(
@@ -216,7 +242,7 @@ class TestDetailCapability:
 
     def test_empty_when_product_missing(self):
         with patch(
-            "shopping.capabilities.detail._load_product_detail_raw",
+            "app.domain.shopping.capabilities.detail._load_product_detail_raw",
             new=AsyncMock(return_value={}),
         ):
             result = asyncio.run(DetailCapability().run(

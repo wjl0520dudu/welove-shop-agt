@@ -2,7 +2,6 @@
 from __future__ import annotations
 import asyncio
 import logging
-import re
 import time
 from typing import Any, AsyncIterator, Dict
 from uuid import uuid4
@@ -29,9 +28,6 @@ from app.application.assistant.orchestration import (
     scope_task_images,
 )
 from app.application.assistant.router import (
-    can_short_circuit_orchestrator,
-    clarification_for_low_confidence,
-    classify_high_confidence_rule,
     normalize_llm_decision,
 )
 from app.infrastructure.config import config
@@ -71,8 +67,8 @@ class AssistantGraph:
     def _build(self):
         g = StateGraph(AssistantState)
         g.add_node("resolve_context", self._resolve_context)
-        g.add_node("analyze_request", self._analyze_request)
         g.add_node("route_intent", self._route)
+        g.add_node("plan_complex", self._plan_complex)
         g.add_node("shopping", self._nodes["shopping_node"])
         g.add_node("knowledge", self._nodes["knowledge_node"])
         g.add_node("chitchat", self._nodes["chitchat_node"])
@@ -82,15 +78,23 @@ class AssistantGraph:
         g.add_node("format_response", self._nodes["format_response"])
 
         g.add_edge(START, "resolve_context")
-        g.add_edge("resolve_context", "analyze_request")
+        g.add_edge("resolve_context", "route_intent")
         g.add_conditional_edges(
-            "analyze_request",
-            self._after_analyze,
-            {"simple": "route_intent", "complex": "execute_dag", "invalid": "format_response"},
+            "route_intent",
+            self._after_route,
+            {
+                "shopping": "shopping",
+                "knowledge": "knowledge",
+                "chitchat": "chitchat",
+                "unknown": "unknown",
+                "complex": "plan_complex",
+            },
         )
-        g.add_conditional_edges("route_intent", lambda s: s.get("route") or "unknown",
-                                {"shopping": "shopping", "knowledge": "knowledge",
-                                 "chitchat": "chitchat", "unknown": "unknown"})
+        g.add_conditional_edges(
+            "plan_complex",
+            self._after_plan,
+            {"complex": "execute_dag", "invalid": "format_response"},
+        )
         for n in ("shopping", "knowledge", "chitchat", "unknown"):
             g.add_edge(n, "format_response")
         g.add_edge("execute_dag", "synthesize_final")
@@ -121,87 +125,40 @@ class AssistantGraph:
         )
         return resolved
 
-    async def _analyze_request(self, state: AssistantState) -> dict:
-        """判断本轮是否需要 Orchestrator，并在需要时生成任务议程。"""
-        question = state.get("question") or ""
-        if not question.strip():
-            return {
-                "original_question": question,
-                "orchestrator_mode": "simple",
-                "orchestrator_reason": "问题为空",
-            }
-
-        has_image = bool(state.get("image_url"))
-        if can_short_circuit_orchestrator(question, has_image=has_image):
-            return {
-                "original_question": question,
-                "orchestrator_mode": "simple",
-                "orchestrator_reason": "高确定性单意图规则，跳过 Orchestrator LLM",
-                "sub_questions": [],
-                "sub_results": [],
-                "current_subquestion_index": 0,
-            }
-
+    async def _plan_complex(self, state: AssistantState) -> dict:
+        """Generate a DAG only after the Router has declared this turn complex."""
+        question = (state.get("canonical_question") or state.get("question") or "").strip()
+        if not question:
+            return self._invalid_plan_state("", "复杂请求缺少完整问题", [], "canonical_question is empty")
         if self._orchestrator_llm is None:
-            return self._fallback_orchestrator_decision(
-                question, "编排模型未配置", has_image=has_image,
-            )
+            return self._invalid_plan_state(question, "编排模型未配置", [], "planner LLM is not configured")
 
-        history_messages = state.get("messages") or [HumanMessage(question)]
-        cid = state.get("conversation_id")
-        uid = state.get("user_id")
-        context_text = ""
-        try:
-            memory = await get_business_memory(cid, uid)
-            context_text = format_business_memory_for_router(memory)
-        except Exception:  # noqa: BLE001
-            logger.warning("orchestrator: 读取 business_memory 失败，退化到纯问题分析", exc_info=True)
-
+        # The Router already consumed full conversation history and resolved
+        # references.  Planner only needs the canonical request, the prepared
+        # structural context, and image scope; it must not repeat top-level
+        # semantic understanding with a second history read.
         messages: list = [SystemMessage(content=ORCHESTRATOR_PROMPT)]
         if state.get("image_url"):
             messages.append(SystemMessage(content=(
                 "本轮用户携带了一张参考图片。请严格按任务粒度设置 use_image："
                 "只有图片检索 shopping 子任务可为 true，knowledge/chitchat 和依赖后续任务必须为 false。"
             )))
+        context_text = format_business_memory_for_router(state.get("business_memory") or {})
         if context_text:
             messages.append(SystemMessage(content=context_text))
-        messages.extend(history_messages)
+        messages.append(HumanMessage(content=question))
 
         try:
             decision = await self._orchestrator_llm.ainvoke(
                 messages,
                 config={"tags": ["ai_internal"]},
             )
-        except Exception:  # noqa: BLE001
-            logger.warning("orchestrator: 结构化拆解失败，尝试启发式拆解", exc_info=True)
-            return self._fallback_orchestrator_decision(
-                question, "结构化拆解失败", has_image=bool(state.get("image_url")),
-            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("planner: structured plan generation failed", exc_info=True)
+            return self._invalid_plan_state(question, "复杂任务规划失败", [], str(exc))
 
         if decision is None:
-            logger.warning(
-                "orchestrator: 结构化拆解返回 None，重试一次 question=%r",
-                question,
-            )
-            try:
-                decision = await self._orchestrator_llm.ainvoke(
-                    messages,
-                    config={"tags": ["ai_internal"]},
-                )
-            except Exception:  # noqa: BLE001
-                logger.warning("orchestrator: 结构化拆解重试失败，尝试启发式拆解", exc_info=True)
-                return self._fallback_orchestrator_decision(
-                    question, "结构化拆解重试失败", has_image=bool(state.get("image_url")),
-                )
-
-        if decision is None:
-            logger.warning(
-                "orchestrator: 结构化拆解重试后仍为空，尝试启发式拆解 question=%r",
-                question,
-            )
-            return self._fallback_orchestrator_decision(
-                question, "结构化拆解返回空", has_image=bool(state.get("image_url")),
-            )
+            return self._invalid_plan_state(question, "复杂任务规划失败", [], "planner returned empty result")
 
         normalized = self._normalize_orchestrator_decision(
             question, decision, has_image=bool(state.get("image_url")),
@@ -225,17 +182,7 @@ class AssistantGraph:
                         question, repaired, has_image=bool(state.get("image_url")),
                     )
             except Exception:  # noqa: BLE001
-                logger.warning("orchestrator: 非法计划修复失败", exc_info=True)
-
-        decision_mode = str(_decision_value(decision, "mode", "simple") or "simple").lower()
-        if decision_mode == "complex" and normalized.get("orchestrator_mode") == "simple":
-            logger.warning(
-                "orchestrator: LLM 声称 complex 但 tasks 不足，尝试启发式补救 question=%r",
-                question,
-            )
-            return self._fallback_orchestrator_decision(
-                question, "LLM 拆解不完整", has_image=bool(state.get("image_url")),
-            )
+                logger.warning("planner: invalid plan repair failed", exc_info=True)
         return normalized
 
     def _normalize_orchestrator_decision(
@@ -250,14 +197,12 @@ class AssistantGraph:
         raw_tasks = _decision_value(decision, "tasks", []) or []
         tasks = _normalize_tasks(raw_tasks)
         if mode != "complex" or len(tasks) < 2:
-            return {
-                "original_question": question,
-                "orchestrator_mode": "simple",
-                "orchestrator_reason": reason or "单任务请求",
-                "sub_questions": [],
-                "sub_results": [],
-                "current_subquestion_index": 0,
-            }
+            return self._invalid_plan_state(
+                question,
+                reason or "复杂任务未生成有效计划",
+                tasks,
+                "Planner must return mode=complex with at least two tasks",
+            )
         try:
             tasks = scope_task_images(tasks, has_image=has_image)
             levels = build_task_levels(
@@ -271,39 +216,6 @@ class AssistantGraph:
             "original_question": question,
             "orchestrator_mode": "complex",
             "orchestrator_reason": reason or "检测到多任务请求",
-            "sub_questions": tasks,
-            "sub_results": [],
-            "current_subquestion_index": 0,
-            "task_levels": levels,
-        }
-
-    def _fallback_orchestrator_decision(
-        self,
-        question: str,
-        reason: str,
-        *,
-        has_image: bool = False,
-    ) -> dict:
-        tasks = _heuristic_split_tasks(question)
-        if len(tasks) < 2:
-            return {
-                "original_question": question,
-                "orchestrator_mode": "simple",
-                "orchestrator_reason": reason,
-                "sub_questions": [],
-                "sub_results": [],
-                "current_subquestion_index": 0,
-            }
-        tasks = scope_task_images(tasks, has_image=has_image)
-        levels = build_task_levels(
-            tasks,
-            max_tasks=config.ORCHESTRATOR_MAX_TASKS,
-            max_depth=config.ORCHESTRATOR_MAX_DEPTH,
-        )
-        return {
-            "original_question": question,
-            "orchestrator_mode": "complex",
-            "orchestrator_reason": f"{reason}，启发式识别到多问题",
             "sub_questions": tasks,
             "sub_results": [],
             "current_subquestion_index": 0,
@@ -327,12 +239,15 @@ class AssistantGraph:
             "sub_results": [],
             "task_levels": [],
             "answer": answer,
-            "task_type": "orchestrator",
+            # ``orchestrator`` is an internal implementation detail. The
+            # Router already classified this as a complex request, so keep the
+            # public result semantic even when planning fails.
+            "task_type": "complex",
             "product_cards": [],
             "sources": [],
             "retrieved_contexts": [],
             "tool_calls": [],
-            "route": "orchestrator",
+            "route": "complex",
             "route_reason": reason or "任务计划无效",
             "error": True,
             "error_code": ErrorCode.ORCHESTRATOR_PLAN_INVALID,
@@ -340,12 +255,20 @@ class AssistantGraph:
             "messages": [AIMessage(content=answer)],
         }
 
-    def _after_analyze(self, state: AssistantState) -> str:
+    @staticmethod
+    def _after_route(state: AssistantState) -> str:
+        if state.get("orchestrator_mode") == "complex":
+            return "complex"
+        route = str(state.get("route") or "unknown")
+        return route if route in {"shopping", "knowledge", "chitchat"} else "unknown"
+
+    @staticmethod
+    def _after_plan(state: AssistantState) -> str:
         if state.get("orchestrator_plan_error"):
             return "invalid"
         if state.get("orchestrator_mode") == "complex" and len(state.get("sub_questions") or []) >= 2:
             return "complex"
-        return "simple"
+        return "invalid"
 
     async def _execute_dag(self, state: AssistantState) -> dict:
         """按拓扑层执行任务：同层并发、跨层等待、每个任务使用隔离状态。"""
@@ -558,8 +481,21 @@ class AssistantGraph:
         return task_result
 
     async def _run_business_task(self, task_state: AssistantState) -> dict[str, Any]:
-        route_result = await self._route(task_state)
-        route = str(route_result.get("route") or "unknown")
+        # Planner has already assigned the domain for every DAG task.  Do not
+        # send subtasks back through the top-level Router or re-read history.
+        task = task_state.get("active_subtask") or {}
+        route = str(task.get("intent_hint") or "unknown")
+        if route not in {"shopping", "knowledge", "chitchat"}:
+            route = "unknown"
+        route_result = _route_result(
+            route=route,
+            confidence=1.0 if route != "unknown" else 0.0,
+            source="planner",
+            reason="Planner assigned subtask domain" if route != "unknown" else "Planner did not assign a runnable domain",
+            mode="simple",
+            canonical_question=str(task_state.get("question") or ""),
+            business_memory=dict(task_state.get("business_memory") or {}),
+        )
         node_key = f"{route}_node"
         if node_key not in self._nodes:
             route = "unknown"
@@ -647,13 +583,15 @@ class AssistantGraph:
         has_error = any(bool(r.get("error")) for r in sub_results)
         return {
             "answer": answer,
-            "task_type": "orchestrator",
+            # Planner/DAG metadata remains available for observability, but
+            # must not overwrite the Router's public semantic route.
+            "task_type": "complex",
             "product_cards": product_cards,
             "sources": sources,
             "retrieved_contexts": retrieved_contexts,
             "tool_calls": tool_calls,
             "suggested_questions": suggested_questions,
-            "route": "orchestrator",
+            "route": "complex",
             "route_reason": state.get("orchestrator_reason"),
             "error": has_error,
             "error_code": ErrorCode.ORCHESTRATOR_PARTIAL_ERROR if has_error else None,
@@ -663,169 +601,106 @@ class AssistantGraph:
 
     async def _route(self, state: AssistantState) -> dict:
         question = (state.get("question") or "").strip()
-        active_task = state.get("active_subtask") or {}
         image_url = (state.get("image_url") or "").strip()
-        task_uses_image = bool(active_task.get("use_image")) if active_task else False
-        has_routable_image = bool(image_url and (not active_task or task_uses_image))
-        if has_routable_image:
-            rule = classify_high_confidence_rule(question, has_image=True)
-            reason = (
-                "任务 use_image=true → shopping 多模态分支"
-                if active_task
-                else "带图请求 → 强制 shopping 多模态分支"
-            )
-            return _route_result(
-                route="shopping",
-                confidence=rule.confidence,
-                source="rule",
-                reason=reason,
-                rule=rule,
-            )
-
-        if not question:
-            rule = classify_high_confidence_rule(question)
+        if not question and not image_url:
             return _route_result(
                 route="unknown",
-                confidence=rule.confidence,
+                confidence=0.0,
                 source="fallback",
                 reason="问题为空，需要用户补充需求",
-                rule=rule,
                 fallback_used=True,
-                clarification=clarification_for_low_confidence(question),
             )
 
-        # 直接传 state["messages"]（已通过主图 checkpointer 合并了历史）
-        # 不要再拼接第二次 question，否则问题出现两次。
+        # resolve_context has already prepared the full supplied conversation
+        # history and its structural artifacts.  Router is the only semantic
+        # reader of that context on the top-level path.
         history_messages = state.get("messages") or [HumanMessage(question)]
-
-        # 把业务上下文（上轮推荐商品、当前关注商品、用户偏好）塞进 Router 的 messages，
-        # 让分类能看到"用户在指代什么"。例如 "第二个多少钱" 单看这句无法分类，
-        # 但看到 last_product_cards 就能判断这是 shopping 场景（追问具体商品）。
-        cid = state.get("conversation_id")
-        uid = state.get("user_id")
-        context_text = ""
-        # DAG dependency memory is already scoped to this task and must win over
-        # the shared Store snapshot (for example, a just-produced product list).
         memory: dict[str, Any] = dict(state.get("business_memory") or {})
-        try:
-            persisted_memory = await get_business_memory(cid, uid)
-            memory = {**(persisted_memory or {}), **memory}
-        except Exception:  # noqa: BLE001
-            # Store 读取失败不阻塞分类，退化到纯 messages 分类
-            logger.warning("router: 读取 business_memory 失败，退化到纯分类", exc_info=True)
-        context_text = format_business_memory_for_router(memory)
-
-        rule = classify_high_confidence_rule(question, memory)
-        intent_hint = str(active_task.get("intent_hint") or "unknown") if active_task else "unknown"
-
-        # Orchestrator hints are already produced by a structured planning call. Reusing a
-        # valid hint avoids a second LLM call per subtask. A contradictory deterministic
-        # rule is allowed to override it so obvious planner mistakes do not reach an Agent.
-        if active_task and intent_hint in {"shopping", "knowledge", "chitchat"}:
-            if rule.matched and rule.route != intent_hint:
-                return _route_result(
-                    route=rule.route,
-                    confidence=rule.confidence,
-                    source="rule_override",
-                    reason=(
-                        f"高确定性规则覆盖 Orchestrator intent_hint={intent_hint}: "
-                        f"{rule.reason}"
-                    ),
-                    rule=rule,
-                )
-            return _route_result(
-                route=intent_hint,
-                confidence=config.ROUTER_ORCHESTRATOR_HINT_CONFIDENCE,
-                source="orchestrator_hint",
-                reason=f"Orchestrator 任务级路由: intent_hint={intent_hint}",
-                rule=rule,
-            )
-
-        # The LLM is the primary semantic decision-maker.  Rules above are kept
-        # only as observations and failure fallbacks; otherwise they would bypass
-        # the one component responsible for cross-turn resolution.
-        # ROUTER_PROMPT 作为首条 system 消息置顶；会话上下文作为第二条 system 消息追加。
-        # with_structured_output 直链，不再需要 checkpointer / thread_id / recursion_limit。
         router_messages: list = [SystemMessage(content=ROUTER_PROMPT)]
+        if image_url:
+            router_messages.append(SystemMessage(content=(
+                "本轮用户上传了参考图片。图片本身可用于后续 shopping 检索；"
+                "请结合用户文字和完整对话判断领域与 simple/complex，不要忽略图片输入。"
+            )))
+        context_text = format_business_memory_for_router(memory)
         if context_text:
             router_messages.append(SystemMessage(content=context_text))
         router_messages.extend(history_messages)
 
         if self._router_llm is None:
-            return _rule_or_unknown_fallback(question, rule, "路由模型未配置")
+            return _route_result(
+                route="unknown", confidence=0.0, source="fallback",
+                reason="路由模型未配置", fallback_used=True,
+            )
 
-        # with_structured_output 默认 include_raw=False，解析失败会抛异常；
-        # 这里兜住，分类失败一律归 unknown，不阻塞主图。
         try:
             decision = await self._router_llm.ainvoke(
                 router_messages,
                 config={"tags": ["ai_internal"]},
             )
         except Exception:  # noqa: BLE001
-            logger.warning("router: 结构化分类失败，退化到 unknown", exc_info=True)
-            return _rule_or_unknown_fallback(question, rule, "结构化路由调用失败")
+            logger.warning("router: structured routing failed", exc_info=True)
+            return _route_result(
+                route="unknown", confidence=0.0, source="fallback",
+                reason="结构化路由调用失败", fallback_used=True,
+            )
         if decision is None:
-            return _rule_or_unknown_fallback(question, rule, "结构化路由返回空结果")
+            return _route_result(
+                route="unknown", confidence=0.0, source="fallback",
+                reason="结构化路由返回空结果", fallback_used=True,
+            )
 
         try:
             normalized = normalize_llm_decision(decision)
         except Exception:  # noqa: BLE001
-            logger.warning("router: 结构化分类结果校验失败，进入澄清兜底", exc_info=True)
-            return _rule_or_unknown_fallback(question, rule, "结构化路由结果不符合 IntentDecision 契约")
+            logger.warning("router: structured routing output could not be normalized", exc_info=True)
+            return _route_result(
+                route="unknown", confidence=0.0, source="fallback",
+                reason="结构化路由结果无法解析", fallback_used=True,
+            )
         llm_trace = {
             "route": normalized.task_type,
+            "mode": normalized.mode,
             "confidence": normalized.confidence,
             "reason": normalized.reason,
         }
-        if (
-            normalized.needs_clarification
-            or
-            normalized.task_type == "unknown"
-            or normalized.confidence < config.ROUTER_LOW_CONFIDENCE_THRESHOLD
-        ):
+        canonical_question = normalized.canonical_question or question
+        routed_memory = {
+            **memory,
+            "selected_product_ids": list(normalized.resolved_product_ids or []),
+            "resolved_knowledge_entities": list(normalized.resolved_knowledge_entities or []),
+        }
+        if normalized.mode == "complex":
+            return _route_result(
+                route="unknown",
+                confidence=normalized.confidence,
+                source="llm",
+                reason=normalized.reason or "LLM identified a complex request",
+                llm=llm_trace,
+                mode="complex",
+                canonical_question=canonical_question,
+                business_memory=routed_memory,
+            )
+        if normalized.task_type == "unknown":
             return _route_result(
                 route="unknown",
                 confidence=normalized.confidence,
                 source="fallback",
-                reason=(
-                    "LLM 路由置信度不足，进入澄清兜底: "
-                    f"route={normalized.task_type}, confidence={normalized.confidence:.3f}"
-                ),
-                rule=rule,
+                reason=normalized.reason or "LLM could not determine the request",
                 llm=llm_trace,
                 fallback_used=True,
-                clarification=normalized.clarification or clarification_for_low_confidence(question),
-            )
-
-        try:
-            bound = _bind_router_context(
-                question=question,
-                canonical_question=normalized.canonical_question,
-                product_ids=normalized.resolved_product_ids,
-                knowledge_entities=normalized.resolved_knowledge_entities,
-                memory=memory,
-            )
-        except ValueError as exc:
-            logger.warning("router returned untrusted entity binding: %s", exc)
-            return _route_result(
-                route="unknown",
-                confidence=0.0,
-                source="fallback",
-                reason=f"路由实体绑定校验失败: {exc}",
-                rule=rule,
-                llm=llm_trace,
-                fallback_used=True,
-                clarification="我没能可靠定位你指的是哪一项。请直接说商品名或序号，我再继续。",
+                canonical_question=canonical_question,
+                business_memory=routed_memory,
             )
         return _route_result(
             route=normalized.task_type,
             confidence=normalized.confidence,
             source="llm",
             reason=normalized.reason or "LLM structured router",
-            rule=rule,
             llm=llm_trace,
-            canonical_question=bound["canonical_question"],
-            business_memory=bound["business_memory"],
+            mode="simple",
+            canonical_question=canonical_question,
+            business_memory=routed_memory,
         )
 
     def _make_initial_state(self, **kwargs) -> tuple[AssistantState, str, str]:
@@ -868,7 +743,6 @@ class AssistantGraph:
             "llm_confidence": None,
             "llm_reason": "",
             "route_fallback_used": False,
-            "route_clarification": "",
             "answer": "",
             "task_type": "",
             "product_cards": [],
@@ -880,8 +754,8 @@ class AssistantGraph:
             "trace_id": trace_id,
             "conversation_history": conversation_history,
             "context_resolution": {},
-            # The model sees a bounded real history; structured card/image
-            # artifacts remain available to ContextResolver separately.
+            # Router receives the complete history supplied by chat-service;
+            # structured card/image artifacts remain available separately.
             "messages": _history_to_messages(conversation_history) or [HumanMessage(content=human_content)],
             "error": False,
             "error_code": None,
@@ -1050,8 +924,8 @@ class AssistantGraph:
         # 主图业务节点返回的 {"messages": [AIMessage(content=完整答案)]} 会被 messages
         # stream 再发一次；这个片段不是 LLM 增量，而是节点回写的完整答案，必须过滤。
         main_nodes = {
-            "analyze_request",
             "route_intent",
+            "plan_complex",
             "shopping",
             "knowledge",
             "chitchat",
@@ -1087,7 +961,7 @@ class AssistantGraph:
                 },
             }
 
-        if node_name == "analyze_request" and node_output.get("orchestrator_mode") == "complex":
+        if node_name == "plan_complex" and node_output.get("orchestrator_mode") == "complex":
             yield {
                 "type": "orchestrator_plan",
                 "data": {
@@ -1144,29 +1018,29 @@ def _route_result(
     confidence: float,
     source: str,
     reason: str,
-    rule=None,
     llm: dict[str, Any] | None = None,
     fallback_used: bool = False,
-    clarification: str = "",
+    mode: str = "simple",
     canonical_question: str = "",
     business_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one stable routing trace for graph state, API and offline evals."""
-    rule_data = rule.to_dict() if rule is not None else {}
     llm_data = llm or {}
     result = {
         "route": route,
         "route_reason": reason,
         "route_confidence": max(0.0, min(1.0, float(confidence or 0.0))),
         "route_source": source,
-        "rule_route": rule_data.get("route"),
-        "rule_confidence": rule_data.get("confidence"),
-        "rule_reason": rule_data.get("reason", ""),
+        # Preserve response compatibility while removing deterministic routing.
+        "rule_route": None,
+        "rule_confidence": None,
+        "rule_reason": "",
         "llm_route": llm_data.get("route"),
         "llm_confidence": llm_data.get("confidence"),
         "llm_reason": llm_data.get("reason", ""),
         "route_fallback_used": bool(fallback_used),
-        "route_clarification": clarification,
+        "orchestrator_mode": mode,
+        "orchestrator_reason": reason if mode == "complex" else "",
     }
     if canonical_question:
         # Replacing state.question here is intentional: child Agents receive the
@@ -1176,86 +1050,6 @@ def _route_result(
     if business_memory is not None:
         result["business_memory"] = business_memory
     return result
-
-
-def _rule_or_unknown_fallback(question: str, rule, failure_reason: str) -> dict[str, Any]:
-    """Use a deterministic route only when the LLM router itself is unavailable."""
-    if rule is not None and rule.matched:
-        return _route_result(
-            route=rule.route,
-            confidence=rule.confidence,
-            source="rule_fallback",
-            reason=f"{failure_reason}; {rule.reason}",
-            rule=rule,
-            fallback_used=True,
-        )
-    return _route_result(
-        route="unknown",
-        confidence=0.0,
-        source="fallback",
-        reason=failure_reason,
-        rule=rule,
-        fallback_used=True,
-        clarification=clarification_for_low_confidence(question),
-    )
-
-
-def _bind_router_context(
-    *,
-    question: str,
-    canonical_question: str,
-    product_ids: list[int],
-    knowledge_entities: list[str],
-    memory: dict[str, Any],
-) -> dict[str, Any]:
-    """Validate LLM bindings against the Preparation snapshot.
-
-    Semantic selection stays in the Router LLM.  This code only protects the
-    system boundary: an LLM may choose an offered item, never invent one.
-    """
-    canonical = (canonical_question or question).strip()
-    if not canonical:
-        raise ValueError("canonical_question is empty")
-
-    bound_memory = dict(memory or {})
-    cards = [card for card in (bound_memory.get("last_product_cards") or []) if isinstance(card, dict)]
-    card_by_id: dict[int, dict[str, Any]] = {}
-    for card in cards:
-        raw_id = card.get("product_id", card.get("id"))
-        try:
-            if raw_id is not None:
-                card_by_id[int(raw_id)] = card
-        except (TypeError, ValueError):
-            continue
-
-    unique_product_ids = list(dict.fromkeys(int(pid) for pid in (product_ids or [])))
-    unknown_ids = [pid for pid in unique_product_ids if pid not in card_by_id]
-    if unknown_ids:
-        raise ValueError(f"unknown product ids: {unknown_ids}")
-    if unique_product_ids:
-        selected_cards = [card_by_id[pid] for pid in unique_product_ids]
-        previous_set = dict(bound_memory.get("active_product_set") or {})
-        bound_memory["last_product_cards"] = selected_cards
-        bound_memory["active_product_set"] = {
-            **previous_set,
-            "product_ids": unique_product_ids,
-        }
-        if len(selected_cards) == 1:
-            bound_memory["last_focused_product"] = selected_cards[0]
-
-    available_entities = {
-        str(entity).strip()
-        for entity in (bound_memory.get("last_knowledge_entities") or [])
-        if str(entity).strip()
-    }
-    unique_entities = list(dict.fromkeys(str(entity).strip() for entity in (knowledge_entities or []) if str(entity).strip()))
-    unknown_entities = [entity for entity in unique_entities if entity not in available_entities]
-    if unknown_entities:
-        raise ValueError(f"unknown knowledge entities: {unknown_entities}")
-    if unique_entities:
-        bound_memory["resolved_knowledge_entities"] = unique_entities
-
-    return {"canonical_question": canonical, "business_memory": bound_memory}
 
 
 def _decision_value(decision: Any, key: str, default: Any = None) -> Any:
@@ -1306,49 +1100,6 @@ def _normalize_tasks(raw_tasks: list) -> list[dict[str, Any]]:
             "reason": str(data.get("reason") or ""),
         })
     return tasks
-
-
-_HEURISTIC_SPLIT_PATTERN = re.compile(
-    r"(?:[？?。；;]\s*)|"
-    r"(?:[，,]?\s*(?:然后|还有|另外|顺便|再帮我|再|以及|并且|此外|同时|另|接着)\s*)|"
-    r"(?:[，,]\s*(?=(?:第[一二三四五六七八九十0-9]+[个款]|它们|他们|这几款|那几款|上面|前面)))"
-)
-
-
-def _heuristic_split_tasks(question: str) -> list[dict[str, Any]]:
-    """LLM planner 不可用时的保守兜底，只处理明显多问句。"""
-    parts = [p.strip(" ，,。？?；;") for p in _HEURISTIC_SPLIT_PATTERN.split(question) if p.strip(" ，,。？?；;")]
-    if len(parts) < 2:
-        return []
-
-    tasks: list[dict[str, Any]] = []
-    for idx, part in enumerate(parts[:5], start=1):
-        task_id = f"t{idx}"
-        depends_on: list[str] = []
-        if idx > 1 and re.search(
-            r"(这些|它们|他们|她们|上面|前面|刚才|推荐的这些|这几款|那几款|第[一二三四五六七八九十0-9]+[个款])",
-            part,
-        ):
-            depends_on = ["t1"]
-        tasks.append({
-            "id": task_id,
-            "question": part,
-            "intent_hint": _guess_intent_hint(part),
-            "depends_on": depends_on,
-            "use_image": None,
-            "reason": "启发式拆分",
-        })
-    return tasks
-
-
-def _guess_intent_hint(text: str) -> str:
-    if re.search(r"(推荐|找|商品|价格|多少钱|对比|比较|库存|规格|性价比|便宜|贵|评分|销量)", text):
-        return "shopping"
-    if re.search(r"(成分|功效|原理|怎么用|适合什么|能不能|副作用|禁忌|区别|为什么|浓度)", text):
-        return "knowledge"
-    if re.search(r"(你好|谢谢|再见|总结|刚才问了什么|你是谁)", text):
-        return "chitchat"
-    return "unknown"
 
 
 def _format_subtask_heading(index: int, total: int, question: str) -> str:
@@ -1415,9 +1166,9 @@ def _dedupe_sources(sources_iter) -> list[dict[str, Any]]:
 def _normalize_conversation_history(
     raw_history: list[Any], question: str, image_url: str | None,
 ) -> list[dict[str, Any]]:
-    """Normalize Java message DTOs and retain only the recent bounded window."""
+    """Normalize Java message DTOs without truncating the supplied history."""
     out: list[dict[str, Any]] = []
-    for item in raw_history[-12:]:
+    for item in raw_history:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "")
@@ -1439,7 +1190,7 @@ def _normalize_conversation_history(
     # exactly once in that case.
     if not out or out[-1].get("role") != "user" or out[-1].get("content") != (question or "").strip():
         out.append({"role": "user", "content": (question or "").strip(), "image_url": image_url or ""})
-    return out[-12:]
+    return out
 
 
 def _history_to_messages(history: list[dict[str, Any]]) -> list:
