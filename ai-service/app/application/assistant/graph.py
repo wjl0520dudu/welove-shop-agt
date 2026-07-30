@@ -611,6 +611,22 @@ class AssistantGraph:
                 fallback_used=True,
             )
 
+        # An image with no text is an explicit product-discovery input.  It is
+        # not an omitted follow-up to the previous detail/compare turn, so do
+        # not let historical action semantics suppress the new image search.
+        # This is an input-mode invariant rather than a keyword intent rule.
+        if image_url and not question:
+            memory = dict(state.get("business_memory") or {})
+            memory["selected_product_ids"] = []
+            return _route_result(
+                route="shopping",
+                confidence=1.0,
+                source="input_mode",
+                reason="当前轮仅上传图片，执行相似商品检索",
+                canonical_question="根据当前图片查找相似商品",
+                business_memory=memory,
+            )
+
         # resolve_context has already prepared the full supplied conversation
         # history and its structural artifacts.  Router is the only semantic
         # reader of that context on the top-level path.
@@ -665,9 +681,22 @@ class AssistantGraph:
             "reason": normalized.reason,
         }
         canonical_question = normalized.canonical_question or question
+        resolved_product_ids = _restrict_to_active_product_set(
+            normalized.resolved_product_ids,
+            memory,
+        )
+        if resolved_product_ids != list(normalized.resolved_product_ids or []):
+            logger.warning(
+                "router discarded product ids outside active product set ids=%s allowed=%s",
+                normalized.resolved_product_ids,
+                _active_product_set_ids(memory),
+            )
         routed_memory = {
             **memory,
-            "selected_product_ids": list(normalized.resolved_product_ids or []),
+            # Router may select only IDs exposed by Preparation's current
+            # conversation-scoped product set.  This validates entity
+            # ownership, not the LLM's semantic interpretation.
+            "selected_product_ids": resolved_product_ids,
             "resolved_knowledge_entities": list(normalized.resolved_knowledge_entities or []),
         }
         if normalized.mode == "complex":
@@ -1051,6 +1080,50 @@ def _route_result(
     if business_memory is not None:
         result["business_memory"] = business_memory
     return result
+
+
+def _active_product_set_ids(memory: dict[str, Any]) -> list[int]:
+    """Return only product IDs exposed by this conversation's Preparation step."""
+    raw_ids = (memory.get("active_product_set") or {}).get("product_ids") or []
+    if not raw_ids:
+        raw_ids = [
+            card.get("product_id") or card.get("id")
+            for card in (memory.get("last_product_cards") or [])
+            if isinstance(card, dict)
+        ]
+    ids: list[int] = []
+    for raw in raw_ids:
+        try:
+            product_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if product_id > 0 and product_id not in ids:
+            ids.append(product_id)
+    return ids
+
+
+def _restrict_to_active_product_set(
+    resolved_product_ids: list[int] | None,
+    memory: dict[str, Any],
+) -> list[int]:
+    """Keep Router bindings inside the current conversation's trusted cards.
+
+    The Router remains LLM-driven for reference resolution.  Code only rejects
+    IDs that do not belong to the product set Preparation exposed to it, which
+    prevents a model from turning an unbound "第一款" into an arbitrary SKU.
+    """
+    allowed = set(_active_product_set_ids(memory))
+    if not allowed:
+        return []
+    selected: list[int] = []
+    for raw in resolved_product_ids or []:
+        try:
+            product_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if product_id in allowed and product_id not in selected:
+            selected.append(product_id)
+    return selected
 
 
 def _decision_value(decision: Any, key: str, default: Any = None) -> Any:

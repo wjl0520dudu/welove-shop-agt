@@ -7,9 +7,13 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from langchain_core.messages import ToolMessage
+from langchain.agents.middleware.types import ModelRequest, ModelResponse
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from app.domain.shopping.tool_guard import ShoppingToolGuardMiddleware
+from app.domain.shopping.tool_guard import (
+    RequireInitialShoppingToolMiddleware,
+    ShoppingToolGuardMiddleware,
+)
 
 
 def _request(
@@ -58,6 +62,34 @@ def test_identical_successful_recommendation_is_reused_within_one_run():
         assert second.tool_call_id == "b"
         assert guard.records[-1]["status"] == "deduplicated"
         assert guard.records[-1]["deduplicated"] is True
+
+    asyncio.run(run())
+
+
+def test_first_model_turn_requires_a_high_level_tool_but_final_answer_does_not():
+    async def run():
+        middleware = RequireInitialShoppingToolMiddleware()
+        observed: list[object] = []
+
+        async def handler(request):
+            observed.append(request.tool_choice)
+            return ModelResponse(result=[AIMessage(content="ok")])
+
+        initial = ModelRequest(
+            model=AsyncMock(),
+            messages=[HumanMessage(content="推荐耳机")],
+        )
+        after_tool = ModelRequest(
+            model=AsyncMock(),
+            messages=[
+                HumanMessage(content="推荐耳机"),
+                ToolMessage(content='{"action":"recommend"}', tool_call_id="tc", name="recommend_products"),
+            ],
+        )
+        await middleware.awrap_model_call(initial, handler)
+        await middleware.awrap_model_call(after_tool, handler)
+
+        assert observed == ["required", None]
 
     asyncio.run(run())
 

@@ -129,6 +129,28 @@ def test_agent_failure_uses_observable_restricted_fallback_only_after_loop_attem
     asyncio.run(run())
 
 
+def test_agent_without_a_high_level_tool_never_returns_an_ungrounded_recommendation():
+    async def run():
+        fake_agent = _FakeAgent({
+            "messages": [AIMessage(content="我已经为你挑了三款耳机。")],
+        })
+        shopping = ShoppingAgent(llm=MagicMock())
+        with patch("app.domain.shopping.agent.create_agent", return_value=fake_agent):
+            result = await shopping.run(
+                question="推荐通勤耳机",
+                messages=[],
+                business_memory={},
+            )
+
+        assert result["error"] is True
+        assert result["error_code"] == "AI_SHOPPING_ERROR"
+        assert result["product_cards"] == []
+        assert result["tool_calls"] == []
+        assert "查询商城的实时商品信息" in result["answer"]
+
+    asyncio.run(run())
+
+
 def test_prompt_has_closed_loop_operation_manuals_but_disallows_history_reresolution():
     prompt = ShoppingAgent(MagicMock())._build_system_prompt(
         selected_product_ids=[11, 13],

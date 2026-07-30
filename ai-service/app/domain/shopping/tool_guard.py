@@ -18,7 +18,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain.agents.middleware.types import ToolCallRequest
+from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
@@ -28,6 +28,30 @@ _PRIMARY_CAPABILITIES = {
     "compare_products": "compare",
     "answer_product_detail": "detail",
 }
+
+
+class RequireInitialShoppingToolMiddleware(AgentMiddleware):
+    """Require the first ShoppingAgent model turn to choose a high-level tool.
+
+    This is an execution contract, not an intent classifier: the LLM still
+    chooses *which* of the high-level tools to call.  It only prevents a model
+    from fabricating a recommendation, comparison, or detail answer before any
+    real product result exists.  Once a tool result is present, normal natural
+    language answer generation is allowed again.
+    """
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler,
+    ) -> ModelResponse:
+        has_tool_result = any(
+            isinstance(message, ToolMessage)
+            for message in (request.messages or [])
+        )
+        if not has_tool_result:
+            return await handler(request.override(tool_choice="required"))
+        return await handler(request)
 
 
 def _normalise_ids(value: Any) -> list[int]:

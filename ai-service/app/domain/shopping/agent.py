@@ -25,7 +25,10 @@ from app.domain.shopping.capabilities import (
 from app.domain.shopping.dispatcher import DispatchDecision, dispatch_shopping_capability
 from app.domain.shopping.high_level_tools import SHOPPING_HIGH_LEVEL_TOOLS
 from app.domain.shopping.schemas import ShoppingContext
-from app.domain.shopping.tool_guard import ShoppingToolGuardMiddleware
+from app.domain.shopping.tool_guard import (
+    RequireInitialShoppingToolMiddleware,
+    ShoppingToolGuardMiddleware,
+)
 
 # Phase 1a 关键变更：LLM 只面对 4 个高层 tool，底层 12 个工具全部退到 Capability 内部。
 # 见 shopping/high_level_tools.py 和 shopping/capabilities/*。
@@ -134,6 +137,9 @@ class ShoppingAgent:
             tools=_ALL_TOOLS,
             state_schema=ShoppingAgentState,
             middleware=[
+                # The LLM still selects the capability.  This only requires a
+                # real high-level product result before it may answer.
+                RequireInitialShoppingToolMiddleware(),
                 guard,
                 # A bounded global limit protects against malformed tool loops.
                 # The Guard still owns same-argument result reuse.
@@ -191,6 +197,27 @@ class ShoppingAgent:
         collected_tool_calls = _extract_tool_calls(
             result.get("messages", []), guard_records=guard.records,
         )
+
+        # A Shopping answer without any high-level ToolResult is not grounded
+        # in real product data.  Never surface a fabricated "I found these"
+        # response with empty cards; tool_choice=required above normally
+        # prevents this, and this is the provider-agnostic final backstop.
+        if not collected_tool_calls:
+            logger.warning("shopping agent completed without a high-level tool call")
+            return {
+                "answer": "我需要先查询商城的实时商品信息，但这次查询没有成功，请稍后再试。",
+                "product_cards": [],
+                "task_type": "shopping",
+                "sources": [],
+                "tool_calls": [],
+                "suggested_questions": [],
+                "capability": None,
+                "dispatch_source": "none",
+                "model_call_count": _count_model_calls(result.get("messages", [])),
+                "error": True,
+                "error_code": ErrorCode.SHOPPING_ERROR,
+                "message": "ShoppingAgent completed without a high-level ToolResult.",
+            }
 
         # ★ Phase 1a 关键变更：product_cards 优先从最近一次 ToolMessage 抽取，
         # 而不是无条件读 Store —— 避免"对比/详情"轮次误带上一轮推荐卡片。

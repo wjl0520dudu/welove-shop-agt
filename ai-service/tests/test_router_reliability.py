@@ -102,7 +102,7 @@ def test_router_keeps_full_card_set_without_entity_validation_or_slicing():
     asyncio.run(run())
 
 
-def test_router_uses_llm_for_image_input_instead_of_rule_shortcut():
+def test_router_routes_empty_text_image_as_a_new_shopping_search():
     async def run():
         router = FakeStructuredRouter(IntentDecision(
             mode="simple",
@@ -119,8 +119,36 @@ def test_router_uses_llm_for_image_input_instead_of_rule_shortcut():
             "business_memory": {},
         })
         assert result["route"] == "shopping"
-        assert router.calls == 1
-        assert any("上传了参考图片" in str(getattr(message, "content", "")) for message in router.messages)
+        assert result["question"] == "根据当前图片查找相似商品"
+        assert result["business_memory"]["selected_product_ids"] == []
+        # An explicit image-only input must not inherit the preceding detail
+        # turn, so it does not need an LLM context interpretation first.
+        assert router.calls == 0
+
+    asyncio.run(run())
+
+
+def test_router_discards_model_product_ids_outside_the_active_card_set():
+    async def run():
+        router = FakeStructuredRouter(IntentDecision(
+            mode="simple",
+            task_type="shopping",
+            confidence=0.92,
+            reason="模型错误地猜测了历史商品",
+            canonical_question="查询第一款商品价格",
+            resolved_product_ids=[42, 999],
+        ))
+        graph = _graph_with_router(router)
+        result = await graph._route({
+            "question": "第一款多少钱？",
+            "messages": [],
+            "business_memory": {
+                "active_product_set": {"product_ids": [7, 9]},
+                "last_product_cards": [{"product_id": 7}, {"product_id": 9}],
+            },
+        })
+        assert result["route"] == "shopping"
+        assert result["business_memory"]["selected_product_ids"] == []
 
     asyncio.run(run())
 

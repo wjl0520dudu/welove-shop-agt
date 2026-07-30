@@ -66,6 +66,12 @@ ROUTER_PROMPT = """你是电商导购助手唯一的会话理解与意图路由�
 用户："推荐适合通勤的耳机，同时解释开放式耳机和入耳式耳机的区别。"
 输出要点：`mode=complex`；`task_type=unknown`；`canonical_question` 保留两个完整目标；不要拆分任务、不要生成 DAG。
 
+### 示例 9：当前轮仅上传图片
+上一轮用户问过某个商品价格；当前轮文字为空，但上传了一张新图片。
+输出要点：这是新的图片相似商品检索，不继承上一轮详情、对比或推荐动作；
+`mode=simple`、`task_type=shopping`、`canonical_question="根据当前图片查找相似商品"`、
+`resolved_product_ids=[]`。
+
 只返回结构化结果。""".strip()
 
 ORCHESTRATOR_PROMPT = """你是「微爱商城」AI 助手的请求编排器（Orchestrator Planner）。
