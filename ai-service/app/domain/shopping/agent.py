@@ -7,14 +7,14 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddleware
+from langchain.agents.middleware.tool_call_limit import ToolCallLimitMiddleware
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from app.infrastructure.persistence.memory import get_business_memory
 from app.domain.shopping.preferences import build_preference_questions
 from app.prompts.prompts import SHOPPING_AGENT_PROMPT
 from app.application.assistant.state import ShoppingAgentState
-from app.infrastructure.llm.middleware import build_summarization_middleware
 from app.infrastructure.errors import ErrorCode
 from app.domain.shopping.capabilities import (
     CompareCapability,
@@ -25,16 +25,11 @@ from app.domain.shopping.capabilities import (
 from app.domain.shopping.dispatcher import DispatchDecision, dispatch_shopping_capability
 from app.domain.shopping.high_level_tools import SHOPPING_HIGH_LEVEL_TOOLS
 from app.domain.shopping.schemas import ShoppingContext
+from app.domain.shopping.tool_guard import ShoppingToolGuardMiddleware
 
 # Phase 1a 关键变更：LLM 只面对 4 个高层 tool，底层 12 个工具全部退到 Capability 内部。
 # 见 shopping/high_level_tools.py 和 shopping/capabilities/*。
 _ALL_TOOLS = SHOPPING_HIGH_LEVEL_TOOLS
-
-# 保留 summarization middleware（长对话压缩）。
-# PreferenceLearningMiddleware 依然禁用 —— after_model 触发太密，代价高。
-_SHOPPING_MIDDLEWARE = [
-    build_summarization_middleware(),
-]
 
 logger = logging.getLogger("ai-service.shopping.agent")
 
@@ -62,39 +57,31 @@ class ShoppingAgent:
     def __init__(self, llm):
         self._llm = llm
 
-    def _build_system_prompt(self, business_memory: Dict[str, Any]) -> str:
-        """Return a domain-only prompt.
-
-        The Router has already expanded cross-turn references into the current
-        question and has bound any product set in ``business_memory`` for tools.
-        Do not expose raw history or product candidates to the Shopping LLM a
-        second time: that would recreate a competing context resolver.
-        """
-        return SHOPPING_AGENT_PROMPT
+    def _build_system_prompt(
+        self,
+        *,
+        selected_product_ids: List[int],
+        image_url: Optional[str],
+        input_mode: str,
+    ) -> str:
+        """Build a bounded, turn-local prompt for the Shopping Tool Agent."""
+        bound = ", ".join(str(product_id) for product_id in selected_product_ids) or "无"
+        image_note = "有；仅 recommend_products 可以使用" if image_url else "无"
+        return (
+            SHOPPING_AGENT_PROMPT
+            + "\n\n## 本轮 Router 已交付的执行边界\n"
+            + f"- 已绑定商品 ID：{bound}\n"
+            + f"- 图片：{image_note}\n"
+            + f"- 推荐输入模式：{input_mode}\n"
+            + "- 当前用户问题已经消除可解析的跨轮指代；不要再读取或猜测会话历史。"
+        )
 
     def _build_messages(
         self, question: str, messages: List[Dict[str, Any]]
     ) -> list:
-        """把 supervisor 传入的对话历史（dict）转成 langchain message 对象。"""
-        out: list = []
-        for m in messages or []:
-            if not isinstance(m, dict):
-                out.append(m)
-                continue
-            role = m.get("role", "")
-            content = m.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(str(c) for c in content)
-            content = str(content).strip()
-            if not content:
-                continue
-            if role == "user":
-                out.append(HumanMessage(content=content))
-            elif role == "assistant":
-                out.append(AIMessage(content=content))
-            elif role == "system":
-                out.append(SystemMessage(content=content))
-        return out
+        """ShoppingAgent receives the canonical current turn, never raw history."""
+        del messages
+        return [HumanMessage(content=(question or "").strip() or "请根据当前商品需求提供帮助。")]
 
     async def run(
         self,
@@ -103,8 +90,11 @@ class ShoppingAgent:
         messages: List[Dict[str, Any]],
         business_memory: Dict[str, Any],
         conversation_id: Optional[str] = None,
-        user_id: Optional[int] = None,
+        user_id: Optional[int | str] = None,
         jwt_token: Optional[str] = None,
+        selected_product_ids: Optional[List[int]] = None,
+        image_url: Optional[str] = None,
+        input_mode: str = "text",
         token_sink: Optional[TokenSink] = None,
     ) -> dict:
         """执行导购推荐。
@@ -121,41 +111,44 @@ class ShoppingAgent:
                 "error_code": ErrorCode.LLM_NOT_CONFIGURED,
             }
 
-        # 拿 Store memory + supervisor 传入的 business_memory 合并
-        store_memory = await get_business_memory(conversation_id, user_id)
-        effective_memory = {**store_memory, **business_memory} if business_memory else store_memory
+        effective_memory = _minimal_business_memory(
+            business_memory,
+            selected_product_ids=selected_product_ids,
+        )
+        bound_product_ids = list(effective_memory.get("selected_product_ids") or [])
+        normalised_input_mode = _normalise_input_mode(image_url, input_mode)
+        guard = ShoppingToolGuardMiddleware()
+        system_prompt = self._build_system_prompt(
+            selected_product_ids=bound_product_ids,
+            image_url=image_url,
+            input_mode=normalised_input_mode,
+        )
 
-        # High-certainty requests execute the real capability directly.  This is
-        # intentionally before create_agent: the model should not be allowed to
-        # freely choose a tool for an already deterministic business action.
-        decision = dispatch_shopping_capability(question, effective_memory)
-        if decision is not None:
-            return await self._run_dispatched_capability(
-                decision=decision,
-                question=question,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                jwt_token=jwt_token,
-                business_memory=effective_memory,
-                token_sink=token_sink,
-            )
-
-        system_prompt = self._build_system_prompt(effective_memory)
-
-        # create_agent 每次重建：system_prompt 依赖本次记忆快照。工具已单例。
+        # A new Agent instance makes its middleware cache request-scoped.  The
+        # LLM decides the high-level capability; Guard/middleware only enforce
+        # call boundaries and loop limits.
         agent = create_agent(
             model=self._llm,
             checkpointer=_shopping_checkpointer,
             system_prompt=system_prompt,
             tools=_ALL_TOOLS,
             state_schema=ShoppingAgentState,
-            middleware=_SHOPPING_MIDDLEWARE,
+            middleware=[
+                guard,
+                # A bounded global limit protects against malformed tool loops.
+                # The Guard still owns same-argument result reuse.
+                ToolCallLimitMiddleware(run_limit=3, exit_behavior="continue"),
+                ModelCallLimitMiddleware(run_limit=4, exit_behavior="end"),
+            ],
         )
 
         agent_messages = self._build_messages(question, messages)
 
         try:
-            # recursion_limit=15：4 个高层 tool 场景下 3-5 步足够，15 是安全上限。
+            # Most normal turns are select-tool → tool-result → answer.  Agent
+            # middleware contributes graph steps too, so 8 can reject that
+            # healthy three-step flow before its final model response.  The
+            # tool/model middleware still provides the real loop bounds.
             result = await agent.ainvoke(
                 {
                     "messages": agent_messages,
@@ -163,35 +156,41 @@ class ShoppingAgent:
                     "user_id": user_id,
                     "jwt_token": jwt_token,
                     "business_memory": effective_memory,
+                    "selected_product_ids": bound_product_ids,
+                    "image_url": image_url or "",
+                    "input_mode": normalised_input_mode,
                 },
                 config={
                     "configurable": {"thread_id": str(uuid4())},
-                    "recursion_limit": 15,
+                    "recursion_limit": 12,
                 },
             )
         except Exception as e:
             logger.exception("ShoppingAgent ainvoke failed")
-            # Store 兜底（可能 Capability 已经写过 last_product_cards）
-            try:
-                fallback_memory = await get_business_memory(conversation_id, user_id)
-                fallback_cards = fallback_memory.get("last_product_cards") or []
-            except Exception:  # noqa: BLE001
-                fallback_cards = []
+            fallback = await self._run_restricted_fallback(
+                question=question,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                jwt_token=jwt_token,
+                business_memory=effective_memory,
+                token_sink=token_sink,
+            )
+            if fallback is not None:
+                return fallback
             return {
-                "answer": (
-                    "我已经为你找到了几款商品，但整理推荐语时遇到点问题。"
-                    "你可以直接看下面的商品卡片，或者告诉我更具体的偏好我再帮你精选。"
-                    if fallback_cards
-                    else "导购 Agent 处理失败，请稍后再试。"
-                ),
-                "product_cards": fallback_cards,
+                "answer": "导购 Agent 处理失败，请稍后再试。",
+                "product_cards": [],
                 "task_type": "shopping",
                 "error": True,
                 "error_code": ErrorCode.SHOPPING_ERROR,
                 "message": str(e),
+                "dispatch_source": "none",
+                "tool_calls": guard.records,
             }
 
-        collected_tool_calls = _extract_tool_calls(result.get("messages", []))
+        collected_tool_calls = _extract_tool_calls(
+            result.get("messages", []), guard_records=guard.records,
+        )
 
         # ★ Phase 1a 关键变更：product_cards 优先从最近一次 ToolMessage 抽取，
         # 而不是无条件读 Store —— 避免"对比/详情"轮次误带上一轮推荐卡片。
@@ -200,8 +199,7 @@ class ShoppingAgent:
         if tool_result and "product_cards" in tool_result:
             product_cards = tool_result.get("product_cards") or []
         else:
-            fallback_memory = await get_business_memory(conversation_id, user_id)
-            product_cards = fallback_memory.get("last_product_cards") or []
+            product_cards = []
 
         # answer 从最后一条 AI 消息 content 提取
         answer = ""
@@ -213,13 +211,18 @@ class ShoppingAgent:
                     answer = content
                     break
 
-        try:
-            latest_memory = await get_business_memory(conversation_id, user_id)
-        except Exception:  # noqa: BLE001
-            latest_memory = effective_memory
         suggested_questions = build_preference_questions(
-            latest_memory.get("user_preferences") or {}
+            effective_memory.get("user_preferences") or {}
         )
+
+        action_to_capability = {
+            "recommend": "recommend",
+            "compare": "compare",
+            "detail": "detail",
+            "clarify": "clarify",
+        }
+        capability = action_to_capability.get(str((tool_result or {}).get("action") or ""))
+        dispatch_source = "agent_tool_loop" if collected_tool_calls else "none"
 
         return {
             "answer": answer or "暂时没能找到合适的商品，能再说详细一点吗？",
@@ -228,6 +231,9 @@ class ShoppingAgent:
             "sources": [],
             "tool_calls": collected_tool_calls,
             "suggested_questions": suggested_questions,
+            "capability": capability,
+            "dispatch_source": dispatch_source,
+            "model_call_count": _count_model_calls(result.get("messages", [])),
             "error": False,
         }
 
@@ -237,20 +243,21 @@ class ShoppingAgent:
         decision: DispatchDecision,
         question: str,
         conversation_id: Optional[str],
-        user_id: Optional[int],
+        user_id: Optional[int | str],
         jwt_token: Optional[str],
         business_memory: Dict[str, Any],
         token_sink: Optional[TokenSink] = None,
+        dispatch_source: str = "restricted_rule_fallback",
     ) -> dict:
-        """Execute one capability without an LLM tool-selection loop."""
+        """Execute a capability only after the Agent path has failed."""
         if decision.capability == "transaction_unsupported":
             return {
                 "answer": "当前导购助手支持商品推荐、对比和详情咨询；请在商品卡片或商品详情页完成加购、下单和支付。",
                 "task_type": "shopping",
                 "product_cards": [], "sources": [], "suggested_questions": [], "error": False,
                 "capability": decision.capability,
-                "dispatch_source": decision.source,
-                "tool_calls": [_dispatch_trace(decision, question, status="unsupported")],
+                "dispatch_source": dispatch_source,
+                "tool_calls": [_dispatch_trace(decision, question, status="unsupported", dispatch_source=dispatch_source)],
             }
 
         context = ShoppingContext(
@@ -270,10 +277,6 @@ class ShoppingAgent:
         else:
             payload = await UserShoppingContextCapability().run(context)
 
-        try:
-            latest_memory = await get_business_memory(conversation_id, user_id)
-        except Exception:  # noqa: BLE001
-            latest_memory = business_memory
         return {
             "answer": await _compose_capability_answer(
                 self._llm, decision.capability, question, payload,
@@ -282,17 +285,98 @@ class ShoppingAgent:
             "task_type": "shopping",
             "product_cards": payload.get("product_cards") or [],
             "sources": [],
-            "tool_calls": [_dispatch_trace(decision, question, status="completed")],
-            "suggested_questions": build_preference_questions(latest_memory.get("user_preferences") or {}),
+            "tool_calls": [_dispatch_trace(decision, question, status="completed", dispatch_source=dispatch_source)],
+            "suggested_questions": build_preference_questions(business_memory.get("user_preferences") or {}),
             "capability": decision.capability,
-            "dispatch_source": decision.source,
+            "dispatch_source": dispatch_source,
             "error": bool(payload.get("error", False)),
             "error_code": payload.get("error_code"),
             "message": payload.get("message"),
         }
 
+    async def _run_restricted_fallback(
+        self,
+        *,
+        question: str,
+        conversation_id: Optional[str],
+        user_id: Optional[int | str],
+        jwt_token: Optional[str],
+        business_memory: Dict[str, Any],
+        token_sink: Optional[TokenSink],
+    ) -> Optional[dict]:
+        """Use the legacy dispatcher only as an observable failure fallback.
 
-def _dispatch_trace(decision: DispatchDecision, question: str, *, status: str) -> dict:
+        This path is intentionally never reached before ``create_agent``.  The
+        dispatcher receives no historical cards/focused product, so it cannot
+        reintroduce a second cross-turn reference resolver.
+        """
+        decision = dispatch_shopping_capability(question, business_memory)
+        if decision is None:
+            return None
+        logger.warning(
+            "shopping restricted rule fallback capability=%s reason=%s",
+            decision.capability,
+            decision.reason,
+        )
+        return await self._run_dispatched_capability(
+            decision=decision,
+            question=question,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            jwt_token=jwt_token,
+            business_memory=business_memory,
+            token_sink=token_sink,
+            dispatch_source="restricted_rule_fallback",
+        )
+
+
+def _minimal_business_memory(
+    business_memory: Optional[Dict[str, Any]],
+    *,
+    selected_product_ids: Optional[List[int]],
+) -> Dict[str, Any]:
+    """Keep only execution-safe fields for a ShoppingAgent turn.
+
+    Historical cards and focused products remain available to Router/Preparation
+    but are deliberately excluded here.  This prevents a lower capability from
+    silently becoming another context resolver.
+    """
+    raw = dict(business_memory or {})
+    bound = selected_product_ids
+    if bound is None:
+        bound = raw.get("selected_product_ids") or []
+    normalised_ids: list[int] = []
+    for value in bound:
+        try:
+            product_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if product_id > 0 and product_id not in normalised_ids:
+            normalised_ids.append(product_id)
+    preferences = raw.get("user_preferences")
+    return {
+        "selected_product_ids": normalised_ids,
+        "user_preferences": dict(preferences) if isinstance(preferences, dict) else {},
+    }
+
+
+def _normalise_input_mode(image_url: Optional[str], requested: str) -> str:
+    if not image_url:
+        return "text"
+    return "image" if str(requested or "").lower() == "image" else "multimodal"
+
+
+def _count_model_calls(messages: list) -> int:
+    return sum(1 for message in messages or [] if getattr(message, "type", "") == "ai")
+
+
+def _dispatch_trace(
+    decision: DispatchDecision,
+    question: str,
+    *,
+    status: str,
+    dispatch_source: str,
+) -> dict:
     tool_by_capability = {
         "recommend": "recommend_products", "compare": "compare_products",
         "detail": "answer_product_detail", "user_context": "get_user_shopping_context",
@@ -301,7 +385,7 @@ def _dispatch_trace(decision: DispatchDecision, question: str, *, status: str) -
     name = tool_by_capability[decision.capability]
     return {"tool_name": name, "name": name, "input_params": {"query": question},
             "args": {"query": question}, "status": status,
-            "dispatch_source": decision.source, "dispatch_reason": decision.reason}
+            "dispatch_source": dispatch_source, "dispatch_reason": decision.reason}
 
 
 async def _compose_capability_answer(
@@ -413,8 +497,17 @@ def _emit_token(token_sink: TokenSink, content: str) -> None:
         logger.debug("shopping token sink unavailable", exc_info=True)
 
 
-def _extract_tool_calls(messages: list) -> List[Dict[str, Any]]:
+def _extract_tool_calls(
+    messages: list,
+    *,
+    guard_records: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """从 create_agent 的 result["messages"] 里抽取工具调用记录。"""
+    records_by_id = {
+        str(record.get("tool_call_id")): record
+        for record in (guard_records or [])
+        if record.get("tool_call_id")
+    }
     out: List[Dict[str, Any]] = []
     for m in messages or []:
         tcs = getattr(m, "tool_calls", None)
@@ -432,15 +525,31 @@ def _extract_tool_calls(messages: list) -> List[Dict[str, Any]]:
             if not name:
                 continue
             normalized_args = args if isinstance(args, dict) else {}
+            trace = records_by_id.get(str(call_id), {})
             out.append({
                 "tool_call_id": call_id,
                 "tool_name": name,
                 "input_params": normalized_args,
-                "status": "invoked",
+                "status": trace.get("status") or "invoked",
+                "capability": trace.get("capability"),
+                "dispatch_source": trace.get("dispatch_source") or "agent_tool_loop",
+                "args_hash": trace.get("args_hash"),
+                "input_mode": trace.get("input_mode"),
+                "duration_ms": trace.get("duration_ms"),
+                "deduplicated": bool(trace.get("deduplicated", False)),
+                "fallback_stage": trace.get("fallback_stage"),
+                "error_code": trace.get("error_code"),
                 # Backward-compatible aliases used by existing scripts/tests.
                 "name": name,
                 "args": normalized_args,
             })
+    # A middleware block can happen before the provider tool call is preserved
+    # in the final message list.  Keep it observable instead of silently
+    # dropping it from the trace.
+    seen_ids = {str(item.get("tool_call_id")) for item in out}
+    for record in guard_records or []:
+        if str(record.get("tool_call_id")) not in seen_ids:
+            out.append(dict(record))
     return out
 
 

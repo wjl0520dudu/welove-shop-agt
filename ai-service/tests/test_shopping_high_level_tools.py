@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -36,6 +36,22 @@ class TestToolCatalog:
             assert t.description
             assert len(t.description) > 30   # 有实质内容，让 LLM 有依据挑
 
+    def test_primary_tools_publish_closed_loop_operation_manuals(self):
+        """高层工具说明是 Agent 的固定执行手册，不应退化成只有一句用途。"""
+        primary_names = {
+            "recommend_products",
+            "compare_products",
+            "answer_product_detail",
+        }
+        for tool in SHOPPING_HIGH_LEVEL_TOOLS:
+            if tool.name not in primary_names:
+                continue
+            assert "固定执行闭环" in tool.description
+            assert "工具内部" in tool.description
+            assert "返回分支" in tool.description
+            assert "完成后" in tool.description
+            assert "最终输出" in tool.description
+
     def test_recommend_args_schema(self):
         """LLM 应该看到 query / limit，但不该看到 runtime。"""
         tool = next(t for t in SHOPPING_HIGH_LEVEL_TOOLS if t.name == "recommend_products")
@@ -48,52 +64,45 @@ class TestToolCatalog:
 
 
 class TestBuildShoppingContextFromRuntime:
-    def test_reads_state_and_memory(self):
+    def test_reads_only_router_injected_memory(self):
         runtime = MagicMock()
         runtime.state = {
             "conversation_id": "c1",
             "user_id": 42,
             "jwt_token": "tk",
             "run_id": "r1",
+            "selected_product_ids": [7, "9", "invalid", 7],
+            "image_url": "https://cdn.example.test/p.png",
+            "input_mode": "multimodal",
+            "business_memory": {
+                "last_product_cards": [{"product_id": 1}],
+                "last_focused_product": {"product_id": 1, "title": "A"},
+                "user_preferences": {"skin_type": "油皮"},
+            },
         }
-        mock_memory = {
-            "last_product_cards": [{"product_id": 1}],
-            "last_focused_product": {"product_id": 1, "title": "A"},
-            "user_preferences": {"skin_type": "油皮"},
-        }
-        with patch(
-            "app.domain.shopping.context.get_business_memory",
-            new=AsyncMock(return_value=mock_memory),
-        ):
-            ctx = asyncio.run(build_shopping_context_from_runtime(runtime))
+        ctx = asyncio.run(build_shopping_context_from_runtime(runtime))
         assert ctx.conversation_id == "c1"
         assert ctx.user_id == 42
         assert ctx.jwt_token == "tk"
         assert ctx.is_logged_in is True
-        assert ctx.last_product_cards == [{"product_id": 1}]
-        assert ctx.last_focused_product == {"product_id": 1, "title": "A"}
+        assert ctx.selected_product_ids == [7, 9]
+        assert ctx.last_product_cards == []
+        assert ctx.last_focused_product is None
         assert ctx.user_preferences == {"skin_type": "油皮"}
+        assert ctx.image_url == "https://cdn.example.test/p.png"
+        assert ctx.input_mode == "multimodal"
 
     def test_no_user_means_not_logged_in(self):
         runtime = MagicMock()
         runtime.state = {"conversation_id": "c1"}
-        with patch(
-            "app.domain.shopping.context.get_business_memory",
-            new=AsyncMock(return_value={}),
-        ):
-            ctx = asyncio.run(build_shopping_context_from_runtime(runtime))
+        ctx = asyncio.run(build_shopping_context_from_runtime(runtime))
         assert ctx.is_logged_in is False
         assert ctx.user_id is None
 
-    def test_memory_failure_falls_back_to_empty(self):
+    def test_malformed_injected_memory_falls_back_to_empty(self):
         runtime = MagicMock()
-        runtime.state = {"conversation_id": "c1", "user_id": 1}
-        with patch(
-            "app.domain.shopping.context.get_business_memory",
-            new=AsyncMock(side_effect=RuntimeError("store down")),
-        ):
-            ctx = asyncio.run(build_shopping_context_from_runtime(runtime))
-        # Store 挂了，链路不中断
+        runtime.state = {"conversation_id": "c1", "user_id": 1, "business_memory": "bad"}
+        ctx = asyncio.run(build_shopping_context_from_runtime(runtime))
         assert ctx.business_memory == {}
         assert ctx.last_product_cards == []
 

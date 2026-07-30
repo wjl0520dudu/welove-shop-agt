@@ -726,6 +726,7 @@ class AssistantGraph:
             "preference_tags": kwargs.get("preference_tags"),
             # 每轮都显式覆盖，避免 checkpointer 把上一轮图片/子任务带到本轮。
             "image_url": image_url or "",
+            "input_mode": "image" if image_url and not question.strip() else ("multimodal" if image_url else "text"),
             "active_subtask": {},
             "dependency_context": [],
             "orchestrator_plan_error": "",

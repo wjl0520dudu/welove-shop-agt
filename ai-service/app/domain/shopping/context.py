@@ -1,7 +1,8 @@
 """构造 ShoppingContext —— 每个高层 Tool 的第一步。
 
-把"从 ToolRuntime 拿 conv/user/jwt + 从 Store 拿 memory"这段样板集中在一处，
-Capability 内部只面对 ShoppingContext（BaseModel），不再直接摸 runtime.state。
+Router 已经完成跨轮上下文理解。本模块只从 ToolRuntime.state 组装最小
+Shopping 执行上下文，避免 Capability 再从 Store 读取历史商品卡并进行第二次
+指代消解。
 
 ## 为什么单独一个模块
 - 每个高层 Tool（recommend/compare/detail/user_context）都要做同样的事；
@@ -15,14 +16,13 @@ from typing import Any, Dict
 
 from langgraph.prebuilt import ToolRuntime
 
-from app.infrastructure.persistence.memory import get_business_memory
 from app.domain.shopping.schemas import ShoppingContext
 
 
 async def build_shopping_context_from_runtime(runtime: ToolRuntime) -> ShoppingContext:
-    """从 ToolRuntime.state + Store 一次组装出 ShoppingContext。
+    """从 ToolRuntime.state 组装 ShoppingContext。
 
-    Capability 只依赖 ShoppingContext，不再直接读 runtime.state / Store，
+    Capability 只依赖 ShoppingContext，不再直接读 runtime.state，
     单测时可以直接 mock 一个 ShoppingContext 传进去。
     """
     state: Dict[str, Any] = dict(runtime.state or {})
@@ -32,16 +32,14 @@ async def build_shopping_context_from_runtime(runtime: ToolRuntime) -> ShoppingC
     jwt_token = state.get("jwt_token")
     run_id = state.get("run_id")
 
-    try:
-        memory = await get_business_memory(conversation_id, user_id)
-    except Exception:  # noqa: BLE001 —— Store 不可用时降级为空 memory，链路继续
-        memory = {}
-    # DAG 后置任务会把前置任务的结构化商品结果放在 task-local memory 中。
-    # 显式注入优先于 Store，避免并发子任务对 last_product_cards 的覆盖顺序
-    # 影响依赖任务的比较/详情能力。
     injected_memory = state.get("business_memory")
-    if isinstance(injected_memory, dict):
-        memory = {**memory, **injected_memory}
+    memory = dict(injected_memory) if isinstance(injected_memory, dict) else {}
+    selected_ids = state.get("selected_product_ids")
+    if not isinstance(selected_ids, list):
+        selected_ids = memory.get("selected_product_ids") or []
+    input_mode = str(state.get("input_mode") or "text")
+    if input_mode not in {"text", "image", "multimodal"}:
+        input_mode = "text"
 
     return ShoppingContext(
         conversation_id=conversation_id,
@@ -50,8 +48,25 @@ async def build_shopping_context_from_runtime(runtime: ToolRuntime) -> ShoppingC
         run_id=run_id,
         is_logged_in=bool(user_id),
         business_memory=memory,
-        last_product_cards=list(memory.get("last_product_cards") or []),
-        selected_product_ids=list(memory.get("selected_product_ids") or []),
-        last_focused_product=memory.get("last_focused_product"),
+        # Historical cards/focus are intentionally not injected into a domain
+        # tool. Router has already turned any valid reference into these ids.
+        last_product_cards=[],
+        selected_product_ids=_normalise_selected_product_ids(selected_ids),
+        last_focused_product=None,
         user_preferences=dict(memory.get("user_preferences") or {}),
+        image_url=str(state.get("image_url") or "").strip() or None,
+        input_mode=input_mode,
     )
+
+
+def _normalise_selected_product_ids(values: Any) -> list[int]:
+    """Keep Router binding order while ignoring invalid and duplicate ids."""
+    ids: list[int] = []
+    for value in values if isinstance(values, list) else []:
+        try:
+            product_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if product_id > 0 and product_id not in ids:
+            ids.append(product_id)
+    return ids

@@ -57,6 +57,9 @@ class AssistantState(TypedDict):
     retrieved_contexts: NotRequired[list[str]]
     tool_calls: NotRequired[list[dict[str, Any]]]
     suggested_questions: NotRequired[list[str]]
+    capability: NotRequired[str]
+    dispatch_source: NotRequired[str]
+    model_call_count: NotRequired[int]
 
     # ── 编排元数据 ──
     run_id: NotRequired[str]
@@ -95,6 +98,11 @@ class ShoppingAgentState(AgentState):
     user_id: NotRequired[int | str]
     jwt_token: NotRequired[str]
     business_memory: NotRequired[dict[str, Any]]
+    # Router-owned binding and image scope.  Shopping tools may consume these
+    # values but must not infer a new binding from raw history.
+    selected_product_ids: NotRequired[list[int]]
+    image_url: NotRequired[str]
+    input_mode: NotRequired[str]
 
 
 class KnowledgeAgentState(AgentState):

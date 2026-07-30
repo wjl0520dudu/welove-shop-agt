@@ -54,14 +54,9 @@ class ShoppingRetriever:
 
     def _get_milvus_store(self):
         if self._milvus_store is None:
-            if config.SHOPPING_MULTIMODAL_USE_THREE_PATH_COLLECTION:
-                from app.infrastructure.vectorstores.product.vector_store_three_path import (
-                    get_product_milvus_store_three_path,
-                )
-                self._milvus_store = get_product_milvus_store_three_path()
-            else:
-                from app.infrastructure.vectorstores.product.vector_store import get_product_milvus_store
-                self._milvus_store = get_product_milvus_store()
+            from app.infrastructure.vectorstores.product.active_store import get_active_product_store
+
+            self._milvus_store = get_active_product_store()
         return self._milvus_store
 
     def _get_pg_store(self):

@@ -34,7 +34,8 @@ class ShoppingContext(BaseModel):
     run_id: Optional[str] = None
 
     is_logged_in: bool = False
-    # 会话级 + 用户级 memory 平铺后的整体视图（get_business_memory 的返回）
+    # Router 注入的最小业务快照。它不用于在 Shopping Capability 内二次
+    # 消解指代；跨轮商品选择只能使用 selected_product_ids。
     business_memory: Dict[str, Any] = Field(default_factory=dict)
 
     # 常用快捷字段，避免每个 Capability 都 memory.get(...)
@@ -42,6 +43,8 @@ class ShoppingContext(BaseModel):
     selected_product_ids: List[int] = Field(default_factory=list)
     last_focused_product: Optional[Dict[str, Any]] = None
     user_preferences: Dict[str, Any] = Field(default_factory=dict)
+    image_url: Optional[str] = None
+    input_mode: Literal["text", "image", "multimodal"] = "text"
 
 
 # ---- 购物需求（ShoppingNeed）--------------------------------------------
@@ -158,6 +161,21 @@ class RankedProduct(BaseModel):
     preference_conflicts: List[str] = Field(default_factory=list)
 
 
+class CandidateSet(BaseModel):
+    """One retrieval result contract for text, image and multimodal recommend.
+
+    Phase 2 only unifies candidate transport.  Semantic match verdicts such as
+    exact/alternative/reject intentionally remain a later Candidate Judge task.
+    """
+
+    input_mode: Literal["text", "image", "multimodal"] = "text"
+    candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    retrieval_channels: List[str] = Field(default_factory=list)
+    retrieval_counts: Dict[str, int] = Field(default_factory=dict)
+    query_text: str = ""
+    image_fingerprint: Optional[str] = None
+
+
 # ---- 三个高层 Tool 的返回契约 -------------------------------------------
 
 class RecommendToolResult(BaseModel):
@@ -171,6 +189,7 @@ class RecommendToolResult(BaseModel):
 
     action: Literal["recommend", "clarify", "empty"]
     need: Optional[ShoppingNeed] = None
+    candidate_set: Optional[CandidateSet] = None
     assumptions: List[str] = Field(default_factory=list)
     ranked_products: List[RankedProduct] = Field(default_factory=list)
     product_cards: List[Dict[str, Any]] = Field(default_factory=list)

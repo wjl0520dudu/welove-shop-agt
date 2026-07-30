@@ -125,7 +125,7 @@ class TestMultimodalRerank:
             {"product_id": 2, "title": "B", "image_url": "http://example.com/b.jpg"},
         ]
 
-        with patch("rag.multimodal_embeddings.TextReRank.call", side_effect=RuntimeError("boom")):
+        with patch("app.infrastructure.retrieval.multimodal_embeddings.TextReRank.call", side_effect=RuntimeError("boom")):
             out = client.multimodal_rerank("query", "http://example.com/q.jpg", docs, top_n=1)
 
         assert out == [docs[0]]
@@ -143,7 +143,7 @@ class TestMultimodalRerank:
             {"product_id": 2, "title": "B", "recall_sources": ["image"]},
         ]
 
-        with patch("rag.multimodal_embeddings.TextReRank.call", return_value=resp):
+        with patch("app.infrastructure.retrieval.multimodal_embeddings.TextReRank.call", return_value=resp):
             out = client.multimodal_rerank("query", None, docs, top_n=2)
 
         assert [item["product_id"] for item in out] == [2, 1]
@@ -155,7 +155,7 @@ class TestMultimodalRerank:
         """服务性错误（网络异常、超时等）→ 降级零向量，不抛异常。"""
         client = DashScopeMultimodalEmbeddings(api_key="test-key", image_dim=3, base_url="")
 
-        with patch("rag.multimodal_embeddings.MultiModalEmbedding.call", side_effect=RuntimeError("boom")):
+        with patch("app.infrastructure.retrieval.multimodal_embeddings.MultiModalEmbedding.call", side_effect=RuntimeError("boom")):
             assert client.embed_image("http://example.com/a.jpg") == [0.0, 0.0, 0.0]
 
     def test_image_embedding_image_error_raises(self):
@@ -170,7 +170,7 @@ class TestMultimodalRerank:
         fake_resp.code = "InvalidParameter"
         fake_resp.message = "Image URL or Base64 is invalid"
 
-        with patch("rag.multimodal_embeddings.MultiModalEmbedding.call", return_value=fake_resp):
+        with patch("app.infrastructure.retrieval.multimodal_embeddings.MultiModalEmbedding.call", return_value=fake_resp):
             import pytest
             with pytest.raises(MultimodalImageError) as exc:
                 client.embed_image("http://example.com/broken.jpg")
@@ -190,7 +190,7 @@ class TestMultimodalRerank:
         fake_resp.code = "InvalidURL"
         fake_resp.message = "invalid image url"
 
-        with patch("rag.multimodal_embeddings.MultiModalEmbedding.call", return_value=fake_resp):
+        with patch("app.infrastructure.retrieval.multimodal_embeddings.MultiModalEmbedding.call", return_value=fake_resp):
             import pytest
             with pytest.raises(MultimodalImageError):
                 client.embed_fusion("text", "http://example.com/broken.jpg")

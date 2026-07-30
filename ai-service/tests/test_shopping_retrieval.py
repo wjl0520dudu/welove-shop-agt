@@ -54,7 +54,10 @@ class TestBuildRetrievalPlan:
     def test_alias_category_is_normalized_before_filtering(self):
         plan = build_retrieval_plan(ShoppingNeed(category="抗初老精华"))
         assert plan.filters["category"] == "精华"
-        assert plan.hard_filters["category"] == "精华"
+        # Category narrows the first recall pass but is intentionally not a
+        # non-negotiable hard filter: a later semantic pass may recover a
+        # catalog naming mismatch without relaxing status/brand/budget.
+        assert "category" not in plan.hard_filters
 
     def test_unknown_category_remains_semantic_only(self):
         plan = build_retrieval_plan(ShoppingNeed(category="提神饮品"))

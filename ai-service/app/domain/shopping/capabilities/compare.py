@@ -17,10 +17,9 @@ build_comparison_rows + choose_best_by_focus
 CompareToolResult
 ```
 
-## 关键：resolve_products 走内部函数而非工具
-- 明确 product_ids → 直接用
-- query 里有"第二个/他们三/这三款" → 复用 tools.reference_tools 的 _resolve_ordinal / _resolve_plural
-- 都没有 + last_product_cards 有 → 默认用上轮全部
+## 商品绑定
+Compare 只接受 Router 已绑定的商品 ID。它不从 query、历史商品卡或
+focused product 中重新解析“第几个”“它们”等跨轮指代。
 """
 
 from __future__ import annotations
@@ -29,11 +28,6 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from app.domain.shopping.schemas import CompareToolResult, ShoppingContext
-from app.application.assistant.reference_tools import (
-    _resolve_ordinal,
-    _resolve_plural,
-    _resolve_pronominal,
-)
 from app.domain.shopping.tools.shopping_tools import (
     ProductFeatures,
     _cards_from_products,
@@ -74,84 +68,9 @@ async def _load_products_by_ids(product_ids: List[int]) -> List[Dict[str, Any]]:
     Phase 1b 起走 Milvus（商品数据在 product_mm_collection），
     跟 DetailCapability._load_product_detail_raw 保持同一数据源。
     """
-    if not product_ids:
-        return []
-    from app.infrastructure.vectorstores.product.vector_store import get_product_milvus_store
-    from pymilvus import Collection
+    from app.infrastructure.vectorstores.product.active_store import load_active_products_by_ids
 
-    try:
-        store = get_product_milvus_store()
-        collection = Collection(store.collection_name)
-        collection.load()
-        ids_expr = ", ".join(str(int(x)) for x in product_ids)
-        rows = collection.query(
-            expr=f"product_id in [{ids_expr}]",
-            output_fields=[
-                "product_id", "title", "brand", "image_url", "description",
-                "category", "sub_category", "tags",
-                "base_price", "rating", "sales_count", "review_count",
-            ],
-            limit=len(product_ids),
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning("Milvus query 商品主档失败 product_ids=%s", product_ids, exc_info=True)
-        return []
-
-    # 保持传入顺序
-    by_id: Dict[int, Dict[str, Any]] = {}
-    for r in rows:
-        pid = int(r.get("product_id") or 0)
-        base_price = float(r.get("base_price") or 0)
-        by_id[pid] = {
-            "product_id": pid,
-            "title": r.get("title") or "",
-            "brand": r.get("brand") or "",
-            "price": base_price,
-            "base_price": base_price,
-            "image_url": r.get("image_url") or "",
-            "description": r.get("description") or "",
-            "category": r.get("category") or "",
-            "sub_category": r.get("sub_category") or "",
-            "tags": r.get("tags") or "",
-            "rating": float(r.get("rating") or 0),
-            "sales_count": int(r.get("sales_count") or 0),
-            "review_count": int(r.get("review_count") or 0),
-        }
-    return [by_id[pid] for pid in product_ids if pid in by_id]
-
-
-def _resolve_products_from_query(
-    query: str,
-    ctx: ShoppingContext,
-) -> List[Dict[str, Any]]:
-    """query 有指代词时定位对比商品。
-
-    复用 tools.reference_tools 里的解析器。命中 plural / plural_compare
-    时用 matched_products 列表；命中 ordinal / pronominal 时用单商品。
-    """
-    if not ctx.last_product_cards:
-        return []
-
-    # 优先复数（"这三款/他们三"），复数直接给多个商品
-    plural = _resolve_plural(query, ctx.last_product_cards)
-    if plural and plural.get("matched_products"):
-        return list(plural["matched_products"])
-
-    # 序号 + 代词：单商品，凑不齐两个就返回空让上游 clarify
-    single: List[Dict[str, Any]] = []
-    ordinal = _resolve_ordinal(query, ctx.last_product_cards)
-    if ordinal and ordinal.get("matched_product"):
-        single.append(ordinal["matched_product"])
-    pronominal = _resolve_pronominal(query, ctx.last_focused_product, ctx.last_product_cards)
-    if pronominal and pronominal.get("matched_product"):
-        m = pronominal["matched_product"]
-        if not any(_same_product(m, p) for p in single):
-            single.append(m)
-    return single
-
-
-def _same_product(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    return (a.get("product_id") or a.get("id")) == (b.get("product_id") or b.get("id"))
+    return load_active_products_by_ids(product_ids)
 
 
 def _pick_best_by_focus(
@@ -201,31 +120,31 @@ class CompareCapability:
     ) -> CompareToolResult:
         trace: List[Dict[str, Any]] = []
 
-        # ── 1. resolve products ──
-        products: List[Dict[str, Any]] = []
-
-        requested_ids = product_ids or context.selected_product_ids
-        if requested_ids:
-            products = await _load_products_by_ids(requested_ids)
-            trace.append({"step": "resolve", "output": {"source": "selected_product_ids", "count": len(products)}})
-        else:
-            # 尝试从 query 里解析指代
-            resolved = _resolve_products_from_query(query, context)
-            if resolved and len(resolved) >= 2:
-                products = resolved
-                trace.append({"step": "resolve", "output": {"source": "reference", "count": len(products)}})
-            elif context.last_product_cards and len(context.last_product_cards) >= 2:
-                # 兜底：用上一轮推荐的全部（"帮我对比" 这种没指代但有上下文的）
-                products = list(context.last_product_cards)
-                trace.append({"step": "resolve", "output": {"source": "last_product_cards", "count": len(products)}})
-
-        if len(products) < 2:
+        # Router is the sole cross-turn resolver.  A caller may narrow the
+        # bound set, but must never introduce arbitrary ids or use a history
+        # fallback inside this Capability.
+        bound_ids = _normalise_product_ids(context.selected_product_ids)
+        requested_ids = _normalise_product_ids(product_ids) if product_ids else bound_ids
+        if not bound_ids or len(requested_ids) < 2 or any(product_id not in bound_ids for product_id in requested_ids):
             return CompareToolResult(
                 action="clarify",
                 clarify_question=(
                     "你想对比哪几款商品？可以告诉我商品名，"
                     "或者我先给你推荐几款再对比。"
                 ),
+                trace=trace,
+            )
+
+        products = await _load_products_by_ids(requested_ids)
+        trace.append({"step": "resolve", "output": {
+            "source": "router_bound_product_ids",
+            "requested_count": len(requested_ids),
+            "count": len(products),
+        }})
+        if len(products) < 2:
+            return CompareToolResult(
+                action="empty",
+                empty_reason="已确认的商品不存在或已下架，暂时无法完成对比。",
                 trace=trace,
             )
 
@@ -268,6 +187,18 @@ class CompareCapability:
             product_cards=cards,
             trace=trace,
         )
+
+
+def _normalise_product_ids(values: Optional[List[int]]) -> List[int]:
+    ids: List[int] = []
+    for value in values or []:
+        try:
+            product_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if product_id > 0 and product_id not in ids:
+            ids.append(product_id)
+    return ids
 
 
 def _explain_pick(best: Dict[str, Any], focus: str) -> str:

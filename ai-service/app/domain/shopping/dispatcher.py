@@ -1,9 +1,9 @@
-"""Deterministic-first dispatcher for shopping capabilities.
+"""Restricted failure fallback for Shopping capabilities.
 
-The dispatcher owns *capability* choice only.  Recommendation need parsing,
-product resolution and answer facts remain inside their existing capabilities.
-Ambiguous requests deliberately return ``None`` so ``ShoppingAgent`` can use
-its structured LLM/tool-agent fallback.
+Normal requests are decided by ``ShoppingAgent(create_agent)``.  This module
+is intentionally retained only for a model/tool-loop failure after the Agent
+path has already been attempted.  It must not inspect history or resolve
+cross-turn product references.
 """
 from __future__ import annotations
 
@@ -41,9 +41,7 @@ def dispatch_shopping_capability(
 ) -> DispatchDecision | None:
     """Return only high-certainty choices; ambiguous requests remain LLM-owned."""
     text = (question or "").strip()
-    mem = memory or {}
-    cards = list(mem.get("last_product_cards") or [])
-    focused = bool(mem.get("last_focused_product"))
+    del memory
 
     if _TRANSACTION_RE.search(text):
         return DispatchDecision("transaction_unsupported", 0.99, reason="explicit transaction request")
@@ -51,11 +49,10 @@ def dispatch_shopping_capability(
         return DispatchDecision("user_context", 0.95, reason="explicit user shopping context request")
     if _COMPARE_RE.search(text):
         return DispatchDecision("compare", 0.96, reason="explicit comparison expression")
-    # Detail-like words are only deterministic with a referable product context.
-    # A query-level "{name}的{attribute}" pattern also counts as an explicit
-    # product reference, enabling first-turn detail dispatch.
-    if _DETAIL_RE.search(text) and (cards or focused or _PRODUCT_ATTR_IN_QUERY.search(text)):
-        return DispatchDecision("detail", 0.95, reason="detail expression with product memory or query-level product reference")
+    # Only a query-local product attribute can be a detail fallback.  Generic
+    # “它多少钱” must remain unresolved rather than consuming history.
+    if _DETAIL_RE.search(text) and _PRODUCT_ATTR_IN_QUERY.search(text):
+        return DispatchDecision("detail", 0.95, reason="explicit query-level product attribute")
     if _RECOMMEND_RE.search(text):
         return DispatchDecision("recommend", 0.94, reason="explicit product discovery/recommendation expression")
     return None

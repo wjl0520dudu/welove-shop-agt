@@ -26,14 +26,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from app.infrastructure.persistence.memory import remember_focused_product
 from app.domain.shopping.cards import build_product_card_from_detail
 from app.domain.shopping.schemas import DetailToolResult, ShoppingContext
-from app.application.assistant.reference_tools import (
-    _resolve_implicit,
-    _resolve_ordinal,
-    _resolve_pronominal,
-)
 from app.domain.shopping.tools.shopping_tools import _extract_product_features
 
 logger = logging.getLogger("ai-service.shopping.detail")
@@ -61,53 +55,24 @@ def _resolve_product_id(
     product_id: Optional[int],
     ctx: ShoppingContext,
 ) -> Optional[int]:
-    """从四种来源定位 product_id：
-    1. 显式 product_id 参数
-    2. query 中的指代（第二个/刚才那个/它）
-    3. last_focused_product 兜底
-    4. last_product_cards 只有一张卡 → 就是它（用户"有其他色号吗"）
-    """
-    if product_id:
-        return int(product_id)
+    """Return a Router-bound product id and never parse history locally."""
+    del query  # Router already resolves cross-turn references before this tool.
+    bound_ids: list[int] = []
+    for value in ctx.selected_product_ids:
+        try:
+            bound_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if bound_id > 0 and bound_id not in bound_ids:
+            bound_ids.append(bound_id)
 
-    if len(ctx.selected_product_ids) == 1:
-        return int(ctx.selected_product_ids[0])
-
-    if ctx.last_product_cards:
-        # 序号
-        r = _resolve_ordinal(query, ctx.last_product_cards)
-        if r and r.get("matched_product"):
-            pid = r["matched_product"].get("product_id")
-            if pid:
-                return int(pid)
-
-        # 代词
-        r = _resolve_pronominal(query, ctx.last_focused_product, ctx.last_product_cards)
-        if r and r.get("matched_product"):
-            pid = r["matched_product"].get("product_id")
-            if pid:
-                return int(pid)
-
-    # 隐式："多少钱/有货吗" 指向 last_focused_product
-    r = _resolve_implicit(query, ctx.last_focused_product)
-    if r and r.get("matched_product"):
-        pid = r["matched_product"].get("product_id")
-        if pid:
-            return int(pid)
-
-    # 单一 focused_product 兜底
-    if ctx.last_focused_product:
-        pid = ctx.last_focused_product.get("product_id")
-        if pid:
-            return int(pid)
-
-    # 上一轮只有 1 张卡：追问必然指向它
-    if len(ctx.last_product_cards) == 1:
-        pid = ctx.last_product_cards[0].get("product_id")
-        if pid:
-            return int(pid)
-
-    return None
+    if product_id is not None:
+        try:
+            requested = int(product_id)
+        except (TypeError, ValueError):
+            return None
+        return requested if requested in bound_ids else None
+    return bound_ids[0] if len(bound_ids) == 1 else None
 
 
 async def _load_product_detail_raw(product_id: int) -> Dict[str, Any]:
@@ -121,7 +86,9 @@ async def _load_product_detail_raw(product_id: int) -> Dict[str, Any]:
       PG 里没这个商品的 SKU 就返回空列表 —— 上层根据 facts["skus"] 是否为空决定
       是否报"暂无 SKU"。
     """
-    from app.infrastructure.vectorstores.product.vector_store import get_product_milvus_store
+    from app.infrastructure.vectorstores.product.active_store import (
+        get_active_product_store as get_product_milvus_store,
+    )
 
     # ── 1. 从 Milvus 拿主档 ──
     try:
@@ -268,7 +235,7 @@ class DetailCapability:
             )
 
         product = await _load_product_detail_raw(pid)
-        if not product:
+        if not product or (product.get("status") is not None and int(product.get("status") or 0) != 1):
             return DetailToolResult(
                 action="empty",
                 empty_reason=f"商品 {pid} 不存在或已下架。",
@@ -284,8 +251,10 @@ class DetailCapability:
         else:
             facts = _build_facts(product, focus)
 
+        # Product focus is intentionally not persisted here.  Cross-turn
+        # product references are resolved once by the Router from the rendered
+        # card set, rather than reconstructed by a lower Shopping capability.
         card = build_product_card_from_detail(product)
-        await remember_focused_product(context.conversation_id, context.user_id, card)
 
         return DetailToolResult(
             action="detail",

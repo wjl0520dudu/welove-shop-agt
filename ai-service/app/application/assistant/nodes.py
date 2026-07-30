@@ -263,49 +263,22 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         return _knowledge_holder["agent"]
 
     async def shopping_node(state: AssistantState) -> dict:
-        # 多模态分支：state 里有 image_url 时走图文多模态检索，
-        # 不进 ShoppingAgent 的 LLM tool loop（文本 LLM 看不到图，让它决定
-        # 要不要调多模态工具没意义）
+        # Router controls image scope.  Text, pure-image and image+text turns
+        # all enter the same ShoppingAgent; only recommend_products chooses a
+        # different *retrieval* mode internally.
         active_task = state.get("active_subtask") or {}
         image_allowed = not active_task or bool(active_task.get("use_image"))
         image_url = (state.get("image_url") or "").strip() if image_allowed else ""
+        question = str(state.get("question") or "").strip()
+        if image_url and not question:
+            question = "根据当前图片查找相似商品"
+        input_mode = "text"
         if image_url:
-            try:
-                persisted_memory = await get_business_memory(
-                    state.get("conversation_id"), state.get("user_id"),
-                )
-            except Exception:  # noqa: BLE001
-                persisted_memory = {}
-            injected_memory = state.get("business_memory") or {}
-            business_memory = {**persisted_memory, **injected_memory}
-            result = await _multimodal_shopping(
-                llm=llm,
-                query_text=state.get("question", ""),
-                image_url=image_url,
-                top_k=5,
-                business_memory=business_memory,
-                token_sink=_graph_token_sink,
-            )
-            # Make image retrieval behave exactly like text recommendation on
-            # the next turn.  Without this, "这两款对比" falls back to stale
-            # cards produced by an earlier text-only recommendation.
-            if result.get("product_cards"):
-                try:
-                    await remember_product_cards(
-                        state.get("conversation_id"), state.get("user_id"),
-                        result["product_cards"],
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning("multimodal product cards memory write failed", exc_info=True)
-            return _merge_result(
-                result,
-                task_type="shopping",
-                extra={"messages": [AIMessage(content=result.get("answer", ""))]},
-            )
+            input_mode = "image" if state.get("input_mode") == "image" else "multimodal"
 
         try:
             result = await get_shopping().run(
-                question=state.get("question", ""),
+                question=question,
                 # The Router already resolved cross-turn context and rewrote the
                 # question.  Do not hand raw history to the domain tool loop and
                 # accidentally create a second, competing reference resolver.
@@ -314,6 +287,9 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 conversation_id=state.get("conversation_id"),
                 user_id=state.get("user_id"),
                 jwt_token=state.get("jwt_token"),
+                selected_product_ids=list((state.get("business_memory") or {}).get("selected_product_ids") or []),
+                image_url=image_url or None,
+                input_mode=input_mode,
                 token_sink=_graph_token_sink,
             )
         except Exception as e:
@@ -454,6 +430,9 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             "sub_questions": state.get("sub_questions", []),
             "sub_results": state.get("sub_results", []),
             "task_levels": state.get("task_levels", []),
+            "capability": state.get("capability"),
+            "dispatch_source": state.get("dispatch_source"),
+            "model_call_count": state.get("model_call_count"),
             "error": bool(state.get("error", False)),
             "error_code": state.get("error_code"),
             "message": state.get("message"),
@@ -539,8 +518,8 @@ def _merge_result(result: Dict[str, Any], *, task_type: str,
                   extra: Dict[str, Any] = None) -> dict:
     merged: Dict[str, Any] = {}
     for key in (
-        "answer", "product_cards", "sources", "tool_calls", "suggested_questions", "retrieved_contexts",
-        "capability", "dispatch_source", "hard_constraint_violation", "error", "error_code", "message",
+            "answer", "product_cards", "sources", "tool_calls", "suggested_questions", "retrieved_contexts",
+        "capability", "dispatch_source", "model_call_count", "hard_constraint_violation", "error", "error_code", "message",
     ):
         if key in result:
             merged[key] = result[key]

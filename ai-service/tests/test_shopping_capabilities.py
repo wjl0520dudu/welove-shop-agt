@@ -56,9 +56,9 @@ class TestExtractFocus:
 # ---- Compare 主流程 -------------------------------------------------------
 
 class TestCompareCapability:
-    def test_clarify_when_only_one_product(self):
+    def test_clarify_when_router_binds_only_one_product(self):
         cap = CompareCapability()
-        ctx = _ctx(last_product_cards=[{"product_id": 1, "title": "只有一个"}])
+        ctx = _ctx(selected_product_ids=[1])
 
         with patch(
             "app.domain.shopping.capabilities.compare._extract_product_features",
@@ -67,20 +67,26 @@ class TestCompareCapability:
             result = asyncio.run(cap.run(query="哪个好", context=ctx))
         assert result.action == "clarify"
 
-    def test_compare_two_from_last_cards(self):
-        """last_product_cards 有 2 个 + query 无指代 → 直接用它们对比。"""
+    def test_compare_uses_router_bound_ids_not_history(self):
         cards = [
             {"product_id": 1, "title": "A", "price": 100, "rating": 4.5, "sales_count": 500},
             {"product_id": 2, "title": "B", "price": 200, "rating": 4.8, "sales_count": 300},
         ]
-        ctx = _ctx(last_product_cards=cards)
+        ctx = _ctx(last_product_cards=cards, selected_product_ids=[1, 2])
         cap = CompareCapability()
 
         features = {
             1: ProductFeatures(core_ingredients=["A 成分"], suitable_skin=["油皮"]),
             2: ProductFeatures(core_ingredients=["B 成分"], suitable_skin=["干皮"]),
         }
+        rows = [
+            {"product_id": 1, "title": "A", "price": 100, "rating": 4.5, "sales_count": 500},
+            {"product_id": 2, "title": "B", "price": 200, "rating": 4.8, "sales_count": 300},
+        ]
         with patch(
+            "app.domain.shopping.capabilities.compare._load_products_by_ids",
+            new=AsyncMock(return_value=rows),
+        ), patch(
             "app.domain.shopping.capabilities.compare._extract_product_features",
             new=AsyncMock(return_value=features),
         ):
@@ -126,10 +132,13 @@ class TestCompareCapability:
             {"product_id": 1, "title": "贵", "price": 500, "rating": 4.9, "sales_count": 100},
             {"product_id": 2, "title": "便宜", "price": 50, "rating": 4.0, "sales_count": 100},
         ]
-        ctx = _ctx(last_product_cards=cards)
+        ctx = _ctx(last_product_cards=cards, selected_product_ids=[1, 2])
         cap = CompareCapability()
 
         with patch(
+            "app.domain.shopping.capabilities.compare._load_products_by_ids",
+            new=AsyncMock(return_value=cards),
+        ), patch(
             "app.domain.shopping.capabilities.compare._extract_product_features",
             new=AsyncMock(return_value={}),
         ):
@@ -154,7 +163,7 @@ class TestCompareCapability:
         ):
             result = asyncio.run(cap.run(
                 query="对比一下",
-                context=_ctx(),
+                context=_ctx(selected_product_ids=[10, 11]),
                 product_ids=[10, 11],
             ))
         assert result.action == "compare"
@@ -169,8 +178,7 @@ class TestDetailCapability:
         result = asyncio.run(cap.run(query="多少钱", context=_ctx()))
         assert result.action == "clarify"
 
-    def test_resolve_ordinal_from_history(self):
-        """query 有'第二个' + last_product_cards 有 → 定位到第 2 个。"""
+    def test_does_not_resolve_ordinal_from_history(self):
         cards = [
             {"product_id": 1, "title": "A"},
             {"product_id": 2, "title": "B"},
@@ -178,24 +186,13 @@ class TestDetailCapability:
         ]
         ctx = _ctx(last_product_cards=cards)
 
-        product_detail = {
-            "product_id": 2, "title": "B", "price": 100,
-            "brand": "Y", "rating": 4.5, "sales_count": 300,
-            "description": "aaa", "tags": "tagB", "skus": [],
-        }
         with patch(
             "app.domain.shopping.capabilities.detail._load_product_detail_raw",
-            new=AsyncMock(return_value=product_detail),
-        ), patch(
-            "app.domain.shopping.capabilities.detail.remember_focused_product",
             new=AsyncMock(),
-        ):
+        ) as load:
             result = asyncio.run(DetailCapability().run(query="第二个多少钱", context=ctx))
-        assert result.action == "detail"
-        assert result.product["product_id"] == 2
-        assert result.focus == "price"
-        # facts.price 应该来自主档
-        assert result.facts["price"] == 100
+        assert result.action == "clarify"
+        load.assert_not_awaited()
 
     def test_focus_sku_returns_sku_list(self):
         cards = [{"product_id": 1, "title": "A"}]
@@ -207,12 +204,9 @@ class TestDetailCapability:
         with patch(
             "app.domain.shopping.capabilities.detail._load_product_detail_raw",
             new=AsyncMock(return_value=product),
-        ), patch(
-            "app.domain.shopping.capabilities.detail.remember_focused_product",
-            new=AsyncMock(),
         ):
             result = asyncio.run(DetailCapability().run(
-                query="有其他色号吗", context=_ctx(last_product_cards=cards),
+                query="有其他色号吗", context=_ctx(last_product_cards=cards, selected_product_ids=[1]),
             ))
         assert result.focus == "sku"
         assert result.facts["sku_count"] == 2
@@ -228,12 +222,9 @@ class TestDetailCapability:
         ), patch(
             "app.domain.shopping.capabilities.detail._extract_product_features",
             new=AsyncMock(return_value=features),
-        ), patch(
-            "app.domain.shopping.capabilities.detail.remember_focused_product",
-            new=AsyncMock(),
         ):
             result = asyncio.run(DetailCapability().run(
-                query="含什么成分", context=_ctx(),
+                query="含什么成分", context=_ctx(selected_product_ids=[5]),
                 product_id=5,
             ))
         assert result.focus == "ingredients"
@@ -246,7 +237,7 @@ class TestDetailCapability:
             new=AsyncMock(return_value={}),
         ):
             result = asyncio.run(DetailCapability().run(
-                query="多少钱", context=_ctx(),
+                query="多少钱", context=_ctx(selected_product_ids=[999]),
                 product_id=999,
             ))
         assert result.action == "empty"

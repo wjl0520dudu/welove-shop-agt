@@ -23,12 +23,13 @@ persist last_product_cards
 RecommendToolResult(action=recommend|clarify|empty)
 ```
 
-## WRONG_CAPABILITY 兜底
-如果 query 明显更像"对比"或"追问详情"，直接返回错误结果让 LLM 改调正确工具。
+跨轮指代和 Shopping capability 选择由 Router / ShoppingAgent 完成。
+RecommendCapability 只负责执行已选择的推荐任务。
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -36,16 +37,16 @@ from app.infrastructure.persistence.memory import (
     clear_pending_shopping_need,
     get_pending_shopping_need,
     remember_pending_shopping_need,
-    remember_preference_facts,
     remember_product_cards,
 )
 from app.infrastructure.llm.llm import get_llm
 from app.domain.shopping.cards import build_product_cards
 from app.domain.shopping.ranking import ProductRanker
-from app.domain.shopping.personalization import apply_user_preferences, facts_from_shopping_need
 from app.domain.shopping.retrieval import ShoppingRetriever, build_retrieval_plan
 from app.domain.shopping.schemas import (
+    CandidateSet,
     PendingShoppingNeed,
+    RankedProduct,
     RecommendToolResult,
     ShoppingContext,
     ShoppingNeed,
@@ -189,28 +190,6 @@ def build_clarify_question(need: ShoppingNeed, missing: List[str]) -> str:
     return "可以再补充一下你的预算或使用场景吗？"
 
 
-# ---- WRONG_CAPABILITY 兜底 ----------------------------------------------
-
-_COMPARE_MARKERS = ("对比", "比较", "哪个好", "哪款好", "比一下", "哪个更")
-_DETAIL_MARKERS = ("多少钱", "价格", "有货", "库存", "什么规格", "什么色号", "适合我")
-
-
-def _looks_like_compare(query: str, ctx: ShoppingContext) -> bool:
-    """有对比意图 + 上一轮有 2 个以上商品 → 应该走 compare_products。"""
-    return (
-        any(m in query for m in _COMPARE_MARKERS)
-        and len(ctx.last_product_cards) >= 2
-    )
-
-
-def _looks_like_detail(query: str, ctx: ShoppingContext) -> bool:
-    """追问价格/库存/规格 + 上一轮有关注商品 → 应该走 answer_product_detail。"""
-    return bool(
-        any(m in query for m in _DETAIL_MARKERS)
-        and (ctx.last_focused_product or ctx.last_product_cards)
-    )
-
-
 # ---- 主类 ---------------------------------------------------------------
 
 
@@ -232,26 +211,6 @@ class RecommendCapability:
         """主入口 —— 见文件头 Pipeline 图。"""
         trace: List[Dict[str, Any]] = []
 
-        # ── WRONG_CAPABILITY 自检 ──
-        if _looks_like_compare(query, context):
-            return RecommendToolResult(
-                action="empty",
-                empty_reason=(
-                    "用户问题更像商品对比，请调 compare_products 工具。"
-                    "（WRONG_CAPABILITY: suggested_tool=compare_products）"
-                ),
-                trace=[{"step": "wrong_capability_check", "output": "looks_like_compare"}],
-            )
-        if _looks_like_detail(query, context):
-            return RecommendToolResult(
-                action="empty",
-                empty_reason=(
-                    "用户问题更像追问某个商品的详情，请调 answer_product_detail 工具。"
-                    "（WRONG_CAPABILITY: suggested_tool=answer_product_detail）"
-                ),
-                trace=[{"step": "wrong_capability_check", "output": "looks_like_detail"}],
-            )
-
         # ── 1. 读 pending + parse 当前 query ──
         pending = await get_pending_shopping_need(context.conversation_id, context.user_id)
         current_need = await _parse_need_llm(query, pending)
@@ -268,29 +227,19 @@ class RecommendCapability:
             need = current_need
         trace.append({"step": "merge_pending_need", "output": need.model_dump()})
 
-        # ── 2b. 长期偏好只补空字段并参与软重排；本轮明确条件始终优先 ──
-        need, personalization_trace = apply_user_preferences(
-            need, context.user_preferences,
-        )
-        trace.append({"step": "apply_user_preferences", "output": personalization_trace})
-
-        # 复用本次 ShoppingNeed 解析结果学习偏好，不增加额外 LLM 调用。
-        learned_facts = facts_from_shopping_need(
-            current_need,
-            query=query,
-            category=need.category,
-        )
-        if learned_facts:
-            await remember_preference_facts(
-                context.conversation_id, context.user_id, learned_facts,
-            )
-            trace.append({"step": "learn_preference_facts", "output": {
-                "fact_count": len(learned_facts),
-                "aspects": [fact.get("aspect") for fact in learned_facts],
-            }})
+        # Long-term behaviour facts and automatic preference learning are
+        # deliberately disabled.  A Shopping turn follows the user's current
+        # request; basic profile tags stay available to later candidate judging
+        # work but must not silently rewrite this retrieval need.
+        trace.append({"step": "preference_scope", "output": {
+            "automatic_learning": "disabled",
+            "soft_rerank": "not_applied",
+        }})
 
         # ── 3. clarify_gate ──
-        missing = get_missing_required_slots(need)
+        # A pure image can establish the product type through image retrieval;
+        # do not reject it merely because text need parsing has no category.
+        missing = [] if context.image_url else get_missing_required_slots(need)
         if missing:
             clarify_q = build_clarify_question(need, missing)
             turn_count = int((pending or {}).get("turn_count") or 0) + 1
@@ -314,7 +263,16 @@ class RecommendCapability:
         # 已经补齐了，清 pending
         await clear_pending_shopping_need(context.conversation_id, context.user_id)
 
-        # ── 4. 检索 ──
+        if context.image_url:
+            return await self._run_image_recommendation(
+                query=query,
+                need=need,
+                context=context,
+                limit=limit,
+                trace=trace,
+            )
+
+        # ── 4. 文本检索 ──
         # top_k = limit（rerank 从 initial_top_k=20 里挑），Phase 1b 起启用 Milvus hybrid + rerank
         plan = build_retrieval_plan(need, top_k=limit)
         candidates, recall_trace = await self.retriever.retrieve(plan, need)
@@ -324,10 +282,19 @@ class RecommendCapability:
             "candidates_count": len(candidates),
         }})
 
+        candidate_set = CandidateSet(
+            input_mode="text",
+            candidates=[dict(candidate) for candidate in candidates],
+            retrieval_channels=["bm25", "dense"],
+            retrieval_counts={"after_recall": len(candidates)},
+            query_text=query,
+        )
+
         if not candidates:
             return RecommendToolResult(
                 action="empty",
                 need=need,
+                candidate_set=candidate_set,
                 empty_reason=(
                     f"没找到匹配「{need.category or query}」的商品，"
                     "试试放宽预算、去掉部分偏好，或换一个更通用的品类关键词。"
@@ -350,7 +317,137 @@ class RecommendCapability:
         return RecommendToolResult(
             action="recommend",
             need=need,
+            candidate_set=candidate_set,
             ranked_products=ranked[:limit],
             product_cards=cards,
             trace=trace,
         )
+
+    async def _run_image_recommendation(
+        self,
+        *,
+        query: str,
+        need: ShoppingNeed,
+        context: ShoppingContext,
+        limit: int,
+        trace: List[Dict[str, Any]],
+    ) -> RecommendToolResult:
+        """Use the existing image retrieval stack behind the same high-level tool.
+
+        The Agent selects ``recommend_products`` once.  This method chooses the
+        low-level retrieval path from Router-provided input mode; the LLM never
+        needs to choose a vector store or an image embedding tool.
+        """
+        from app.domain.shopping.multimodal_search import (
+            enforce_explicit_product_filters,
+            extract_explicit_product_filters,
+            search_multimodal_v1,
+        )
+
+        input_mode = "image" if context.input_mode == "image" else "multimodal"
+        retrieval_query = "" if input_mode == "image" else query
+        filters = extract_explicit_product_filters(retrieval_query)
+        retrieval_limit = max(int(limit or 3) * 2, int(limit or 3), 1)
+        try:
+            candidates = await search_multimodal_v1(
+                query_text=retrieval_query,
+                query_image_url=str(context.image_url),
+                top_k=retrieval_limit,
+                filters=filters,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("multimodal recommend retrieval failed")
+            return RecommendToolResult(
+                action="empty",
+                need=need,
+                candidate_set=CandidateSet(
+                    input_mode=input_mode,
+                    query_text=query,
+                    image_fingerprint=_image_fingerprint(context.image_url),
+                ),
+                empty_reason="图片检索暂时不可用，请稍后再试。",
+                trace=[*trace, {"step": "multimodal_retrieval", "output": "error"}],
+            )
+
+        # search_multimodal_v1 already applies status / configured retrieval
+        # filters.  Keep its factual result shaping here and defer semantic
+        # exact/alternative judgement to Phase 3.
+        filtered = enforce_explicit_product_filters(list(candidates or []), filters)
+        channels = (
+            ["image_vector"] if input_mode == "image"
+            else ["dense", "bm25", "image_vector", "vl_rerank"]
+        )
+        candidate_set = CandidateSet(
+            input_mode=input_mode,
+            candidates=[dict(candidate) for candidate in filtered],
+            retrieval_channels=channels,
+            retrieval_counts={
+                "after_recall": len(candidates or []),
+                "after_filters": len(filtered),
+            },
+            query_text=query,
+            image_fingerprint=_image_fingerprint(context.image_url),
+        )
+        trace.append({"step": "multimodal_retrieval", "output": {
+            "input_mode": input_mode,
+            "candidate_count": len(filtered),
+            "channels": channels,
+        }})
+        if not filtered:
+            return RecommendToolResult(
+                action="empty",
+                need=need,
+                candidate_set=candidate_set,
+                empty_reason="没有找到与图片和当前需求相近的在售商品。",
+                trace=trace,
+            )
+
+        ranked = [_ranked_product_from_multimodal(candidate, input_mode) for candidate in filtered]
+        cards = build_product_cards(ranked, limit=limit)
+        if cards:
+            await remember_product_cards(context.conversation_id, context.user_id, cards)
+        return RecommendToolResult(
+            action="recommend",
+            need=need,
+            candidate_set=candidate_set,
+            ranked_products=ranked[:limit],
+            product_cards=cards,
+            trace=trace,
+        )
+
+
+def _image_fingerprint(image_url: Optional[str]) -> Optional[str]:
+    if not image_url:
+        return None
+    return hashlib.sha256(str(image_url).encode("utf-8")).hexdigest()[:16]
+
+
+def _as_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ranked_product_from_multimodal(candidate: Dict[str, Any], input_mode: str) -> RankedProduct:
+    sources = list(candidate.get("recall_sources") or [])
+    if not sources:
+        sources = ["image_vector" if input_mode == "image" else "multimodal"]
+    return RankedProduct(
+        product_id=int(candidate.get("product_id") or candidate.get("id") or 0),
+        title=str(candidate.get("title") or ""),
+        brand=str(candidate.get("brand") or ""),
+        price=_as_float(candidate.get("price") or candidate.get("base_price")),
+        base_price=_as_float(candidate.get("base_price") or candidate.get("price")),
+        image_url=str(candidate.get("image_url") or ""),
+        rating=_as_float(candidate.get("rating")),
+        review_count=int(candidate.get("review_count") or 0),
+        sales_count=int(candidate.get("sales_count") or 0),
+        category=str(candidate.get("category") or ""),
+        sub_category=str(candidate.get("sub_category") or ""),
+        tags=str(candidate.get("tags") or ""),
+        description=str(candidate.get("description") or ""),
+        score=_as_float(candidate.get("score") or candidate.get("rrf_score")),
+        recall_sources=sources,
+        rank_reason=["图片相似检索命中" if input_mode == "image" else "图文检索命中"],
+    )
