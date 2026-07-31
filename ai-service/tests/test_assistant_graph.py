@@ -161,3 +161,26 @@ def test_unknown_node_uses_contextual_product_clarification():
         assert result["answer"] == "当前只有 2 款商品可供查询，请问你是想查询当前这 2 款吗？"
 
     asyncio.run(run())
+
+
+def test_unknown_node_uses_llm_to_naturally_express_fallback():
+    from app.application.assistant.nodes import make_nodes
+
+    class FakeChunk:
+        content = "你可以先告诉我想购买的商品品类和使用场景。"
+
+    class FakeLlm:
+        def __init__(self):
+            self.prompts = []
+
+        async def astream(self, messages):
+            self.prompts = messages
+            yield FakeChunk()
+
+    async def run():
+        llm = FakeLlm()
+        result = await make_nodes(llm)["unknown_node"]({"question": "推荐一下"})
+        assert result["answer"] == "你可以先告诉我想购买的商品品类和使用场景。"
+        assert "当前用户问题：\n推荐一下" in llm.prompts[0].content
+
+    asyncio.run(run())

@@ -8,14 +8,13 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from app.application.assistant.state import AssistantState
 from app.infrastructure.persistence.memory import get_business_memory, remember_product_cards
 from app.domain.shopping.preferences import build_preference_questions
-from app.prompts.prompts import CHITCHAT_PROMPT
+from app.prompts.prompts import CHITCHAT_PROMPT, UNKNOWN_FALLBACK_PROMPT
 from app.infrastructure.errors import ErrorCode
+from app.domain.chitchat.agent import ChitchatAgent
 from app.domain.shopping.agent import ShoppingAgent
 from app.domain.knowledge.agent import KnowledgeAgent
 
 logger = logging.getLogger("ai-service.nodes")
-
-# 闲聊 agent 专用独立 checkpointer，与主图 checkpointer 完全隔离
 
 
 # ---- 多模态 shopping 推荐话术 prompt --------------------------------
@@ -248,9 +247,11 @@ def _graph_token_sink(content: str) -> None:
 
 
 def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
-               knowledge_agent: Optional[KnowledgeAgent] = None) -> Dict[str, Callable]:
+               knowledge_agent: Optional[KnowledgeAgent] = None,
+               chitchat_agent: Optional[ChitchatAgent] = None) -> Dict[str, Callable]:
     _shopping_holder: Dict[str, Any] = {"agent": shopping_agent}
     _knowledge_holder: Dict[str, Any] = {"agent": knowledge_agent}
+    _chitchat_holder: Dict[str, Any] = {"agent": chitchat_agent}
 
     def get_shopping():
         if _shopping_holder["agent"] is None:
@@ -261,6 +262,11 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         if _knowledge_holder["agent"] is None:
             _knowledge_holder["agent"] = KnowledgeAgent(llm)
         return _knowledge_holder["agent"]
+
+    def get_chitchat():
+        if _chitchat_holder["agent"] is None:
+            _chitchat_holder["agent"] = ChitchatAgent(llm)
+        return _chitchat_holder["agent"]
 
     async def shopping_node(state: AssistantState) -> dict:
         # Router controls image scope.  Text, pure-image and image+text turns
@@ -351,33 +357,15 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 "error_code": ErrorCode.LLM_NOT_CONFIGURED,
             }
         try:
-            messages = [
-                SystemMessage(content=CHITCHAT_PROMPT.format(**_build_chitchat_prompt_context(state))),
-                *_build_agent_messages(state),
-            ]
-            chunks: list[str] = []
-            # recursion_limit=5：chitchat 正常 1-2 步就出结果，5 步防死循环
-            async for chunk in llm.astream(messages):
-                content = _stream_text_content(getattr(chunk, "content", ""))
-                if not content:
-                    continue
-                chunks.append(content)
-                _graph_token_sink(content)
-            result = {"messages": [AIMessage(content="".join(chunks))]}
-            # answer 直接从最后一条 AI 消息 content 提取（纯文本，可流式）。
-            # 去 ToolStrategy 后不再有 structured_response，这里就是主路径。
-            answer = ""
-            for m in reversed(result.get("messages", [])):
-                if isinstance(m, dict):
-                    if m.get("type") == "ai" and m.get("content"):
-                        answer = str(m.get("content", ""))
-                        break
-                else:
-                    if getattr(m, "type", "") == "ai":
-                        content = getattr(m, "content", "")
-                        if isinstance(content, str) and content.strip():
-                            answer = content
-                            break
+            # The Agent owns natural expression and middleware-based context
+            # compaction.  The parent graph provides the authoritative message
+            # history, so do not duplicate it inside the system prompt.
+            result = await get_chitchat().run(
+                messages=_build_agent_messages(state),
+                system_prompt=CHITCHAT_PROMPT.format(**_build_chitchat_prompt_context(state)),
+                token_sink=_graph_token_sink,
+            )
+            answer = str(result.get("answer") or "").strip()
             answer = answer or "嗯嗯，我在呢~"
         except Exception as e:
             logger.exception("chitchat node failed")
@@ -396,9 +384,30 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         }
 
     async def unknown_node(state: AssistantState) -> dict:
-        msg = state.get("route_clarification") or (
+        fallback = state.get("route_clarification") or (
             "我还不确定你的需求，请清楚描述想找的商品或想了解的问题。"
         )
+        if llm is None:
+            msg = fallback
+        else:
+            try:
+                prompt = UNKNOWN_FALLBACK_PROMPT.format(
+                    current_question=str(
+                        state.get("canonical_question") or state.get("question") or ""
+                    ).strip() or "（用户没有提供文字问题）",
+                    verified_clarification=str(state.get("route_clarification") or "").strip() or "（无）",
+                )
+                chunks: list[str] = []
+                async for chunk in llm.astream([SystemMessage(content=prompt)]):
+                    content = _stream_text_content(getattr(chunk, "content", ""))
+                    if not content:
+                        continue
+                    chunks.append(content)
+                    _graph_token_sink(content)
+                msg = "".join(chunks).strip() or fallback
+            except Exception:  # noqa: BLE001
+                logger.warning("unknown fallback expression failed", exc_info=True)
+                msg = fallback
         return {
             "answer": msg,
             "task_type": "unknown",
@@ -490,28 +499,9 @@ def _build_chitchat_prompt_context(state: AssistantState) -> dict[str, str]:
     }
     profile = {key: value for key, value in profile.items() if value not in (None, "", [])}
 
-    history_lines: list[str] = []
-    for message in (state.get("messages") or [])[-10:]:
-        if isinstance(message, dict):
-            role = str(message.get("role") or "")
-            content = str(message.get("content") or "").strip()
-        else:
-            role = str(getattr(message, "type", "") or "")
-            content = str(getattr(message, "content", "") or "").strip()
-        if role in {"human", "user"}:
-            label = "用户"
-        elif role in {"ai", "assistant"}:
-            label = "助手"
-        else:
-            continue
-        if content:
-            history_lines.append(f"{label}：{content[:300]}")
-
     current_question = str(state.get("question") or "").strip()
-    history_text = "\n".join(history_lines) if history_lines else "暂无"
     return {
         "user_profile": json.dumps(profile, ensure_ascii=False) if profile else "暂无",
-        "recent_conversation": history_text,
         "current_question": current_question or "暂无",
     }
 

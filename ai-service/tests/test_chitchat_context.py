@@ -4,7 +4,7 @@ from app.application.assistant.nodes import _build_chitchat_prompt_context
 from app.prompts.prompts import CHITCHAT_PROMPT
 
 
-def test_chitchat_prompt_contains_bounded_history_profile_and_current_question():
+def test_chitchat_prompt_delegates_history_to_agent_messages_and_includes_profile():
     context = _build_chitchat_prompt_context({
         "question": "总结一下这次对话",
         "gender": "female",
@@ -18,7 +18,7 @@ def test_chitchat_prompt_contains_bounded_history_profile_and_current_question()
 
     assert "用户画像" in prompt
     assert "简约" in prompt
-    assert "最近对话" in prompt
-    assert "推荐一副耳机" in prompt
+    assert "对话消息" in prompt
+    assert "完整的会话消息会作为本次 Agent 的 messages 单独提供" in prompt
     assert "当前用户问题" in prompt
     assert "总结一下这次对话" in prompt
