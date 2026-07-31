@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from langchain_core.messages import AIMessage, ToolMessage
 
 from app.domain.shopping.agent import _extract_high_level_tool_result
 from app.domain.shopping.context import build_shopping_context_from_runtime
 from app.domain.shopping.high_level_tools import SHOPPING_HIGH_LEVEL_TOOLS
+from app.domain.shopping.schemas import RecommendToolResult
 
 
 class TestToolCatalog:
@@ -147,3 +148,52 @@ class TestExtractHighLevelToolResult:
         m2 = self._tm({"action": "compare", "product_cards": [{"id": 2}]})
         result = _extract_high_level_tool_result([m1, m2])
         assert result["action"] == "compare"
+
+
+def test_recommend_tool_hides_internal_and_rejected_candidates_from_agent():
+    async def run():
+        tool = next(
+            item for item in SHOPPING_HIGH_LEVEL_TOOLS
+            if item.name == "recommend_products"
+        )
+        capability_result = RecommendToolResult(
+            action="recommend",
+            candidate_set={
+                "input_mode": "text",
+                "candidates": [
+                    {"product_id": 11, "title": "visible headphones"},
+                    {"product_id": 99, "title": "rejected tablet"},
+                ],
+            },
+            ranked_products=[{
+                "product_id": 11,
+                "title": "visible headphones",
+                "score": 0.9,
+            }],
+            product_cards=[{"product_id": 11, "title": "visible headphones"}],
+            trace=[{"stage": "judge", "rejected_product_ids": [99]}],
+        )
+        with patch(
+            "app.domain.shopping.high_level_tools.build_shopping_context_from_runtime",
+            new=AsyncMock(return_value=MagicMock()),
+        ), patch(
+            "app.domain.shopping.high_level_tools.RecommendCapability.run",
+            new=AsyncMock(return_value=capability_result),
+        ):
+            payload = await tool.coroutine(
+                runtime=MagicMock(),
+                query="recommend five headphones",
+                limit=5,
+            )
+
+        assert payload["requested_limit"] == 5
+        assert payload["returned_count"] == 1
+        assert payload["product_cards"] == [
+            {"product_id": 11, "title": "visible headphones"},
+        ]
+        assert "candidate_set" not in payload
+        assert "trace" not in payload
+        assert "need" not in payload
+        assert "99" not in str(payload)
+
+    asyncio.run(run())

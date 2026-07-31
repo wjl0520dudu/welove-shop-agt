@@ -26,7 +26,6 @@ import logging
 from typing import Any, Dict, List, Tuple
 
 from app.infrastructure.config import config
-from app.domain.shopping.category_resolver import normalize_product_category
 from app.domain.shopping.schemas import ProductFilterPlan, ShoppingNeed, ShoppingRetrievalPlan
 
 logger = logging.getLogger("ai-service.shopping.retrieval")
@@ -177,30 +176,6 @@ class ShoppingRetriever:
             trace.append({"source": f"milvus_{mode}", "status": "ok", "count": len(results),
                           "filters": filters, "query": query})
 
-        # ── category 兜底：filter 里带了 category 但零命中 → 去掉 category 再来一次 ──
-        # 场景：LLM 抽出的 category 词跟库里两级类目都对不上（如 "护肤品" vs 库里
-        # "美妆护肤/面霜"）。语义 hybrid 本身对 "护肤品" 的召回能力是好的，只是被
-        # 死板的 filter 拦掉了 —— 松掉 filter 让 hybrid 语义救场。
-        if not results and filters.get("category"):
-            no_cat_filters = {k: v for k, v in filters.items() if k not in ("category", "sub_category")}
-            if uses_three_path:
-                fallback_results = self._three_path_text_search(
-                    store, query, mode=mode, filters=no_cat_filters, top_k=recall_top_k,
-                )
-            else:
-                fallback_results = store.search(
-                    query=query,
-                    mode=mode,
-                    filters=no_cat_filters,
-                    top_k=recall_top_k,
-                )
-            if fallback_results:
-                _tag_recall_source(fallback_results, f"{mode}_no_cat")
-                trace.append({"source": f"milvus_{mode}_no_cat", "status": "ok",
-                              "count": len(fallback_results), "filters": no_cat_filters,
-                              "note": "category 精确匹配失败，走无 category filter 语义召回兜底"})
-                results = fallback_results
-
         if not results:
             return []
 
@@ -314,12 +289,15 @@ class ShoppingRetriever:
         results = await pg.search(
             query=query,
             top_k=max(plan.top_k, plan.initial_top_k),
-            category=need.category,
-            brand=need.brand,
-            budget_min=need.budget_min,
-            budget_max=need.budget_max,
+            # Keep the fallback semantically open as well. The SQL store
+            # already enforces status=1; user category/budget conditions are
+            # evaluated by the shared LLM Candidate Judge after recall.
+            category=None,
+            brand=None,
+            budget_min=None,
+            budget_max=None,
             preferences=need.preferences,
-            avoid=need.avoid,
+            avoid=None,
             limit=plan.top_k,
         )
         return results or []
@@ -347,17 +325,11 @@ def _plan_to_milvus_filters(
 
     优先用 plan.filters（Capability 可能自定义），缺失字段从 need 补。
     """
-    filters: Dict[str, Any] = dict(plan.filters or {})
-    normalized_category = normalize_product_category(need.category)
-    if normalized_category and not filters.get("category"):
-        filters["category"] = normalized_category
-    if need.brand and not filters.get("brand"):
-        filters["brand"] = need.brand
-    if need.budget_min is not None and "budget_min" not in filters:
-        filters["budget_min"] = need.budget_min
-    if need.budget_max is not None and "budget_max" not in filters:
-        filters["budget_max"] = need.budget_max
-    return filters
+    # User conditions remain part of the semantic query and are judged after
+    # recall. Re-attaching them here would recreate the old hard-filter path
+    # and make same-type alternatives impossible to show.
+    filters = dict(plan.filters or {})
+    return {"status": 1} if filters.get("status") == 1 else {}
 
 
 def _relaxed_to_milvus_filters(relaxed: Dict[str, Any]) -> Dict[str, Any]:
@@ -417,7 +389,11 @@ def _dedupe_by_product_id(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 # ---- build_retrieval_plan（供 Capability 用）------------------------------
 
-def build_retrieval_plan(need: ShoppingNeed, top_k: int = 5) -> ShoppingRetrievalPlan:
+def build_retrieval_plan(
+    need: ShoppingNeed,
+    top_k: int = 5,
+    query_text: str = "",
+) -> ShoppingRetrievalPlan:
     """把 ShoppingNeed 翻译成 ShoppingRetrievalPlan（Phase 1b 版）。
 
     - top_k：最终返回给排序器的候选数（默认 5）
@@ -437,7 +413,9 @@ def build_retrieval_plan(need: ShoppingNeed, top_k: int = 5) -> ShoppingRetrieva
         parts.append(need.category)
     if need.brand:
         parts.append(need.brand)
-    primary = " ".join(parts) if parts else (need.category or "")
+    primary = str(query_text or "").strip()
+    if not primary:
+        primary = " ".join(parts) if parts else (need.category or "")
 
     semantic_queries = [primary]
     if need.category and need.category not in semantic_queries:
@@ -445,36 +423,24 @@ def build_retrieval_plan(need: ShoppingNeed, top_k: int = 5) -> ShoppingRetrieva
     if need.skin_type and need.category:
         semantic_queries.append(f"适合{need.skin_type}的{need.category}")
 
+    # Retrieval produces a semantic candidate set. Product type, budget, brand,
+    # scenario and other natural-language requirements are judged after recall
+    # by the single LLM Candidate Judge. Turning them into exact vector filters
+    # makes alternatives impossible and makes every new catalog phrase a code
+    # change. Availability is the only system fact enforced here.
     filters: Dict[str, Any] = {"status": 1}
-    normalized_category = normalize_product_category(need.category)
-    if normalized_category:
-        filters["category"] = normalized_category
-    if need.brand:
-        filters["brand"] = need.brand
-    if need.budget_min is not None:
-        filters["budget_min"] = need.budget_min
-    if need.budget_max is not None:
-        filters["budget_max"] = need.budget_max
-
-    # Budget/brand/status are user-visible hard constraints.  Category is used
-    # for the first recall pass, then may be removed for a semantic fallback;
-    # this recovers long-tail wording without returning an over-budget/wrong-
-    # brand product.
     hard_filters = {
         key: value for key, value in filters.items()
-        if key in {"status", "brand", "budget_min", "budget_max"}
+        if key == "status"
     }
     filter_plan = ProductFilterPlan(
         hard_filters=hard_filters,
         soft_preferences=list(need.preferences or []),
         relaxation_policy={
             **{key: False for key in hard_filters},
-            "category": bool(normalized_category),
+            "category": False,
         },
     )
-    # Only category is relaxed.  Explicit budget/brand/status remain in the
-    # fallback expression and are revalidated before cards are returned.
-    relaxed: List[Dict[str, Any]] = [dict(hard_filters)] if normalized_category else []
 
     # 召回数：rerank 需要更多候选（默认 20）；不 rerank 直接按 top_k
     initial_top_k = config.RAG_INITIAL_TOP_K
@@ -485,7 +451,7 @@ def build_retrieval_plan(need: ShoppingNeed, top_k: int = 5) -> ShoppingRetrieva
         keyword_queries=[need.brand] if need.brand else [],
         filters=filters,
         hard_filters=filter_plan.hard_filters,
-        relaxed_filters=[r for r in relaxed if r],
+        relaxed_filters=[],
         top_k=top_k,
         initial_top_k=initial_top_k,
         use_rerank=True,   # Phase 1b：默认开 rerank

@@ -51,6 +51,13 @@ def resolve_turn_context(
         "needs_clarification": False,
         "clarification": "",
     }
+    source = "message_artifact"
+    if not cards:
+        cards = [
+            dict(card) for card in (memory.get("last_product_cards") or [])
+            if isinstance(card, Mapping)
+        ]
+        source = "store_fallback"
     if not cards:
         return {"business_memory": memory, "context_resolution": result}
 
@@ -64,7 +71,7 @@ def resolve_turn_context(
         "product_ids": [card.get("product_id") or card.get("id") for card in cards],
     }
     result.update({
-        "reference_source": "message_artifact",
+        "reference_source": source,
         "reference_message_id": artifact.get("id") if artifact else None,
         "candidate_product_ids": memory["active_product_set"]["product_ids"],
     })

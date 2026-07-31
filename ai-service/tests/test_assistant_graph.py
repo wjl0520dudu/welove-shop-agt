@@ -150,3 +150,14 @@ def test_unknown_node_uses_plain_need_description_prompt():
         assert "清楚描述" in result["answer"]
 
     asyncio.run(run())
+
+
+def test_unknown_node_uses_contextual_product_clarification():
+    async def run():
+        graph = AssistantGraph(llm=None)
+        result = await graph._nodes["unknown_node"]({
+            "route_clarification": "当前只有 2 款商品可供查询，请问你是想查询当前这 2 款吗？",
+        })
+        assert result["answer"] == "当前只有 2 款商品可供查询，请问你是想查询当前这 2 款吗？"
+
+    asyncio.run(run())

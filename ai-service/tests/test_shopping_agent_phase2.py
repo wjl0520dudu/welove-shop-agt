@@ -178,6 +178,18 @@ def test_prompt_has_closed_loop_operation_manuals_but_disallows_history_reresolu
     assert "最终输出" in prompt
 
 
+def test_prompt_limits_answer_products_to_the_rendered_card_count():
+    prompt = ShoppingAgent(MagicMock())._build_system_prompt(
+        selected_product_ids=[],
+        image_url=None,
+        input_mode="text",
+    )
+
+    assert "returned_count" in prompt
+    assert "product_cards" in prompt
+    assert "不得为了满足数量" in prompt
+
+
 def test_real_create_agent_tool_loop_executes_the_high_level_tool_once():
     async def run():
         _REAL_LOOP_CALLS.clear()

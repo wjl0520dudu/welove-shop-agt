@@ -84,6 +84,8 @@ class ProductCard(FlexibleModel):
     sales_count: Optional[int] = Field(None, description="Sales count")
     sub_category: str = Field("", description="Product sub-category")
     reason: str = Field("", description="Recommendation reason")
+    match_status: Optional[str] = Field(None, description="exact or alternative")
+    constraint_gaps: List[Dict[str, Any]] = Field(default_factory=list, description="Unmet conditions for alternatives")
 
 
 class ConfirmButton(FlexibleModel):

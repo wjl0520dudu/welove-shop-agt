@@ -53,6 +53,9 @@ def build_product_cards(
                 "_personalization_score": round(p.personalization_score, 3),
                 "_matched_preferences": p.matched_preferences,
                 "_preference_conflicts": p.preference_conflicts,
+                "match_status": p.match_status,
+                "constraint_gaps": p.constraint_gaps,
+                "judge_reason": p.judge_reason,
             }
         )
     return cards

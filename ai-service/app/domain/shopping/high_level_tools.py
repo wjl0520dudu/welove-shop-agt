@@ -76,13 +76,12 @@ async def recommend_products(
         dict 结构：
         {
             "action": "recommend|clarify|empty",
-            "need": {...},                    # 解析后的结构化需求
-            "candidate_set": {...},            # 文本/图片/图文统一候选容器
             "product_cards": [...],           # 前端可直接渲染的卡片
-            "ranked_products": [...],         # 完整排序详情（含 rank_reason）
+            "ranked_products": [...],         # 仅包含最终展示商品
+            "requested_limit": 3,             # 本次期望数量
+            "returned_count": 2,              # 最终真实商品数量
             "clarify_question": "...",         # action=clarify 时的追问
             "empty_reason": "...",             # action=empty 时的说明
-            "trace": [...],                    # 观测用
         }
 
         - action=recommend: 基于 product_cards + ranked_products 写自然语言推荐话术。
@@ -91,7 +90,22 @@ async def recommend_products(
     """
     context = await build_shopping_context_from_runtime(runtime)
     result = await RecommendCapability().run(query=query, context=context, limit=limit)
-    return result.model_dump()
+    # CandidateSet and trace are internal observability artifacts. Exposing
+    # rejected candidates to the final Agent lets it mention products that the
+    # user will never see as cards and also needlessly enlarges the prompt.
+    payload = result.model_dump(include={
+        "action",
+        "ranked_products",
+        "product_cards",
+        "clarify_question",
+        "empty_reason",
+        "error",
+        "error_code",
+        "message",
+    })
+    payload["requested_limit"] = max(1, int(limit or 3))
+    payload["returned_count"] = len(payload.get("product_cards") or [])
+    return payload
 
 
 # ---- Tool 2: compare_products -------------------------------------------

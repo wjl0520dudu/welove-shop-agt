@@ -685,7 +685,10 @@ class AssistantGraph:
             normalized.resolved_product_ids,
             memory,
         )
-        if resolved_product_ids != list(normalized.resolved_product_ids or []):
+        invalid_product_binding = (
+            resolved_product_ids != list(normalized.resolved_product_ids or [])
+        )
+        if invalid_product_binding:
             logger.warning(
                 "router discarded product ids outside active product set ids=%s allowed=%s",
                 normalized.resolved_product_ids,
@@ -699,6 +702,29 @@ class AssistantGraph:
             "selected_product_ids": resolved_product_ids,
             "resolved_knowledge_entities": list(normalized.resolved_knowledge_entities or []),
         }
+        if invalid_product_binding:
+            # Product IDs are facts owned by the trusted card snapshot. A
+            # partially valid model binding must not silently become a request
+            # for only the surviving product.
+            routed_memory["selected_product_ids"] = []
+            available_count = len(_active_product_set_ids(memory))
+            route_clarification = ""
+            if available_count:
+                route_clarification = (
+                    f"当前只有 {available_count} 款商品可供查询，暂时无法定位你提到的商品。"
+                    f"请问你是想查询当前这 {available_count} 款吗？"
+                )
+            return _route_result(
+                route="unknown",
+                confidence=normalized.confidence,
+                source="fallback",
+                reason="Router referenced a product outside the active card set",
+                llm=llm_trace,
+                fallback_used=True,
+                canonical_question=question,
+                route_clarification=route_clarification,
+                business_memory=routed_memory,
+            )
         if normalized.mode == "complex":
             return _route_result(
                 route="unknown",
@@ -719,6 +745,7 @@ class AssistantGraph:
                 llm=llm_trace,
                 fallback_used=True,
                 canonical_question=canonical_question,
+                route_clarification=normalized.clarification,
                 business_memory=routed_memory,
             )
         return _route_result(
@@ -1052,6 +1079,7 @@ def _route_result(
     fallback_used: bool = False,
     mode: str = "simple",
     canonical_question: str = "",
+    route_clarification: str = "",
     business_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one stable routing trace for graph state, API and offline evals."""
@@ -1069,6 +1097,7 @@ def _route_result(
         "llm_confidence": llm_data.get("confidence"),
         "llm_reason": llm_data.get("reason", ""),
         "route_fallback_used": bool(fallback_used),
+        "route_clarification": route_clarification,
         "orchestrator_mode": mode,
         "orchestrator_reason": reason if mode == "complex" else "",
     }

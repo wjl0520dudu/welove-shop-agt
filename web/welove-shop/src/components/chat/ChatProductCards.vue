@@ -18,8 +18,12 @@
           <uni-icons type="image" size="26" color="#98a2b3" />
         </view>
         <view class="body">
-          <text class="title">{{ item.title }}</text>
+          <view class="title-row">
+            <text class="title">{{ item.title }}</text>
+            <text v-if="item.isAlternative" class="reference-badge">店内参考</text>
+          </view>
           <text v-if="item.reason" class="reason">{{ item.reason }}</text>
+          <text v-if="item.gapMessage" class="gap">{{ item.gapMessage }}</text>
           <view class="bottom">
             <text class="price">{{ item.price }}</text>
             <view class="add" @tap.stop="$emit('add', item.raw)">
@@ -60,6 +64,8 @@ export default {
           id: pid,
           title: p.title || p.name || p.productTitle || '好物推荐',
           reason: p.reason || p.recommendReason || p.desc || '',
+          isAlternative: (p.matchStatus || p.match_status) === 'alternative',
+          gapMessage: this.firstGapMessage(p),
           price: formatMoney(p.price ?? p.basePrice ?? p.base_price ?? p.skuPrice ?? 0),
           image: this.cardImage(p, pid),
           raw: { ...p, id: pid, productId: pid }
@@ -83,6 +89,12 @@ export default {
         return this.detailImages[key] ? buildImageUrl(this.detailImages[key]) : ''
       }
       return buildImageUrl(pickProductImage(product))
+    },
+    firstGapMessage(product) {
+      const gaps = product.constraintGaps || product.constraint_gaps || []
+      if (!Array.isArray(gaps) || !gaps.length) return ''
+      const gap = gaps[0] || {}
+      return gap.message || gap.reason || [gap.name, gap.expected, gap.actual].filter(Boolean).join(': ')
     },
     loadProductImages() {
       const ids = Array.from(new Set(
@@ -156,6 +168,7 @@ export default {
   padding: 16rpx;
 }
 .title {
+  flex: 1;
   display: -webkit-box;
   overflow: hidden;
   height: 74rpx;
@@ -166,6 +179,30 @@ export default {
   white-space: normal;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
+}
+.title-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8rpx;
+}
+.reference-badge {
+  flex-shrink: 0;
+  margin-top: 2rpx;
+  padding: 3rpx 8rpx;
+  border-radius: 8rpx;
+  background: #fff3e0;
+  color: #b54708;
+  font-size: 18rpx;
+  font-weight: 700;
+}
+.gap {
+  display: block;
+  margin-top: 6rpx;
+  overflow: hidden;
+  color: #b54708;
+  font-size: 20rpx;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .reason {
   display: block;

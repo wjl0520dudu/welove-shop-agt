@@ -128,7 +128,7 @@ def test_router_routes_empty_text_image_as_a_new_shopping_search():
     asyncio.run(run())
 
 
-def test_router_discards_model_product_ids_outside_the_active_card_set():
+def test_router_rejects_whole_binding_when_any_product_id_is_outside_active_cards():
     async def run():
         router = FakeStructuredRouter(IntentDecision(
             mode="simple",
@@ -147,7 +147,73 @@ def test_router_discards_model_product_ids_outside_the_active_card_set():
                 "last_product_cards": [{"product_id": 7}, {"product_id": 9}],
             },
         })
-        assert result["route"] == "shopping"
+        assert result["route"] == "unknown"
+        assert result["route_fallback_used"] is True
+        assert result["route_clarification"] == (
+            "当前只有 2 款商品可供查询，暂时无法定位你提到的商品。"
+            "请问你是想查询当前这 2 款吗？"
+        )
+        assert result["business_memory"]["selected_product_ids"] == []
+
+    asyncio.run(run())
+
+
+def test_router_unknown_decision_can_supply_contextual_clarification():
+    async def run():
+        router = FakeStructuredRouter(IntentDecision(
+            mode="simple",
+            task_type="unknown",
+            confidence=0.91,
+            reason="第三款不在当前集合中",
+            clarification="当前只有 2 款商品可供查询，请问你是想查询当前这 2 款吗？",
+        ))
+        graph = _graph_with_router(router)
+        result = await graph._route({
+            "question": "第一款和第三款呢？",
+            "messages": [],
+            "business_memory": {
+                "active_product_set": {"product_ids": [11, 12]},
+                "last_product_cards": [{"product_id": 11}, {"product_id": 12}],
+            },
+        })
+
+        assert result["route"] == "unknown"
+        assert result["route_clarification"] == (
+            "当前只有 2 款商品可供查询，请问你是想查询当前这 2 款吗？"
+        )
+
+    asyncio.run(run())
+
+
+def test_router_prompt_forbids_partial_binding_for_out_of_range_ordinal():
+    async def run():
+        router = FakeStructuredRouter(IntentDecision(
+            mode="simple",
+            task_type="unknown",
+            confidence=0.95,
+            reason="the third card does not exist",
+            canonical_question="first and third items",
+            resolved_product_ids=[],
+        ))
+        graph = _graph_with_router(router)
+        result = await graph._route({
+            "question": "first and third items",
+            "messages": [],
+            "business_memory": {
+                "active_product_set": {"product_ids": [11, 12]},
+                "last_product_cards": [
+                    {"product_id": 11, "title": "A"},
+                    {"product_id": 12, "title": "B"},
+                ],
+            },
+        })
+
+        prompt_text = "\n".join(
+            str(getattr(message, "content", "")) for message in router.messages
+        )
+        assert "第一款和第三款" in prompt_text
+        assert "整个引用都视为无法可靠解析" in prompt_text
+        assert result["route"] == "unknown"
         assert result["business_memory"]["selected_product_ids"] == []
 
     asyncio.run(run())

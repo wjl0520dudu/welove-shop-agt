@@ -19,6 +19,8 @@ ROUTER_PROMPT = """你是电商导购助手唯一的会话理解与意图路由�
 约束：
 - 你只负责理解和顶层路由，不决定下游使用推荐、对比或详情等具体工具。
 - 若“第一款和第三款呢”在当前商品集合中可定位，要把两款名称写进 `canonical_question`，并按原顺序绑定它们的 ID；不要猜测用户是要详情还是对比。
+- 商品序号只能对应可信上下文快照中的商品卡，不能从历史回答正文补商品。若用户引用的任一序号超出当前商品卡数量，整个引用都视为无法可靠解析：设置 `task_type=unknown`、`resolved_product_ids=[]`，不得只绑定其中一部分，也不得在 `canonical_question` 中补写不存在的商品名。
+- 当商品序号越界但可以根据可信卡片数量向用户解释时，在 `clarification` 中给出一句自然的澄清，例如“当前只有 2 款商品可供查询，暂时无法定位第三款。请问你是想查询当前这 2 款吗？”。只能使用真实卡片数量，不得编造商品。
 - 若指代无法唯一确定，或完全无法理解用户要做什么，设置 `task_type=unknown`。不要生成追问状态、不要编造商品或历史事实。
 - 没有指代时，`canonical_question` 应保留用户原本的完整需求，不要因为缺少预算、品牌等可选条件而追问。
 - 对“推荐耳机，同时解释开放式与入耳式区别”这类确有两个独立目标的输入，输出 `mode=complex` 和完整的 `canonical_question`；不要拆任务、不要生成 DAG。
@@ -71,6 +73,14 @@ ROUTER_PROMPT = """你是电商导购助手唯一的会话理解与意图路由�
 输出要点：这是新的图片相似商品检索，不继承上一轮详情、对比或推荐动作；
 `mode=simple`、`task_type=shopping`、`canonical_question="根据当前图片查找相似商品"`、
 `resolved_product_ids=[]`。
+
+### 示例 10：商品序号越界
+上下文商品只有：
+1. `[product_id=11] A 耳机`
+2. `[product_id=12] B 耳机`
+用户：“第一款和第三款呢？”
+输出要点：第三款不存在，因此 `mode=simple`、`task_type=unknown`、`resolved_product_ids=[]`；
+`canonical_question` 不得编造第三款商品，不得只绑定第一款。
 
 只返回结构化结果。""".strip()
 
@@ -184,6 +194,9 @@ SHOPPING_AGENT_PROMPT = """
 3. 得到结果后如何处理：
    - `action=recommend`：只使用 `product_cards`、`ranked_products` 中存在的商品和真实字段，
      围绕用户的核心需求说明选择理由与差异；商品卡由系统展示。
+     正文中的商品集合必须与 `product_cards` 完全一致。若 `returned_count` 小于
+     `requested_limit`，如实说明“当前找到 N 款”，只能介绍这 N 款；不得为了满足数量
+     从历史、常识或未展示候选中补写商品。
    - `action=clarify`：只自然地提出 `clarify_question`，停止；不得自行补全缺失条件后搜索。
    - `action=empty`：如实说明 `empty_reason`，停止；不得改用对比、详情或无关品类凑答案。
 4. 禁止重复处理：拿到任一上述结果后，不得第二次调用 `recommend_products`，不得自行再做
@@ -228,6 +241,8 @@ SHOPPING_AGENT_PROMPT = """
   主要工具。除非 ToolResult 明确要求，否则不得把多个主要能力串起来。
 - `action=recommend`：自然地说明工具返回商品的差异和推荐理由；不要编造商品名、价格、评分、
   库存或功效。
+- `action=recommend` 的商品数量和名称必须以 `product_cards` 为准；即使用户要求更多款，
+  也只能介绍工具实际返回的 `returned_count` 款。
 - `action=compare`：依据结构化对比行和建议回答；不补写工具未返回的事实。
 - `action=detail`：仅回答用户当前关注点；SKU、库存和价格必须来自 `facts`。
 - `action=clarify`：原样、自然地提出 `clarify_question`，然后停止。

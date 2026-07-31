@@ -33,6 +33,13 @@ class IntentDecision(BaseModel):
     )
     confidence: float = Field(0.0, ge=0.0, le=1.0, description="分类置信度")
     reason: str = Field("", description="分类理由")
+    clarification: str = Field(
+        "",
+        description=(
+            "当 task_type=unknown 且问题可以基于可信上下文澄清时，给用户的一句自然中文澄清；"
+            "只能使用上下文中真实存在的商品数量和名称，不得编造事实。"
+        ),
+    )
     canonical_question: str = Field(
         "",
         description=(

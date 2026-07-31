@@ -46,6 +46,7 @@ class AssistantState(TypedDict):
     llm_confidence: NotRequired[float]
     llm_reason: NotRequired[str]
     route_fallback_used: NotRequired[bool]
+    route_clarification: NotRequired[str]
 
     # ── 业务节点产出 ──
     answer: NotRequired[str]

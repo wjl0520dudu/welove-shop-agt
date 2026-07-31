@@ -95,3 +95,20 @@ def test_preparation_does_not_depend_on_question_wording():
 
     assert result["context_resolution"]["has_reference"] is False
     assert result["business_memory"]["last_product_cards"] == TEXT_CARDS
+
+
+def test_preparation_uses_store_cards_when_history_has_no_rendered_cards():
+    result = resolve_turn_context(
+        question="first and third items",
+        business_memory={"last_product_cards": TEXT_CARDS},
+        conversation_history=[],
+    )
+
+    assert result["context_resolution"]["reference_source"] == "store_fallback"
+    assert result["context_resolution"]["reference_message_id"] is None
+    assert result["context_resolution"]["candidate_product_ids"] == [11, 12]
+    assert result["business_memory"]["active_product_set"] == {
+        "source_message_id": None,
+        "source_type": "recommendation",
+        "product_ids": [11, 12],
+    }

@@ -159,6 +159,10 @@ class RankedProduct(BaseModel):
     personalization_score: float = 0.0
     matched_preferences: List[str] = Field(default_factory=list)
     preference_conflicts: List[str] = Field(default_factory=list)
+    # Phase 3 single LLM judge verdict. Optional for Phase 2/old messages.
+    match_status: Optional[Literal["exact", "alternative"]] = None
+    constraint_gaps: List[Dict[str, Any]] = Field(default_factory=list)
+    judge_reason: str = ""
 
 
 class CandidateSet(BaseModel):
