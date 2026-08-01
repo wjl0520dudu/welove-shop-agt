@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from langchain_core.messages import AIMessage
 from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
 from app.infrastructure.persistence.memory import get_business_memory, remember_product_cards, remember_user_preferences
@@ -74,7 +75,6 @@ class AssistantGraph:
         g.add_node("chitchat", self._nodes["chitchat_node"])
         g.add_node("unknown", self._nodes["unknown_node"])
         g.add_node("execute_dag", self._execute_dag)
-        g.add_node("synthesize_final", self._synthesize_final)
         g.add_node("format_response", self._nodes["format_response"])
 
         g.add_edge(START, "resolve_context")
@@ -97,8 +97,10 @@ class AssistantGraph:
         )
         for n in ("shopping", "knowledge", "chitchat", "unknown"):
             g.add_edge(n, "format_response")
-        g.add_edge("execute_dag", "synthesize_final")
-        g.add_edge("synthesize_final", "format_response")
+        # Complex tasks publish each completed subtask immediately.  The
+        # executor also builds the compatibility-only final aggregation, so a
+        # separate synthesis node would only delay the final response.
+        g.add_edge("execute_dag", "format_response")
         g.add_edge("format_response", END)
         # 从 runtime 模块动态读，确保拿到的是 init_runtime() 覆盖后的实例
         return g.compile(checkpointer=_runtime.checkpointer, store=_runtime.store)
@@ -293,28 +295,104 @@ class AssistantGraph:
         task_by_id = {str(task["id"]): task for task in tasks}
         result_by_id: dict[str, dict[str, Any]] = {}
         semaphore = asyncio.Semaphore(max(1, config.ORCHESTRATOR_MAX_CONCURRENCY))
-        try:
-            base_memory = await get_business_memory(state.get("conversation_id"), state.get("user_id"))
-        except Exception:  # noqa: BLE001
-            logger.warning("orchestrator: 读取基础业务记忆失败，任务按空记忆执行", exc_info=True)
-            base_memory = {}
+        # Preparation already read the conversation-scoped memory for this
+        # turn.  Do not let every complex execution perform a second Store /
+        # Redis read, otherwise task isolation and latency both regress.
+        base_memory = dict(state.get("business_memory") or {})
+        sequence_by_id = {
+            str(task["id"]): index + 1
+            for index, task in enumerate(tasks)
+        }
+        # Domain tasks in the same DAG level still execute concurrently, but
+        # user-visible results must follow the Planner's semantic order.  A
+        # later task may finish first; keep it buffered until every preceding
+        # task has been published so the conversation does not jump from
+        # "question 2" back to "question 1".
+        stream_buffer: dict[int, dict[str, Any]] = {}
+        token_buffer: dict[int, list[str]] = {}
+        streamed_parts: dict[int, list[str]] = {}
+        displayed_sequences: set[int] = set()
+        next_stream_sequence = 1
+
+        def emit_visible_token(sequence: int, task_id: str, content: str) -> None:
+            if not content:
+                return
+            if sequence not in displayed_sequences:
+                displayed_sequences.add(sequence)
+                if sequence > 1:
+                    self._emit_subtask_token(
+                        "\n\n", task_id=task_id, sequence=sequence,
+                    )
+            streamed_parts.setdefault(sequence, []).append(content)
+            self._emit_subtask_token(
+                content, task_id=task_id, sequence=sequence,
+            )
+
+        def make_token_sink(task_id: str):
+            sequence = sequence_by_id[task_id]
+
+            def sink(content: str) -> None:
+                text = str(content or "")
+                if not text:
+                    return
+                if sequence == next_stream_sequence:
+                    emit_visible_token(sequence, task_id, text)
+                else:
+                    token_buffer.setdefault(sequence, []).append(text)
+
+            return sink
+
+        def publish_ready_results() -> None:
+            nonlocal next_stream_sequence
+            while next_stream_sequence <= len(tasks):
+                sequence = next_stream_sequence
+                planned_task = tasks[sequence - 1]
+                task_id = str(planned_task.get("id") or "")
+                for buffered in token_buffer.pop(sequence, []):
+                    emit_visible_token(sequence, task_id, buffered)
+
+                # The current task may still be running.  Its previously
+                # buffered chunks have now been released and subsequent chunks
+                # can flow directly; completion metadata must wait for result.
+                if sequence not in stream_buffer:
+                    break
+
+                result = stream_buffer[sequence]
+
+                # Some fallback paths return a final string without provider
+                # chunks.  Preserve the SSE contract by emitting bounded text
+                # chunks before the completion metadata instead of sending the
+                # whole answer inside subtask_result.
+                if not streamed_parts.get(sequence):
+                    for chunk in _fallback_stream_chunks(str(result.get("answer") or "")):
+                        emit_visible_token(sequence, task_id, chunk)
+
+                self._emit_subtask_result(
+                    result,
+                    sequence=sequence,
+                    include_answer=False,
+                )
+                stream_buffer.pop(sequence, None)
+                next_stream_sequence += 1
 
         for level_index, task_ids in enumerate(levels):
-            level_results = await asyncio.gather(
-                *(
-                    self._execute_subtask(
+            async def run_level_task(task_id: str):
+                try:
+                    return task_id, await self._execute_subtask(
                         parent_state=state,
                         task=task_by_id[task_id],
                         level_index=level_index,
                         result_by_id=result_by_id,
                         base_memory=base_memory,
                         semaphore=semaphore,
+                        token_sink=make_token_sink(task_id),
                     )
-                    for task_id in task_ids
-                ),
-                return_exceptions=True,
-            )
-            for task_id, result in zip(task_ids, level_results):
+                except BaseException as exc:  # noqa: BLE001
+                    return task_id, exc
+
+            pending = [asyncio.create_task(run_level_task(task_id)) for task_id in task_ids]
+            for completed in asyncio.as_completed(pending):
+                task_id, result = await completed
                 if isinstance(result, BaseException):
                     logger.error(
                         "orchestrator: 子任务出现未捕获异常 task_id=%s: %s",
@@ -330,6 +408,9 @@ class AssistantGraph:
                     )
                 else:
                     result_by_id[task_id] = result
+                completed_sequence = sequence_by_id[task_id]
+                stream_buffer[completed_sequence] = result_by_id[task_id]
+                publish_ready_results()
 
         ordered_results = [result_by_id[str(task["id"])] for task in tasks]
         cards = _dedupe_product_cards(
@@ -346,10 +427,55 @@ class AssistantGraph:
             except Exception:  # noqa: BLE001
                 logger.warning("orchestrator: 聚合商品卡片写入业务记忆失败", exc_info=True)
 
+        product_cards = _dedupe_product_cards(
+            card
+            for result in ordered_results
+            for card in (result.get("product_cards") or [])
+        )
+        sources = _dedupe_sources(
+            source
+            for result in ordered_results
+            for source in (result.get("sources") or [])
+        )
+        retrieved_contexts = list(dict.fromkeys(
+            str(context)
+            for result in ordered_results
+            for context in (result.get("retrieved_contexts") or [])
+            if str(context).strip()
+        ))[:10]
+        tool_calls = [
+            call
+            for result in ordered_results
+            for call in (result.get("tool_calls") or [])
+        ]
+        suggested_questions = list(dict.fromkeys(
+            question
+            for result in ordered_results
+            for question in (result.get("suggested_questions") or [])
+            if question
+        ))[:4]
+        has_error = any(bool(result.get("error")) for result in ordered_results)
+        answer = _join_subtask_answers(ordered_results)
+
         return {
             "sub_questions": tasks,
             "sub_results": ordered_results,
             "task_levels": levels,
+            # Compatibility aggregation only: this is a deterministic join of
+            # already emitted subtask answers, never a second synthesis step.
+            "answer": answer,
+            "task_type": "complex",
+            "product_cards": product_cards,
+            "sources": sources,
+            "retrieved_contexts": retrieved_contexts,
+            "tool_calls": tool_calls,
+            "suggested_questions": suggested_questions,
+            "route": "complex",
+            "route_reason": state.get("orchestrator_reason"),
+            "error": has_error,
+            "error_code": ErrorCode.ORCHESTRATOR_PARTIAL_ERROR if has_error else None,
+            "message": "部分子任务处理失败" if has_error else None,
+            "messages": [AIMessage(content=answer)] if answer else [],
         }
 
     async def _execute_subtask(
@@ -361,6 +487,7 @@ class AssistantGraph:
         result_by_id: dict[str, dict[str, Any]],
         base_memory: dict[str, Any],
         semaphore: asyncio.Semaphore,
+        token_sink=None,
     ) -> dict[str, Any]:
         dependencies = [result_by_id[dep_id] for dep_id in (task.get("depends_on") or [])]
         failed_dependencies = [
@@ -378,12 +505,22 @@ class AssistantGraph:
             )
 
         payloads = [dependency_payload(result) for result in dependencies]
-        task_messages = list(parent_state.get("messages") or [])
+        route = str(task.get("intent_hint") or "unknown")
+        # Shopping and Knowledge receive only their canonical task plus
+        # explicit dependency facts.  The Router has already resolved all
+        # cross-turn references, so handing them parent messages would create
+        # a competing context resolver.  Chitchat is the deliberate exception
+        # because natural chat and conversation review require history.
+        task_messages = (
+            list(parent_state.get("messages") or [])
+            if route == "chitchat"
+            else []
+        )
         if payloads:
             task_messages.append(SystemMessage(content=format_dependency_message(payloads)))
         task_messages.append(HumanMessage(content=str(task.get("question") or "")))
 
-        task_memory = dependency_business_memory(base_memory, payloads)
+        task_memory = _build_task_business_memory(base_memory, payloads)
         task_state: AssistantState = {
             "question": str(task.get("question") or ""),
             "original_question": parent_state.get("original_question") or parent_state.get("question") or "",
@@ -397,8 +534,21 @@ class AssistantGraph:
             "dependency_context": payloads,
             "business_memory": task_memory,
             "orchestrator_mode": "complex",
+            "subtask_token_sink": token_sink,
             "error": False,
         }
+        if route == "chitchat":
+            # Chitchat is the sole domain exception: natural dialogue and
+            # explicit conversation review need the Preparation-owned history
+            # and user profile, while still receiving the Planner task as the
+            # current user message.
+            task_state.update({
+                "conversation_history": list(parent_state.get("conversation_history") or []),
+                "context_resolution": dict(parent_state.get("context_resolution") or {}),
+                "gender": parent_state.get("gender"),
+                "skin_type": parent_state.get("skin_type"),
+                "preference_tags": parent_state.get("preference_tags"),
+            })
         if task.get("use_image") and parent_state.get("image_url"):
             task_state["image_url"] = parent_state["image_url"]
 
@@ -480,6 +630,52 @@ class AssistantGraph:
         ).model_dump()
         return task_result
 
+    @staticmethod
+    def _emit_subtask_result(
+        result: dict[str, Any], *, sequence: int, include_answer: bool = True,
+    ) -> None:
+        """Publish a user-facing completed task without exposing internals.
+
+        ``get_stream_writer`` only exists while ``astream`` is active.  The
+        same DAG is also used by ``run()``, where this is intentionally a
+        no-op and the compatibility aggregate is returned at the end.
+        """
+        payload = {
+            "task_id": result.get("id"),
+            "sequence": sequence,
+            "question": result.get("question") or "",
+            "status": result.get("status") or "failed",
+            "answer": (result.get("answer") or "") if include_answer else "",
+            "streamed": not include_answer,
+            "product_cards": result.get("product_cards") or [],
+            "sources": result.get("sources") or [],
+            "error_code": result.get("error_code"),
+            "message": result.get("message"),
+        }
+        try:
+            get_stream_writer()({"type": "subtask_result", "data": payload})
+        except Exception:  # noqa: BLE001
+            # ``run()`` has no stream writer.  Do not make a successful domain
+            # task fail merely because there is no streaming consumer.
+            logger.debug("subtask result stream writer unavailable", exc_info=True)
+
+    @staticmethod
+    def _emit_subtask_token(content: str, *, task_id: str, sequence: int) -> None:
+        """Publish one user-visible token for the currently displayed task."""
+        if not content:
+            return
+        try:
+            get_stream_writer()({
+                "type": "token",
+                "data": {
+                    "content": content,
+                    "task_id": task_id,
+                    "sequence": sequence,
+                },
+            })
+        except Exception:  # noqa: BLE001
+            logger.debug("subtask token stream writer unavailable", exc_info=True)
+
     async def _run_business_task(self, task_state: AssistantState) -> dict[str, Any]:
         # Planner has already assigned the domain for every DAG task.  Do not
         # send subtasks back through the top-level Router or re-read history.
@@ -541,62 +737,6 @@ class AssistantGraph:
             "error": True,
             "error_code": error_code,
             "message": message,
-        }
-
-    def _synthesize_final(self, state: AssistantState) -> dict:
-        if state.get("orchestrator_plan_error"):
-            return self._invalid_plan_state(
-                state.get("original_question") or state.get("question") or "",
-                state.get("orchestrator_reason") or "任务计划无效",
-                list(state.get("sub_questions") or []),
-                str(state.get("orchestrator_plan_error")),
-            )
-        sub_results = state.get("sub_results") or []
-        answer = _build_orchestrator_answer(sub_results)
-        product_cards = _dedupe_product_cards(
-            card
-            for result in sub_results
-            for card in (result.get("product_cards") or [])
-        )
-        sources = _dedupe_sources(
-            source
-            for result in sub_results
-            for source in (result.get("sources") or [])
-        )
-        retrieved_contexts = list(dict.fromkeys(
-            str(context)
-            for result in sub_results
-            for context in (result.get("retrieved_contexts") or [])
-            if str(context).strip()
-        ))[:10]
-        tool_calls = [
-            call
-            for result in sub_results
-            for call in (result.get("tool_calls") or [])
-        ]
-        suggested_questions = list(dict.fromkeys(
-            question
-            for result in sub_results
-            for question in (result.get("suggested_questions") or [])
-            if question
-        ))[:4]
-        has_error = any(bool(r.get("error")) for r in sub_results)
-        return {
-            "answer": answer,
-            # Planner/DAG metadata remains available for observability, but
-            # must not overwrite the Router's public semantic route.
-            "task_type": "complex",
-            "product_cards": product_cards,
-            "sources": sources,
-            "retrieved_contexts": retrieved_contexts,
-            "tool_calls": tool_calls,
-            "suggested_questions": suggested_questions,
-            "route": "complex",
-            "route_reason": state.get("orchestrator_reason"),
-            "error": has_error,
-            "error_code": ErrorCode.ORCHESTRATOR_PARTIAL_ERROR if has_error else None,
-            "message": "部分子任务处理失败" if has_error else None,
-            "messages": [AIMessage(content=answer)],
         }
 
     async def _route(self, state: AssistantState) -> dict:
@@ -865,6 +1005,7 @@ class AssistantGraph:
         - token        LLM 增量 token（重复多次）
         - tool_call    工具被调用
         - tool_result  工具返回
+        - subtask_result 复杂任务中一个已完成的用户可见结果
         - final        最终完整响应（跟 /run 一致）
         - error        出错
         - done         结束标志（前端可关流）
@@ -889,6 +1030,7 @@ class AssistantGraph:
         }
 
         final_result: Dict[str, Any] = {}
+        complex_turn = False
         # LangGraph subgraphs=True 时事件格式为 (namespace_tuple, mode, payload)
         # namespace_tuple: 空 = 主图，(node_name, task_id) = 子图
         async for chunk in self.graph.astream(
@@ -910,6 +1052,12 @@ class AssistantGraph:
                 # payload = (message_chunk, metadata_dict)
                 msg_chunk, meta = payload
                 async for event in self._translate_message_event(msg_chunk, meta, namespace):
+                    if complex_turn and event.get("type") == "token":
+                        # Complex responses become user-visible only when an
+                        # Artifact is complete.  Suppress any nested model
+                        # chunks here as a final guard against duplicated
+                        # partial text from a child Agent implementation.
+                        continue
                     yield event
 
             elif mode == "custom":
@@ -918,12 +1066,25 @@ class AssistantGraph:
                 if isinstance(payload, dict) and payload.get("type") == "token":
                     data = payload.get("data") or {}
                     if isinstance(data, dict) and data.get("content"):
-                        yield {"type": "token", "data": {"content": str(data["content"])}}
+                        yield {
+                            "type": "token",
+                            "data": {
+                                "content": str(data["content"]),
+                                **({"task_id": data.get("task_id")} if data.get("task_id") else {}),
+                                **({"sequence": data.get("sequence")} if data.get("sequence") else {}),
+                            },
+                        }
+                elif isinstance(payload, dict) and payload.get("type") == "subtask_result":
+                    data = payload.get("data") or {}
+                    if isinstance(data, dict) and data.get("task_id"):
+                        yield {"type": "subtask_result", "data": data}
 
             elif mode == "updates":
                 # payload = {node_name: {state_delta_key: value, ...}}
                 for node_name, node_output in (payload or {}).items():
                     async for event in self._translate_update_event(node_name, node_output):
+                        if event.get("type") == "route" and (event.get("data") or {}).get("mode") == "complex":
+                            complex_turn = True
                         yield event
                     # format_response 节点会把整个 result 写到 state["result"]
                     if node_name == "format_response" and isinstance(node_output, dict):
@@ -988,7 +1149,6 @@ class AssistantGraph:
             "chitchat",
             "unknown",
             "execute_dag",
-            "synthesize_final",
             "format_response",
         }
         if not namespace and graph_node in main_nodes:
@@ -1015,6 +1175,7 @@ class AssistantGraph:
                     "llm_route": node_output.get("llm_route"),
                     "llm_confidence": node_output.get("llm_confidence"),
                     "fallback_used": bool(node_output.get("route_fallback_used")),
+                    "mode": node_output.get("orchestrator_mode") or "simple",
                 },
             }
 
@@ -1025,16 +1186,6 @@ class AssistantGraph:
                     "mode": "complex",
                     "reason": node_output.get("orchestrator_reason"),
                     "tasks": node_output.get("sub_questions") or [],
-                },
-            }
-
-        if node_name == "prepare_subtask" and node_output.get("subtask_heading"):
-            active = node_output.get("active_subtask") or {}
-            yield {
-                "type": "orchestrator_subtask",
-                "data": {
-                    "task": active,
-                    "heading": node_output.get("subtask_heading"),
                 },
             }
 
@@ -1059,8 +1210,8 @@ class AssistantGraph:
                         "error_code": result.get("error_code"),
                     },
                 }
-            # Keep DAG telemetry out of the user token stream.  The only user
-            # facing answer for a complex request is the final synthesized one.
+            # These are diagnostic lifecycle events.  User-visible completed
+            # content is emitted earlier as ``subtask_result`` custom events.
 
         # 2. 子节点消息里可能含 ToolMessage（工具返回）—— 用于 tool_result
         # 主图节点自己不会直接调工具，工具都在子图（ShoppingAgent 等）内部。
@@ -1205,26 +1356,64 @@ def _normalize_tasks(raw_tasks: list) -> list[dict[str, Any]]:
     return tasks
 
 
-def _format_subtask_heading(index: int, total: int, question: str) -> str:
-    prefix = "我会分成几个部分依次回答：\n\n" if index == 0 else "\n\n"
-    return f"{prefix}{index + 1}. {question}\n"
+def _build_task_business_memory(
+    base_memory: dict[str, Any],
+    dependency_payloads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Create the smallest memory slice a domain subtask may consume.
+
+    ``resolve_context`` is the only top-level reader of broad conversation
+    state.  A Shopping/Knowledge task may use Router bindings and base
+    preference tags as soft signals, plus only the artifacts it explicitly
+    depends on.  It must not inherit mutable last-card snapshots or arbitrary
+    historical facts from the parent conversation.
+    """
+    allowed_keys = (
+        "selected_product_ids",
+        "resolved_knowledge_entities",
+        "user_preferences",
+    )
+    scoped = {
+        key: value
+        for key, value in (base_memory or {}).items()
+        if key in allowed_keys and value not in (None, "", [])
+    }
+    memory = dependency_business_memory(scoped, dependency_payloads)
+    # A dependent Shopping task must be able to operate on the exact products
+    # produced by its upstream Artifact.  Keep an explicit Router binding when
+    # one already exists; otherwise bind only those dependency product IDs.
+    if not memory.get("selected_product_ids"):
+        dependency_ids: list[int] = []
+        for payload in dependency_payloads:
+            if payload.get("status") != "success":
+                continue
+            for card in payload.get("product_cards") or []:
+                try:
+                    product_id = int(card.get("product_id") or card.get("id"))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if product_id > 0 and product_id not in dependency_ids:
+                    dependency_ids.append(product_id)
+        if dependency_ids:
+            memory["selected_product_ids"] = dependency_ids
+    return memory
 
 
-def _build_orchestrator_answer(sub_results: list[dict[str, Any]]) -> str:
-    if not sub_results:
-        return "我暂时没能完成这个复合问题的拆解，请你换个方式再问一次。"
+def _join_subtask_answers(sub_results: list[dict[str, Any]]) -> str:
+    """Compatibility answer for non-stream callers, without new narration."""
+    return "\n\n".join(
+        answer
+        for result in sub_results
+        if (answer := str(result.get("answer") or "").strip())
+    )
 
-    parts = ["我会分成几个部分依次回答："]
-    for index, result in enumerate(sub_results, start=1):
-        question = result.get("question") or f"第 {index} 个问题"
-        answer = (result.get("answer") or "").strip()
-        if not answer:
-            if result.get("error"):
-                answer = "这一部分暂时处理失败，请稍后再试。"
-            else:
-                answer = "这一部分暂时没有得到明确结果。"
-        parts.append(f"{index}. {question}\n{answer}")
-    return "\n\n".join(parts)
+
+def _fallback_stream_chunks(text: str) -> list[str]:
+    """Split a non-streaming fallback into small SSE-friendly text chunks."""
+    value = str(text or "")
+    if not value:
+        return []
+    return [value[index:index + 6] for index in range(0, len(value), 6)]
 
 
 def _dedupe_product_cards(cards_iter) -> list[dict[str, Any]]:

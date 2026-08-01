@@ -281,6 +281,10 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         input_mode = "text"
         if image_url:
             input_mode = "image" if state.get("input_mode") == "image" else "multimodal"
+        # Simple turns stream through the graph sink.  Complex turns receive a
+        # task-scoped sink from the DAG executor so concurrent Agents cannot
+        # interleave their tokens in the user-visible answer.
+        token_sink = state.get("subtask_token_sink") if active_task else _graph_token_sink
 
         try:
             result = await get_shopping().run(
@@ -296,7 +300,7 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 selected_product_ids=list((state.get("business_memory") or {}).get("selected_product_ids") or []),
                 image_url=image_url or None,
                 input_mode=input_mode,
-                token_sink=_graph_token_sink,
+                token_sink=token_sink,
             )
         except Exception as e:
             logger.exception("shopping node failed")
@@ -316,11 +320,24 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             # KnowledgeAgent receives the canonical current question only.  Its
             # prior entity binding is already represented in that question by
             # the Router, so no full history or secondary context resolver is needed.
-            messages = [HumanMessage(content=state.get("question", ""))]
+            messages = []
+            dependency_context = state.get("dependency_context") or []
+            if dependency_context:
+                messages.append(SystemMessage(content=(
+                    "以下是本知识子任务明确依赖的上游已验证结果。"
+                    "只能使用其中的商品、来源和结论，不得补充其他历史信息：\n"
+                    + json.dumps(dependency_context, ensure_ascii=False)
+                )))
+            messages.append(HumanMessage(content=state.get("question", "")))
             result = await get_knowledge().run(
                 messages=messages,
                 conversation_id=state.get("conversation_id", ""),
                 user_id=state.get("user_id"),
+                token_sink=(
+                    state.get("subtask_token_sink")
+                    if state.get("active_subtask")
+                    else _graph_token_sink
+                ),
             )
             # 无检索结果兜底：sources 为空 或 has_answer=False 时补一句引导，
             # 但 task_type 保持 knowledge —— 不要伪装成 chitchat，否则前端行为错乱。
@@ -363,7 +380,11 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             result = await get_chitchat().run(
                 messages=_build_agent_messages(state),
                 system_prompt=CHITCHAT_PROMPT.format(**_build_chitchat_prompt_context(state)),
-                token_sink=_graph_token_sink,
+                token_sink=(
+                    state.get("subtask_token_sink")
+                    if state.get("active_subtask")
+                    else _graph_token_sink
+                ),
             )
             answer = str(result.get("answer") or "").strip()
             answer = answer or "嗯嗯，我在呢~"
@@ -398,12 +419,14 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                     verified_clarification=str(state.get("route_clarification") or "").strip() or "（无）",
                 )
                 chunks: list[str] = []
+                token_sink = None if state.get("active_subtask") else _graph_token_sink
                 async for chunk in llm.astream([SystemMessage(content=prompt)]):
                     content = _stream_text_content(getattr(chunk, "content", ""))
                     if not content:
                         continue
                     chunks.append(content)
-                    _graph_token_sink(content)
+                    if token_sink is not None:
+                        token_sink(content)
                 msg = "".join(chunks).strip() or fallback
             except Exception:  # noqa: BLE001
                 logger.warning("unknown fallback expression failed", exc_info=True)

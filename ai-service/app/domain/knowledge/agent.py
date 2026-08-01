@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from uuid import uuid4
+from collections.abc import Callable
 from typing import Any, Dict, List, Optional
 
 from cachetools import TTLCache
@@ -12,6 +13,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddleware
 from langchain.agents.middleware.tool_call_limit import ToolCallLimitMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.messages import AIMessageChunk
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
@@ -596,6 +598,7 @@ class KnowledgeAgent:
         messages: list,
         conversation_id: str = "",
         user_id: Optional[int | str] = None,
+        token_sink: Callable[[str], None] | None = None,
     ) -> dict:
         """执行知识问答。
 
@@ -631,23 +634,41 @@ class KnowledgeAgent:
         if cache_key and cache_key in _knowledge_cache:
             cached = _knowledge_cache[cache_key]
             await self._persist_entities(conversation_id, user_id, question, cached.get("sources") or [])
+            if token_sink is not None:
+                for chunk in _stream_text_chunks(str(cached.get("answer") or "")):
+                    token_sink(chunk)
             return cached
 
         # 每次调用使用唯一 thread_id，确保不受内部 tool_call 消息污染。
         # recursion_limit=12：单个检索工具的受控 Agent loop。
         # ModelCallLimit(run_limit=5, exit_behavior="end") 兜底防真死循环。
         # 观测：正常单轮问答 5-6 步，跨轮指代 8-10 步，20 有充裕余量。
-        result = await self._get_agent().ainvoke(
-            {
-                "messages": messages,
-                "conversation_id": conversation_id,
-                "user_id": user_id,
-            },
-            config={
-                "configurable": {"thread_id": str(uuid4())},
-                "recursion_limit": 12,
-            },
-        )
+        agent_input = {
+            "messages": messages,
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+        }
+        agent_config = {
+            "configurable": {"thread_id": str(uuid4())},
+            "recursion_limit": 12,
+        }
+        if token_sink is None:
+            result = await self._get_agent().ainvoke(agent_input, config=agent_config)
+        else:
+            result = {}
+            async for mode, payload in self._get_agent().astream(
+                agent_input,
+                config=agent_config,
+                stream_mode=["values", "messages"],
+            ):
+                if mode == "values" and isinstance(payload, dict):
+                    result = payload
+                elif mode == "messages":
+                    message, _metadata = payload
+                    if isinstance(message, AIMessageChunk):
+                        content = _stream_text_content(message.content)
+                        if content:
+                            token_sink(content)
 
         # answer 从最后一条 AI 消息 content 提取（纯文本，可流式）；
         # sources 从 search_knowledge 的 ToolMessage 里 JSON 解析抽取。
@@ -751,3 +772,20 @@ class KnowledgeAgent:
                 await remember_knowledge_entities(conversation_id, user_id, entities)
         except Exception:  # noqa: BLE001
             logger.warning("knowledge: 实体持久化失败", exc_info=True)
+
+
+def _stream_text_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def _stream_text_chunks(text: str) -> list[str]:
+    value = str(text or "")
+    return [value[index:index + 6] for index in range(0, len(value), 6)]

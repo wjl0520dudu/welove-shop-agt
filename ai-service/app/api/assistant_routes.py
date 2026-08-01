@@ -118,7 +118,7 @@ async def stream_assistant(request: AssistantRunRequest, http_request: Request):
     """流式版本 /run，返回 SSE 事件流。
 
     事件类型：start / route / orchestrator_plan / orchestrator_subtask /
-    token / tool_call / tool_result / final / error / done。
+    subtask_result / token / tool_call / tool_result / final / error / done。
     详见 assistant/graph.py::astream。
 
     客户端断开检测：每次 yield 前用 Starlette 自带的 `request.is_disconnected()`

@@ -469,16 +469,40 @@ export default {
         // The plan and subtask events are diagnostic telemetry, not chat UI.
         onOrchestratorPlan: () => {},
         onOrchestratorSubtask: () => {},
+        // 复杂任务在一个领域子任务完成时发送完整结果。这里直接追加，
+        // 不暴露内部任务名称、DAG 或 Agent 等实现细节。
+        onSubtaskResult: (payload = {}) => {
+          assistant.pending = false
+          assistant.taskType = 'complex'
+          const answer = String(payload.answer || '').trim()
+          if (answer) {
+            assistant.content += assistant.content ? `\n\n${answer}` : answer
+            gotText = true
+          }
+          const incomingCards = Array.isArray(payload.product_cards)
+            ? payload.product_cards
+            : (Array.isArray(payload.productCards) ? payload.productCards : [])
+          if (incomingCards.length) {
+            const seen = new Set()
+            assistant.productCards = [...(assistant.productCards || []), ...incomingCards].filter((card) => {
+              const key = String(card && (card.product_id || card.productId || card.id || card.title || ''))
+              if (!key || seen.has(key)) return false
+              seen.add(key)
+              return true
+            })
+          }
+          this.scrollToBottom()
+        },
         // final 兜底：若某类回复没有逐 token 流（如 unknown/error 静态回复），用 final 的完整答案补上
         onFinalText: (text, finalPayload = {}) => {
           const finalTaskType = finalPayload.task_type || finalPayload.taskType || assistant.taskType
-          const isOrchestratorFinal = finalTaskType === 'orchestrator'
+          const isComplexFinal = finalTaskType === 'complex' || finalTaskType === 'orchestrator'
           const suggested = finalPayload.suggested_questions || finalPayload.suggestedQuestions || []
           if (Array.isArray(suggested) && suggested.length) {
             this.learnedRecommended = suggested.filter(Boolean)
             this.buildRecommended()
           }
-          if (finalTaskType === 'orchestrator') {
+          if (isComplexFinal) {
             assistant.agentMeta = {
               ...(assistant.agentMeta || {}),
               orchestratorMode: finalPayload.orchestrator_mode || 'complex',
@@ -488,9 +512,9 @@ export default {
               taskLevels: finalPayload.task_levels || []
             }
           }
-          // Orchestrator 会先流出子任务标题/子答案，final.answer 才是完整聚合结果。
-          // 不能因为 gotText=true 就丢弃 final，否则前端只能看到拆解标题。
-          if (text && (isOrchestratorFinal || !gotText)) {
+          // subtask_result 已是用户已看到的完整分段。final 只用于兼容、
+          // 元数据和没有流式内容时的兜底，不能重复覆盖或显示一份总回答。
+          if (text && !gotText) {
             assistant.pending = false
             assistant.content = text
             gotText = true

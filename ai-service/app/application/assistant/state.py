@@ -77,11 +77,13 @@ class AssistantState(TypedDict):
     orchestrator_reason: NotRequired[str]
     sub_questions: NotRequired[list[dict[str, Any]]]
     active_subtask: NotRequired[dict[str, Any]]
-    subtask_heading: NotRequired[str]
     current_subquestion_index: NotRequired[int]
     sub_results: NotRequired[list[dict[str, Any]]]
     task_levels: NotRequired[list[list[str]]]
     dependency_context: NotRequired[list[dict[str, Any]]]
+    # In-process callback used only while a complex DAG task is executing.
+    # It is never persisted or exposed through the public response contract.
+    subtask_token_sink: NotRequired[Any]
     orchestrator_plan_error: NotRequired[str]
 
 

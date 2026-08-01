@@ -137,6 +137,7 @@ public class ChatServiceImpl implements ChatService {
         Map<String, Object>[] cartSelection = new Map[]{null};
         String[] sources = {""};
         Map<String, Object>[] agentMeta = new Map[]{new java.util.LinkedHashMap<>()};
+        boolean[] receivedSubtaskResults = {false};
 
         // ============= SseEmitter 生命周期回调 =============
         // onCompletion: 流正常关闭时调用(包括 emitter.complete() 和客户端正常断开)
@@ -237,6 +238,10 @@ public class ChatServiceImpl implements ChatService {
                         case "orchestrator_subtask":
                             captureOrchestratorMeta(eventType, event, agentMeta[0]);
                             break;
+                        case "subtask_result":
+                            receivedSubtaskResults[0] = true;
+                            captureSubtaskResult(event, answerBuilder, productCards[0]);
+                            break;
                         case "token":
                             answerBuilder.append(event.getOrDefault("content", ""));
                             break;
@@ -248,9 +253,9 @@ public class ChatServiceImpl implements ChatService {
                             // ai-service 的 final data 即完整 AIResponse，字段在顶层(非嵌套 response)
                             Object finalAnswer = event.get("answer");
                             String finalTaskType = String.valueOf(event.getOrDefault("task_type", ""));
-                            if (isComplexTask(finalTaskType)
+                            if (isComplexTask(finalTaskType) && !receivedSubtaskResults[0]
                                     && finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
-                                // 编排模式的 token 主要是子任务流；最终聚合答案必须作为持久化权威结果。
+                                // 兼容未升级的上游：没有逐任务事件时，final.answer 仍可作为完整结果。
                                 answerBuilder.setLength(0);
                                 answerBuilder.append(finalAnswer);
                             } else if (answerBuilder.length() == 0 && finalAnswer != null) {
@@ -258,7 +263,7 @@ public class ChatServiceImpl implements ChatService {
                             }
                             if (event.containsKey("task_type")) taskType[0] = String.valueOf(event.get("task_type"));
                             if (event.get("product_cards") instanceof java.util.List<?> pc) {
-                                productCards[0] = (java.util.List<Map<String, Object>>) pc;
+                                mergeProductCards(productCards[0], pc);
                             }
                             if (event.get("confirm_card") instanceof Map<?, ?> cc) {
                                 confirmCard[0] = (Map<String, Object>) cc;
@@ -384,6 +389,7 @@ public class ChatServiceImpl implements ChatService {
         Map<String, Object>[] cartSelection = new Map[]{null};
         String[] sources = {""};
         Map<String, Object>[] agentMeta = new Map[]{new java.util.LinkedHashMap<>()};
+        boolean[] receivedSubtaskResults = {false};
 
         emitter.onCompletion(() -> log.debug("SseEmitter[MM] onCompletion conv={}", conversationId));
         emitter.onTimeout(() -> {
@@ -468,6 +474,10 @@ public class ChatServiceImpl implements ChatService {
                         case "orchestrator_subtask":
                             captureOrchestratorMeta(eventType, event, agentMeta[0]);
                             break;
+                        case "subtask_result":
+                            receivedSubtaskResults[0] = true;
+                            captureSubtaskResult(event, answerBuilder, productCards[0]);
+                            break;
                         case "token":
                             answerBuilder.append(event.getOrDefault("content", ""));
                             break;
@@ -478,9 +488,9 @@ public class ChatServiceImpl implements ChatService {
                             captureFinalAgentMeta(event, agentMeta[0]);
                             Object finalAnswer = event.get("answer");
                             String finalTaskType = String.valueOf(event.getOrDefault("task_type", ""));
-                            if (isComplexTask(finalTaskType)
+                            if (isComplexTask(finalTaskType) && !receivedSubtaskResults[0]
                                     && finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
-                                // 图文场景也可能进入编排链路，最终聚合答案不能被子任务 token 覆盖。
+                                // 兼容没有逐任务结果的旧上游响应。
                                 answerBuilder.setLength(0);
                                 answerBuilder.append(finalAnswer);
                             } else if (answerBuilder.length() == 0 && finalAnswer != null) {
@@ -488,7 +498,7 @@ public class ChatServiceImpl implements ChatService {
                             }
                             if (event.containsKey("task_type")) taskType[0] = String.valueOf(event.get("task_type"));
                             if (event.get("product_cards") instanceof java.util.List<?> pc) {
-                                productCards[0] = (java.util.List<Map<String, Object>>) pc;
+                                mergeProductCards(productCards[0], pc);
                             }
                             if (event.get("confirm_card") instanceof Map<?, ?> cc) {
                                 confirmCard[0] = (Map<String, Object>) cc;
@@ -787,6 +797,51 @@ public class ChatServiceImpl implements ChatService {
      */
     private static boolean isComplexTask(String taskType) {
         return "complex".equals(taskType) || "orchestrator".equals(taskType);
+    }
+
+    /**
+     * Accumulate a completed complex-task segment for persistence.  The same
+     * event has already been forwarded to H5; this method only ensures that a
+     * normal completion or an interrupted stream can replay what the user saw.
+     */
+    @SuppressWarnings("unchecked")
+    private static void captureSubtaskResult(Map<String, Object> event,
+                                             StringBuilder answerBuilder,
+                                             java.util.List<Map<String, Object>> productCards) {
+        String answer = String.valueOf(event.getOrDefault("answer", "")).trim();
+        if (!answer.isEmpty()) {
+            if (answerBuilder.length() > 0) answerBuilder.append("\n\n");
+            answerBuilder.append(answer);
+        }
+        Object cards = event.get("product_cards");
+        if (!(cards instanceof java.util.List<?>)) cards = event.get("productCards");
+        if (cards instanceof java.util.List<?> list) {
+            mergeProductCards(productCards, list);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void mergeProductCards(java.util.List<Map<String, Object>> target,
+                                          java.util.List<?> incoming) {
+        java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+        for (Map<String, Object> card : target) {
+            seen.add(productCardKey(card));
+        }
+        for (Object item : incoming) {
+            if (!(item instanceof Map<?, ?> raw)) continue;
+            Map<String, Object> card = new java.util.LinkedHashMap<>((Map<String, Object>) raw);
+            String key = productCardKey(card);
+            if (!key.isEmpty() && !seen.add(key)) continue;
+            target.add(card);
+        }
+    }
+
+    private static String productCardKey(Map<String, Object> card) {
+        Object id = card.get("product_id");
+        if (id == null) id = card.get("productId");
+        if (id == null) id = card.get("id");
+        if (id == null) id = card.get("title");
+        return id == null ? "" : String.valueOf(id);
     }
 
     private void saveQaLog(Long userId, Long convId, String question, String answer, String taskType, long duration) {

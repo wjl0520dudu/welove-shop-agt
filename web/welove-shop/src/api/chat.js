@@ -51,7 +51,7 @@ export function stopStream(payload = {}) {
  * 事件命名做双向兼容映射后回调给页面。
  *
  * @param {object} payload  { userId, conversationId, content, username?, isAdmin?, gender?, skinType?, preferenceTags? }
- * @param {object} cb  { onOpen, onText, onProductCards, onConfirm, onCartSelection, onRouted, onDone, onError }
+ * @param {object} cb  { onOpen, onText, onSubtaskResult, onProductCards, onConfirm, onCartSelection, onRouted, onDone, onError }
  * @returns {{ promise: Promise<void>, abort: () => void }}
  */
 export function streamMessage(payload, cb = {}) {
@@ -161,6 +161,9 @@ function dispatchChatEvent({ event, data }, cb) {
       break
     case 'orchestrator_subtask':
       cb.onOrchestratorSubtask && cb.onOrchestratorSubtask(obj || {})
+      break
+    case 'subtask_result':
+      cb.onSubtaskResult && cb.onSubtaskResult(obj || {})
       break
     case 'final': {
       // final 携带完整响应：在此提取卡片/路由。

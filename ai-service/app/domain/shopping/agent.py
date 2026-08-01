@@ -9,7 +9,7 @@ from uuid import uuid4
 from langchain.agents import create_agent
 from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddleware
 from langchain.agents.middleware.tool_call_limit import ToolCallLimitMiddleware
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.domain.shopping.preferences import build_preference_questions
@@ -155,22 +155,37 @@ class ShoppingAgent:
             # middleware contributes graph steps too, so 8 can reject that
             # healthy three-step flow before its final model response.  The
             # tool/model middleware still provides the real loop bounds.
-            result = await agent.ainvoke(
-                {
-                    "messages": agent_messages,
-                    "conversation_id": conversation_id,
-                    "user_id": user_id,
-                    "jwt_token": jwt_token,
-                    "business_memory": effective_memory,
-                    "selected_product_ids": bound_product_ids,
-                    "image_url": image_url or "",
-                    "input_mode": normalised_input_mode,
-                },
-                config={
-                    "configurable": {"thread_id": str(uuid4())},
-                    "recursion_limit": 12,
-                },
-            )
+            agent_input = {
+                "messages": agent_messages,
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+                "jwt_token": jwt_token,
+                "business_memory": effective_memory,
+                "selected_product_ids": bound_product_ids,
+                "image_url": image_url or "",
+                "input_mode": normalised_input_mode,
+            }
+            agent_config = {
+                "configurable": {"thread_id": str(uuid4())},
+                "recursion_limit": 12,
+            }
+            if token_sink is None:
+                result = await agent.ainvoke(agent_input, config=agent_config)
+            else:
+                result = {}
+                async for mode, payload in agent.astream(
+                    agent_input,
+                    config=agent_config,
+                    stream_mode=["values", "messages"],
+                ):
+                    if mode == "values" and isinstance(payload, dict):
+                        result = payload
+                    elif mode == "messages":
+                        message, _metadata = payload
+                        if isinstance(message, AIMessageChunk):
+                            content = _stream_text_content(message.content)
+                            if content:
+                                _emit_token(token_sink, content)
         except Exception as e:
             logger.exception("ShoppingAgent ainvoke failed")
             fallback = await self._run_restricted_fallback(

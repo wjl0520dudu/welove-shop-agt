@@ -6,7 +6,7 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.tools import tool
 
@@ -24,6 +24,16 @@ class _FakeAgent:
         if self.error:
             raise self.error
         return self.result
+
+
+class _FakeStreamingAgent(_FakeAgent):
+    async def astream(self, state, config, stream_mode):
+        self.calls.append((state, config))
+        assert stream_mode == ["values", "messages"]
+        yield "messages", (AIMessageChunk(content="逐"), {})
+        yield "messages", (AIMessageChunk(content="字"), {})
+        yield "messages", (AIMessageChunk(content="回答"), {})
+        yield "values", self.result
 
 
 class _ToolBoundFakeModel(FakeMessagesListChatModel):
@@ -96,6 +106,31 @@ def test_normal_turn_uses_create_agent_and_never_pre_dispatches_rules():
         assert result["capability"] == "recommend"
         assert result["product_cards"] == [{"product_id": 7, "title": "通勤耳机"}]
         assert result["model_call_count"] == 2
+
+    asyncio.run(run())
+
+
+def test_agent_streams_provider_chunks_when_token_sink_is_supplied():
+    async def run():
+        fake_agent = _FakeStreamingAgent(_tool_loop_result(
+            tool_name="recommend_products",
+            action="recommend",
+            payload={"product_cards": [{"product_id": 7, "title": "通勤耳机"}]},
+        ))
+        shopping = ShoppingAgent(llm=MagicMock())
+        received: list[str] = []
+
+        with patch("app.domain.shopping.agent.create_agent", return_value=fake_agent):
+            result = await shopping.run(
+                question="推荐通勤耳机",
+                messages=[],
+                business_memory={},
+                token_sink=received.append,
+            )
+
+        assert received == ["逐", "字", "回答"]
+        assert result["answer"] == "这是基于工具真实结果的自然回答。"
+        assert result["product_cards"] == [{"product_id": 7, "title": "通勤耳机"}]
 
     asyncio.run(run())
 
