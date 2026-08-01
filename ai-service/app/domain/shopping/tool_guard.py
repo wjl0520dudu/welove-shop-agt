@@ -29,6 +29,11 @@ _PRIMARY_CAPABILITIES = {
     "answer_product_detail": "detail",
 }
 
+_SHOPPING_FACT_TOOLS = frozenset({
+    *_PRIMARY_CAPABILITIES,
+    "get_user_shopping_context",
+})
+
 
 class RequireInitialShoppingToolMiddleware(AgentMiddleware):
     """Require the first ShoppingAgent model turn to choose a high-level tool.
@@ -47,6 +52,7 @@ class RequireInitialShoppingToolMiddleware(AgentMiddleware):
     ) -> ModelResponse:
         has_tool_result = any(
             isinstance(message, ToolMessage)
+            and str(getattr(message, "name", "") or "") in _SHOPPING_FACT_TOOLS
             for message in (request.messages or [])
         )
         if not has_tool_result:
