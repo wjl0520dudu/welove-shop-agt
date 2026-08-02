@@ -66,6 +66,7 @@ class AssistantState(TypedDict):
     dispatch_source: NotRequired[str]
     model_call_count: NotRequired[int]
     shopping_runtime: NotRequired[str]
+    knowledge_runtime: NotRequired[str]
     skill_reads: NotRequired[list[str]]
     script_calls: NotRequired[list[dict[str, Any]]]
 

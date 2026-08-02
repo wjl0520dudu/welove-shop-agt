@@ -454,6 +454,27 @@ class AssistantGraph:
             for question in (result.get("suggested_questions") or [])
             if question
         ))[:4]
+        skill_reads = list(dict.fromkeys(
+            skill_name
+            for result in ordered_results
+            for skill_name in (result.get("skill_reads") or [])
+            if skill_name
+        ))
+        script_calls = [
+            call
+            for result in ordered_results
+            for call in (result.get("script_calls") or [])
+        ]
+        shopping_runtime = next((
+            result.get("shopping_runtime")
+            for result in ordered_results
+            if result.get("shopping_runtime")
+        ), None)
+        knowledge_runtime = next((
+            result.get("knowledge_runtime")
+            for result in ordered_results
+            if result.get("knowledge_runtime")
+        ), None)
         has_error = any(bool(result.get("error")) for result in ordered_results)
         answer = _join_subtask_answers(ordered_results)
 
@@ -470,6 +491,10 @@ class AssistantGraph:
             "retrieved_contexts": retrieved_contexts,
             "tool_calls": tool_calls,
             "suggested_questions": suggested_questions,
+            "shopping_runtime": shopping_runtime,
+            "knowledge_runtime": knowledge_runtime,
+            "skill_reads": skill_reads,
+            "script_calls": script_calls,
             "route": "complex",
             "route_reason": state.get("orchestrator_reason"),
             "error": has_error,
@@ -608,6 +633,10 @@ class AssistantGraph:
             "retrieved_contexts": result.get("retrieved_contexts", []),
             "tool_calls": result.get("tool_calls", []),
             "suggested_questions": result.get("suggested_questions", []),
+            "shopping_runtime": result.get("shopping_runtime"),
+            "knowledge_runtime": result.get("knowledge_runtime"),
+            "skill_reads": result.get("skill_reads", []),
+            "script_calls": result.get("script_calls", []),
             "duration_ms": int((time.perf_counter() - started) * 1000),
             "error": has_error,
             "error_code": result.get("error_code"),

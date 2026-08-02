@@ -144,6 +144,7 @@ def normalize_ai_response(
         sub_results=result.get("sub_results") or [],
         task_levels=result.get("task_levels") or [],
         shopping_runtime=result.get("shopping_runtime"),
+        knowledge_runtime=result.get("knowledge_runtime"),
         skill_reads=result.get("skill_reads") or [],
         script_calls=result.get("script_calls") or [],
     )

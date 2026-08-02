@@ -468,6 +468,7 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             "dispatch_source": state.get("dispatch_source"),
             "model_call_count": state.get("model_call_count"),
             "shopping_runtime": state.get("shopping_runtime"),
+            "knowledge_runtime": state.get("knowledge_runtime"),
             "skill_reads": state.get("skill_reads", []),
             "script_calls": state.get("script_calls", []),
             "error": bool(state.get("error", False)),
@@ -537,7 +538,7 @@ def _merge_result(result: Dict[str, Any], *, task_type: str,
     merged: Dict[str, Any] = {}
     for key in (
             "answer", "product_cards", "sources", "tool_calls", "suggested_questions", "retrieved_contexts",
-        "capability", "dispatch_source", "model_call_count", "shopping_runtime", "skill_reads", "script_calls",
+        "capability", "dispatch_source", "model_call_count", "shopping_runtime", "knowledge_runtime", "skill_reads", "script_calls",
         "hard_constraint_violation", "error", "error_code", "message",
     ):
         if key in result:

@@ -105,6 +105,14 @@ class Config:
     SHOPPING_SKILLS_ROOT = os.getenv(
         "SHOPPING_SKILLS_ROOT", "/skills/shopping-agent/"
     )
+    # KnowledgeAgent Deep Agents + Skills runtime. The old LangChain agent is
+    # retained only for an explicit manual rollback.
+    KNOWLEDGE_DEEP_AGENT_ENABLED = os.getenv(
+        "KNOWLEDGE_DEEP_AGENT_ENABLED", "true"
+    ).lower() in ("1", "true", "yes")
+    KNOWLEDGE_SKILLS_ROOT = os.getenv(
+        "KNOWLEDGE_SKILLS_ROOT", "/skills/knowledge-agent/"
+    )
     # Reviewed Skill scripts execute through a fixed whitelist runner. Generic
     # shell/Deep Agents execute remains hidden from ShoppingAgent.
     SHOPPING_SKILL_SCRIPT_MODE = os.getenv(

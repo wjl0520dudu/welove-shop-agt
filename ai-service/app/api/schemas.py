@@ -202,9 +202,13 @@ class AIResponse(FlexibleModel):
         None,
         description="Shopping runtime implementation used for this turn",
     )
+    knowledge_runtime: Optional[str] = Field(
+        None,
+        description="Knowledge runtime implementation used for this turn",
+    )
     skill_reads: List[str] = Field(
         default_factory=list,
-        description="Privacy-safe Shopping Skill names read during this turn",
+        description="Privacy-safe domain Skill names read during this turn",
     )
     script_calls: List[Dict[str, Any]] = Field(
         default_factory=list,

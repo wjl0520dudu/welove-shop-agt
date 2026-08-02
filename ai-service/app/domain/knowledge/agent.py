@@ -19,8 +19,10 @@ from pydantic import BaseModel, Field
 
 from app.infrastructure.persistence.memory import remember_knowledge_entities
 from app.infrastructure.llm.middleware import build_summarization_middleware
-from app.prompts.prompts import KNOWLEDGE_PROMPT
+from app.prompts.prompts import KNOWLEDGE_AGENT_PROMPT, KNOWLEDGE_PROMPT
 from app.application.assistant.state import KnowledgeAgentState
+from app.domain.knowledge.skill_observability import extract_knowledge_skill_reads
+from app.infrastructure.config import config
 from app.infrastructure.retrieval.retriever import get_retriever
 
 logger = logging.getLogger("ai-service.knowledge.agent")
@@ -227,7 +229,7 @@ def _extract_sources(messages: list) -> list:
 
 
 def _extract_tool_calls(messages: list) -> list[dict[str, Any]]:
-    """Build a stable, bounded tool trace from Agent AI/Tool messages."""
+    """Build a stable trace containing Knowledge business tools only."""
     calls: list[dict[str, Any]] = []
     by_id: dict[str, dict[str, Any]] = {}
     for message in messages or []:
@@ -241,6 +243,8 @@ def _extract_tool_calls(messages: list) -> list[dict[str, Any]]:
                     call_id = str(getattr(raw, "id", "") or "")
                     name = str(getattr(raw, "name", "") or "")
                     args = getattr(raw, "args", {}) or {}
+                if name != "search_knowledge":
+                    continue
                 item = {
                     "tool_call_id": call_id or None,
                     "tool_name": name,
@@ -258,6 +262,8 @@ def _extract_tool_calls(messages: list) -> list[dict[str, Any]]:
         call_id = str(getattr(message, "tool_call_id", "") or "")
         item = by_id.get(call_id)
         if item is None:
+            if str(getattr(message, "name", "") or "") != "search_knowledge":
+                continue
             item = {
                 "tool_call_id": call_id or None,
                 "tool_name": str(getattr(message, "name", "") or ""),
@@ -542,7 +548,7 @@ _UNGROUNDED_FALLBACK_ANSWER = (
 
 
 class KnowledgeAgent:
-    """知识问答 agent：create_agent + search_knowledge。
+    """Skill-driven knowledge agent with evidence-grounded retrieval.
 
     The main Intent Router owns cross-turn reference resolution.  This Agent
     receives a self-contained question and does not read historical entities or
@@ -559,10 +565,11 @@ class KnowledgeAgent:
 
     def __init__(self, llm):
         self._llm = llm
-        self._agent = None
+        self._legacy_agent = None
 
-    def _get_agent(self):
-        if self._agent is None:
+    def _get_legacy_agent(self):
+        """Return the explicit rollback runtime used when the switch is off."""
+        if self._legacy_agent is None:
             # 工具集（简化设计）：
             # - search_knowledge：内部知识库 RAG。**内部自动兜底**：
             #   分数 < 0.5 时程序自动触发博查网络搜索，LLM 无感知。
@@ -574,7 +581,7 @@ class KnowledgeAgent:
             #   超限后注入错误 ToolMessage，让模型用已有内容答（不硬停）
             # ModelCallLimit(5) 硬顶兜底，防弱模型死循环；recursion_limit 再兜一层
             #
-            self._agent = create_agent(
+            self._legacy_agent = create_agent(
                 model=self._llm,
                 checkpointer=_knowledge_checkpointer,
                 system_prompt=KNOWLEDGE_PROMPT,
@@ -590,7 +597,7 @@ class KnowledgeAgent:
                     ModelCallLimitMiddleware(run_limit=5, exit_behavior="end"),
                 ],
             )
-        return self._agent
+        return self._legacy_agent
 
     async def run(
         self,
@@ -629,8 +636,17 @@ class KnowledgeAgent:
                 question = content.strip()
                 break
 
-        # 对话级缓存：同一对话 + 同一问题，直接返回缓存
-        cache_key = f"{conversation_id}:{hashlib.md5(question.encode()).hexdigest()}" if question else ""
+        knowledge_runtime = (
+            "deep_agent" if config.KNOWLEDGE_DEEP_AGENT_ENABLED
+            else "langchain_agent"
+        )
+
+        # 对话级缓存：同一运行时 + 同一对话 + 同一问题，直接返回缓存。
+        # 把运行时加入 key，确保人工回滚开关切换后不会复用另一条链的观测结果。
+        cache_key = (
+            f"{knowledge_runtime}:{conversation_id}:"
+            f"{hashlib.md5(question.encode()).hexdigest()}"
+        ) if question else ""
         if cache_key and cache_key in _knowledge_cache:
             cached = _knowledge_cache[cache_key]
             await self._persist_entities(conversation_id, user_id, question, cached.get("sources") or [])
@@ -650,13 +666,28 @@ class KnowledgeAgent:
         }
         agent_config = {
             "configurable": {"thread_id": str(uuid4())},
-            "recursion_limit": 12,
+            "recursion_limit": 32 if knowledge_runtime == "deep_agent" else 12,
         }
+        skill_source = "/skills/knowledge-agent/"
+        if config.KNOWLEDGE_DEEP_AGENT_ENABLED:
+            from app.domain.knowledge.deep_agent import KnowledgeDeepAgentAdapter
+
+            deep_runtime = KnowledgeDeepAgentAdapter(
+                llm=self._llm,
+                tools=[search_knowledge],
+                checkpointer=_knowledge_checkpointer,
+                skills_root=config.KNOWLEDGE_SKILLS_ROOT,
+            ).build(system_prompt=KNOWLEDGE_AGENT_PROMPT)
+            agent = deep_runtime.graph
+            skill_source = deep_runtime.skill_source
+        else:
+            agent = self._get_legacy_agent()
+
         if token_sink is None:
-            result = await self._get_agent().ainvoke(agent_input, config=agent_config)
+            result = await agent.ainvoke(agent_input, config=agent_config)
         else:
             result = {}
-            async for mode, payload in self._get_agent().astream(
+            async for mode, payload in agent.astream(
                 agent_input,
                 config=agent_config,
                 stream_mode=["values", "messages"],
@@ -682,6 +713,30 @@ class KnowledgeAgent:
                     break
         sources = _extract_sources(result_messages)
         tool_calls = _extract_tool_calls(result_messages)
+        skill_reads = (
+            extract_knowledge_skill_reads(
+                result_messages,
+                skill_source=skill_source,
+            )
+            if knowledge_runtime == "deep_agent"
+            else []
+        )
+
+        if not any(call.get("status") == "completed" for call in tool_calls):
+            logger.warning("knowledge agent completed without a successful knowledge tool call")
+            return {
+                "answer": "我需要先检索可靠资料，但这次检索没有成功，请稍后再试。",
+                "sources": [],
+                "retrieved_contexts": [],
+                "tool_calls": tool_calls,
+                "confidence": 0.0,
+                "has_answer": False,
+                "task_type": "knowledge",
+                "knowledge_runtime": knowledge_runtime,
+                "skill_reads": skill_reads,
+                "error": True,
+                "error_code": "AI_RAG_TOOL_NOT_EXECUTED",
+            }
 
         # ── 生成后自评（反幻觉最后一道关）──
         # 让 LLM 自己判断答案是否完全来自参考资料。判为 false 时改写为兜底文案。
@@ -715,6 +770,8 @@ class KnowledgeAgent:
             "confidence": 0.7 if sources else 0.3,
             "has_answer": bool(sources) and grounded,
             "task_type": "knowledge",
+            "knowledge_runtime": knowledge_runtime,
+            "skill_reads": skill_reads,
         }
 
         # 存入缓存
