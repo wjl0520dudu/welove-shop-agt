@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 # 主图只产 shopping|knowledge|chitchat|unknown；cart 仅为兼容旧购物车库保留。
 TaskType = Literal["shopping", "knowledge", "chitchat", "unknown", "cart"]
 RouteMode = Literal["simple", "complex"]
+ImageQueryMode = Literal["unused", "image_only", "multimodal"]
 OrchestratorIntentHint = Literal["shopping", "knowledge", "chitchat", "unknown"]
 
 
@@ -54,6 +55,14 @@ class IntentDecision(BaseModel):
     resolved_knowledge_entities: List[str] = Field(
         default_factory=list,
         description="Router 从会话上下文理解出的知识实体；无知识指代时为空。",
+    )
+    image_query_mode: ImageQueryMode = Field(
+        "unused",
+        description=(
+            "仅当前轮带参考图片时使用：image_only=用户文字没有额外的商品条件，"
+            "应以图搜相似商品；multimodal=文字包含需要与图片共同满足的商品条件；"
+            "unused=图片与当前任务无关或本轮没有图片。"
+        ),
     )
 
 

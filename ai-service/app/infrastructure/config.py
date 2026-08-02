@@ -113,6 +113,12 @@ class Config:
     SHOPPING_SKILL_SCRIPT_TIMEOUT_SECONDS = float(os.getenv(
         "SHOPPING_SKILL_SCRIPT_TIMEOUT_SECONDS", "2"
     ))
+    # DashScope's multimodal SDK is synchronous.  The shopping retrieval
+    # wrapper runs it in a bounded worker and uses this as the total request
+    # budget, so a stalled third-party call cannot block FastAPI's event loop.
+    SHOPPING_MULTIMODAL_RETRIEVAL_TIMEOUT_SECONDS = float(os.getenv(
+        "SHOPPING_MULTIMODAL_RETRIEVAL_TIMEOUT_SECONDS", "12"
+    ))
     # 多模态 embedding / rerank 走百炼业务空间专属端点；不配置时使用 dashscope SDK 默认端点。
     DASHSCOPE_MAAS_BASE_URL = os.getenv("DASHSCOPE_MAAS_BASE_URL", "")
 

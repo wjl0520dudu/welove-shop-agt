@@ -32,6 +32,7 @@ def normalize_llm_decision(decision: Any) -> IntentDecision:
             canonical_question=str(getattr(decision, "canonical_question", "") or ""),
             resolved_product_ids=list(getattr(decision, "resolved_product_ids", []) or []),
             resolved_knowledge_entities=list(getattr(decision, "resolved_knowledge_entities", []) or []),
+            image_query_mode=str(getattr(decision, "image_query_mode", "unused") or "unused"),
         )
 
     route = str(normalized.task_type).lower().strip()
@@ -48,6 +49,10 @@ def normalize_llm_decision(decision: Any) -> IntentDecision:
     if mode == "complex":
         route = "unknown"
 
+    image_query_mode = str(normalized.image_query_mode or "unused").lower().strip()
+    if image_query_mode not in {"unused", "image_only", "multimodal"}:
+        image_query_mode = "unused"
+
     confidence = max(0.0, min(1.0, float(normalized.confidence or 0.0)))
     return IntentDecision(
         mode=mode,
@@ -58,4 +63,5 @@ def normalize_llm_decision(decision: Any) -> IntentDecision:
         canonical_question=str(normalized.canonical_question or "").strip(),
         resolved_product_ids=list(normalized.resolved_product_ids or []),
         resolved_knowledge_entities=list(normalized.resolved_knowledge_entities or []),
+        image_query_mode=image_query_mode,
     )

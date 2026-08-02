@@ -23,7 +23,11 @@ from app.domain.shopping.capabilities import (
     UserShoppingContextCapability,
 )
 from app.domain.shopping.dispatcher import DispatchDecision, dispatch_shopping_capability
-from app.domain.shopping.high_level_tools import SHOPPING_HIGH_LEVEL_TOOLS
+from app.domain.shopping.high_level_tools import (
+    SHOPPING_HIGH_LEVEL_TOOLS,
+    SHOPPING_ROLLBACK_TOOLS,
+    shopping_candidate_session,
+)
 from app.domain.shopping.script_tools import SHOPPING_SCRIPT_TOOLS
 from app.domain.shopping.schemas import ShoppingContext
 from app.domain.shopping.skill_observability import (
@@ -36,17 +40,18 @@ from app.domain.shopping.tool_guard import (
 )
 from app.infrastructure.config import config
 
-# Phase 1a 关键变更：LLM 只面对 4 个高层 tool，底层 12 个工具全部退到 Capability 内部。
-# 见 shopping/high_level_tools.py 和 shopping/capabilities/*。
-_ALL_TOOLS = SHOPPING_HIGH_LEVEL_TOOLS
+# 人工回滚链保留旧的一体化 Tool；DeepAgent 主链使用 S4/S5 窄 Tool。
+_ALL_TOOLS = SHOPPING_ROLLBACK_TOOLS
+_DEEP_AGENT_BUSINESS_TOOLS = SHOPPING_HIGH_LEVEL_TOOLS
 _BUSINESS_TOOL_NAMES = frozenset(
-    str(getattr(tool, "name", "") or "") for tool in _ALL_TOOLS
+    str(getattr(tool, "name", "") or "")
+    for tool in [*_ALL_TOOLS, *_DEEP_AGENT_BUSINESS_TOOLS]
 )
 
 
 def _deep_agent_tools() -> list:
     """Return the DeepAgent surface without changing the rollback runtime."""
-    tools = list(_ALL_TOOLS)
+    tools = list(_DEEP_AGENT_BUSINESS_TOOLS)
     if str(config.SHOPPING_SKILL_SCRIPT_MODE).lower() == "controlled":
         existing = {str(getattr(tool, "name", "") or "") for tool in tools}
         tools.extend(
@@ -64,18 +69,11 @@ _shopping_checkpointer = InMemorySaver()
 
 
 class ShoppingAgent:
-    """导购 Agent —— Phase 1a 起使用高层 Capability Tool 模式。
+    """Skill-driven ShoppingAgent with controlled, factual business tools.
 
-    ## Phase 1a 变更（本 commit）
-    - LLM 可见工具从 12 个 → 4 个高层 tool
-    - product_cards 从 ToolMessage 抽取（不再无条件读 Store 兜底）
-    - system_prompt 大幅精简（76 行控制指令 → 40 行工具描述）
-    - 底层工具（search_products/get_product_detail/…）仍存在，但只作为
-      Capability 内部函数被调用，不再挂给 LLM
-
-    ## Phase 1b 计划（下个 commit）
-    - shopping/retrieval.py 内部从 PgVectorStore 切到 ProductMilvusStore（三路 + rerank）
-    - agent.py 零改动
+    DeepAgent 主链按需读取 Shopping Skill。推荐任务由候选召回和结果终结
+    组成；比较与详情统一读取 Router 已绑定商品事实。关闭 DeepAgent 时仍可
+    人工回滚到旧的一体化 Tool。
     """
 
     def __init__(self, llm):
@@ -90,7 +88,7 @@ class ShoppingAgent:
     ) -> str:
         """Build a bounded, turn-local prompt for the Shopping Tool Agent."""
         bound = ", ".join(str(product_id) for product_id in selected_product_ids) or "无"
-        image_note = "有；仅 recommend_products 可以使用" if image_url else "无"
+        image_note = "有；仅商品发现 Skill 的候选召回步骤可以使用" if image_url else "无"
         return (
             SHOPPING_AGENT_PROMPT
             + "\n\n## 本轮 Router 已交付的执行边界\n"
@@ -213,23 +211,24 @@ class ShoppingAgent:
                 # cut off before its final model response.
                 "recursion_limit": 40 if shopping_runtime == "deep_agent" else 12,
             }
-            if token_sink is None:
-                result = await agent.ainvoke(agent_input, config=agent_config)
-            else:
-                result = {}
-                async for mode, payload in agent.astream(
-                    agent_input,
-                    config=agent_config,
-                    stream_mode=["values", "messages"],
-                ):
-                    if mode == "values" and isinstance(payload, dict):
-                        result = payload
-                    elif mode == "messages":
-                        message, _metadata = payload
-                        if isinstance(message, AIMessageChunk):
-                            content = _stream_text_content(message.content)
-                            if content:
-                                _emit_token(token_sink, content)
+            with shopping_candidate_session():
+                if token_sink is None:
+                    result = await agent.ainvoke(agent_input, config=agent_config)
+                else:
+                    result = {}
+                    async for mode, payload in agent.astream(
+                        agent_input,
+                        config=agent_config,
+                        stream_mode=["values", "messages"],
+                    ):
+                        if mode == "values" and isinstance(payload, dict):
+                            result = payload
+                        elif mode == "messages":
+                            message, _metadata = payload
+                            if isinstance(message, AIMessageChunk):
+                                content = _stream_text_content(message.content)
+                                if content:
+                                    _emit_token(token_sink, content)
         except Exception as e:
             logger.exception("ShoppingAgent ainvoke failed")
             fallback = await self._run_restricted_fallback(
@@ -323,7 +322,9 @@ class ShoppingAgent:
         action_to_capability = {
             "recommend": "recommend",
             "compare": "compare",
+            "compare_facts": "compare",
             "detail": "detail",
+            "detail_facts": "detail",
             "clarify": "clarify",
         }
         capability = action_to_capability.get(str((tool_result or {}).get("action") or ""))
@@ -684,7 +685,8 @@ def _extract_high_level_tool_result(messages: list) -> Dict[str, Any]:
     用这个字段过滤掉旧的底层工具残留（如果消息 buffer 里混着的话）。
     """
     high_level_actions = {
-        "recommend", "clarify", "empty", "compare", "detail"
+        "recommend", "clarify", "empty", "compare", "detail",
+        "compare_facts", "detail_facts",
     }
     for m in reversed(messages or []):
         if getattr(m, "type", "") != "tool":

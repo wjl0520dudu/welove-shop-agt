@@ -33,6 +33,10 @@ class AssistantState(TypedDict):
     conversation_history: NotRequired[list[dict[str, Any]]]
     context_resolution: NotRequired[dict[str, Any]]
     canonical_question: NotRequired[str]
+    # Router-owned image retrieval semantics.  This is deliberately separate
+    # from the presence of text: a phrase such as “帮我找这个” can be a pure
+    # image search rather than a text/image retrieval constraint.
+    input_mode: NotRequired[str]
 
     # ── 路由节点产出 ──
     route: NotRequired[str]

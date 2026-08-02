@@ -128,6 +128,33 @@ def test_router_routes_empty_text_image_as_a_new_shopping_search():
     asyncio.run(run())
 
 
+def test_router_routes_image_led_vague_text_as_pure_image_search():
+    """Image semantics come from the Router LLM, not a wording keyword list."""
+    async def run():
+        router = FakeStructuredRouter(IntentDecision(
+            mode="simple",
+            task_type="shopping",
+            confidence=0.96,
+            reason="用户要求根据当前图片查找商品",
+            canonical_question="根据当前图片查找相似商品",
+            image_query_mode="image_only",
+        ))
+        graph = _graph_with_router(router)
+        result = await graph._route({
+            "question": "给我找这个东西",
+            "image_url": "https://img.example.test/shoe.jpg",
+            "messages": [],
+            "business_memory": {},
+        })
+
+        assert result["route"] == "shopping"
+        assert result["question"] == "根据当前图片查找相似商品"
+        assert result["input_mode"] == "image"
+        assert result["route_source"] == "llm"
+
+    asyncio.run(run())
+
+
 def test_router_rejects_whole_binding_when_any_product_id_is_outside_active_cards():
     async def run():
         router = FakeStructuredRouter(IntentDecision(

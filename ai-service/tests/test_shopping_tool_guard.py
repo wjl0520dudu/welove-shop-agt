@@ -108,6 +108,48 @@ def test_first_model_turn_requires_a_high_level_tool_but_final_answer_does_not()
     asyncio.run(run())
 
 
+def test_candidate_search_requires_finalize_unless_search_is_terminal():
+    async def run():
+        middleware = RequireInitialShoppingToolMiddleware()
+        observed: list[object] = []
+
+        async def handler(request):
+            observed.append(request.tool_choice)
+            return ModelResponse(result=[AIMessage(content="ok")])
+
+        after_candidates = ModelRequest(
+            model=AsyncMock(),
+            messages=[ToolMessage(
+                content='{"action":"candidates","candidate_set_id":"set-1"}',
+                tool_call_id="search",
+                name="search_product_candidates",
+            )],
+        )
+        after_empty = ModelRequest(
+            model=AsyncMock(),
+            messages=[ToolMessage(
+                content='{"action":"empty","empty_reason":"none"}',
+                tool_call_id="search-empty",
+                name="search_product_candidates",
+            )],
+        )
+        after_finalize = ModelRequest(
+            model=AsyncMock(),
+            messages=[ToolMessage(
+                content='{"action":"recommend","product_cards":[]}',
+                tool_call_id="finalize",
+                name="finalize_product_recommendation",
+            )],
+        )
+
+        await middleware.awrap_model_call(after_candidates, handler)
+        await middleware.awrap_model_call(after_empty, handler)
+        await middleware.awrap_model_call(after_finalize, handler)
+        assert observed == ["required", None, None]
+
+    asyncio.run(run())
+
+
 def test_matching_skill_is_required_before_a_business_tool_executes():
     async def run():
         middleware = RequireMatchingShoppingSkillMiddleware()

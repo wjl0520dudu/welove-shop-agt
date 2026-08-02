@@ -29,21 +29,76 @@ from app.domain.shopping.skill_observability import shopping_skill_name_from_pat
 
 _PRIMARY_CAPABILITIES = {
     "recommend_products": "recommend",
+    "search_product_candidates": "recommend",
+    "finalize_product_recommendation": "recommend",
     "compare_products": "compare",
     "answer_product_detail": "detail",
 }
 
+
+def _capability_for_tool(tool_name: str, args: dict[str, Any]) -> str | None:
+    """Resolve execution capability without interpreting user language."""
+    if tool_name == "load_bound_product_facts":
+        purpose = str(args.get("purpose") or "").strip()
+        return purpose if purpose in {"compare", "detail"} else None
+    return _PRIMARY_CAPABILITIES.get(tool_name)
+
 _SHOPPING_FACT_TOOLS = frozenset({
     *_PRIMARY_CAPABILITIES,
+    "load_bound_product_facts",
     "get_user_shopping_context",
 })
 
 SHOPPING_TOOL_SKILL_REQUIREMENTS = {
     "recommend_products": "discover-products",
+    "search_product_candidates": "discover-products",
+    "finalize_product_recommendation": "discover-products",
     "compare_products": "compare-products",
     "answer_product_detail": "inspect-product",
     "get_user_shopping_context": "use-shopping-profile",
 }
+
+
+def _required_skill_for_tool(tool_name: str, args: dict[str, Any]) -> str | None:
+    """Map the unified facts tool to the Skill-selected purpose."""
+    if tool_name == "load_bound_product_facts":
+        purpose = str(args.get("purpose") or "").strip()
+        if purpose == "compare":
+            return "compare-products"
+        if purpose == "detail":
+            return "inspect-product"
+        return None
+    return SHOPPING_TOOL_SKILL_REQUIREMENTS.get(tool_name)
+
+_TERMINAL_SHOPPING_TOOLS = frozenset({
+    "recommend_products",
+    "finalize_product_recommendation",
+    "compare_products",
+    "answer_product_detail",
+    "load_bound_product_facts",
+    "get_user_shopping_context",
+})
+
+
+def _tool_message_action(message: ToolMessage) -> str:
+    try:
+        payload = json.loads(str(message.content or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    return str(payload.get("action") or "") if isinstance(payload, dict) else ""
+
+
+def _is_terminal_shopping_result(message: Any) -> bool:
+    if not isinstance(message, ToolMessage) or getattr(message, "status", None) == "error":
+        return False
+    name = str(getattr(message, "name", "") or "")
+    if name in _TERMINAL_SHOPPING_TOOLS:
+        return True
+    # Candidate search is terminal only when there is nothing to finalize.
+    return name == "search_product_candidates" and _tool_message_action(message) in {
+        "clarify",
+        "empty",
+    }
 
 
 class RequireInitialShoppingToolMiddleware(AgentMiddleware):
@@ -62,9 +117,7 @@ class RequireInitialShoppingToolMiddleware(AgentMiddleware):
         handler,
     ) -> ModelResponse:
         has_tool_result = any(
-            isinstance(message, ToolMessage)
-            and str(getattr(message, "name", "") or "") in _SHOPPING_FACT_TOOLS
-            and getattr(message, "status", None) != "error"
+            _is_terminal_shopping_result(message)
             for message in (request.messages or [])
         )
         if not has_tool_result:
@@ -146,7 +199,7 @@ class RequireMatchingShoppingSkillMiddleware(AgentMiddleware):
                     self.read_skills.append(skill_name)
             return result
 
-        required_skill = SHOPPING_TOOL_SKILL_REQUIREMENTS.get(tool_name)
+        required_skill = _required_skill_for_tool(tool_name, args)
         if tool_name == SHOPPING_SCRIPT_TOOL_NAME:
             required_skill = str(args.get("skill_name") or "").strip() or None
         if required_skill is None or required_skill in self.read_skills:
@@ -203,7 +256,7 @@ class ShoppingToolGuardMiddleware(AgentMiddleware):
         args = dict(args) if isinstance(args, dict) else {}
         state = dict(request.state or {})
         call_id = str(tool_call.get("id") or "shopping-tool-call")
-        capability = _PRIMARY_CAPABILITIES.get(tool_name)
+        capability = _capability_for_tool(tool_name, args)
 
         # Deep Agents adds read_file for progressive Skill loading.  It is an
         # internal runtime operation, not a Shopping capability, so it must not
@@ -331,6 +384,20 @@ class ShoppingToolGuardMiddleware(AgentMiddleware):
             if requested and requested[0] not in bound_ids:
                 return "本轮只能查询已确认的商品，请重新说明要了解的商品。"
             if not requested and len(bound_ids) != 1:
+                return "你想了解哪一件商品？请明确商品名或序号。"
+        if tool_name == "load_bound_product_facts":
+            purpose = str(args.get("purpose") or "").strip()
+            requested = _normalise_ids(args.get("product_ids"))
+            effective_ids = requested or bound_ids
+            if purpose not in {"compare", "detail"}:
+                return "请明确本次是比较商品还是查询单品详情。"
+            if not bound_ids:
+                return "我还不确定你指的是哪些商品，请明确商品名或序号。"
+            if requested and any(product_id not in bound_ids for product_id in requested):
+                return "本轮只能读取 Router 已确认的商品，请重新说明商品。"
+            if purpose == "compare" and len(effective_ids) < 2:
+                return "至少需要两件已确认商品才能比较。"
+            if purpose == "detail" and len(effective_ids) != 1:
                 return "你想了解哪一件商品？请明确商品名或序号。"
         return None
 

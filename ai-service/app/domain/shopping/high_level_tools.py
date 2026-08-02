@@ -1,4 +1,4 @@
-"""ShoppingAgent 的高层 Tool 入口 —— LLM 只面对这 4 个。
+"""ShoppingAgent 的受控业务 Tool 入口。
 
 ## 关键约束
 - 每个 Tool 的 docstring 是 LLM 判断"用哪个"的重要依据，必须清楚写：
@@ -12,12 +12,16 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+import secrets
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 
 from app.domain.shopping.capabilities import (
+    BoundProductFactsCapability,
     CompareCapability,
     DetailCapability,
     RecommendCapability,
@@ -26,6 +30,33 @@ from app.domain.shopping.capabilities import (
 from app.domain.shopping.context import build_shopping_context_from_runtime
 
 logger = logging.getLogger("ai-service.shopping.high_level_tools")
+
+
+# DeepAgent 的一次运行会跨多个模型/Tool step。候选集只在该请求的上下文中
+# 暂存，Agent 只拿到不可猜测的 ID；终结 Tool 始终使用服务端保存的原始候选，
+# 不接受模型重新提交商品事实。
+_CANDIDATE_SESSION: ContextVar[Optional[dict[str, dict[str, Any]]]] = ContextVar(
+    "shopping_candidate_session",
+    default=None,
+)
+
+
+@contextmanager
+def shopping_candidate_session():
+    """Create an isolated candidate registry for one ShoppingAgent run."""
+    token = _CANDIDATE_SESSION.set({})
+    try:
+        yield
+    finally:
+        _CANDIDATE_SESSION.reset(token)
+
+
+def _candidate_registry() -> dict[str, dict[str, Any]]:
+    registry = _CANDIDATE_SESSION.get()
+    if registry is None:
+        registry = {}
+        _CANDIDATE_SESSION.set(registry)
+    return registry
 
 
 # ---- Tool 1: recommend_products -----------------------------------------
@@ -65,6 +96,106 @@ async def recommend_products(
         "message",
     })
     payload["requested_limit"] = max(1, int(limit or 3))
+    payload["returned_count"] = len(payload.get("product_cards") or [])
+    return payload
+
+
+# ---- Phase S4: narrow recommendation tools -----------------------------
+
+@tool(parse_docstring=True)
+async def search_product_candidates(
+    runtime: ToolRuntime,
+    query: str,
+    limit: int = 3,
+) -> dict:
+    """召回真实商城候选，不做最终候选审核或商品卡构造。
+
+    用于 ``discover-products`` Skill 的第一步。文本、纯图片和图文请求都使用
+    本工具；输入模式与图片由运行时提供，不允许模型选择底层检索通道。
+
+    Args:
+        query: Router 已消解指代后的完整商品需求。
+        limit: 用户期望展示的商品数量，默认 3。
+
+    Returns:
+        action=candidates 时返回有限 CandidateSet 和 candidate_set_id；
+        action=clarify/empty 时返回对应原因并终止推荐流程。
+    """
+    context = await build_shopping_context_from_runtime(runtime)
+    requested_limit = max(1, int(limit or 3))
+    result = await RecommendCapability().search_candidates(
+        query=query,
+        context=context,
+        limit=requested_limit,
+    )
+    payload = result.model_dump(include={
+        "action",
+        "candidate_set",
+        "clarify_question",
+        "empty_reason",
+    })
+    payload["requested_limit"] = requested_limit
+    candidate_set = result.candidate_set
+    payload["candidate_count"] = len(candidate_set.candidates) if candidate_set else 0
+    if result.action == "candidates" and candidate_set is not None:
+        candidate_set_id = secrets.token_urlsafe(18)
+        _candidate_registry()[candidate_set_id] = {
+            "query": str(query or "").strip(),
+            "requested_limit": requested_limit,
+            "result": result,
+        }
+        payload["candidate_set_id"] = candidate_set_id
+    return payload
+
+
+@tool(parse_docstring=True)
+async def finalize_product_recommendation(
+    runtime: ToolRuntime,
+    candidate_set_id: str,
+) -> dict:
+    """按 ``discover-products`` Skill 审核已召回候选并生成最终商品卡。
+
+    仅用于 ``search_product_candidates`` 成功后的第二步。候选事实由服务端根据
+    candidate_set_id 读取，模型不能传入、替换或改写商品 ID、价格和候选字段。
+    第一轮迁移继续复用现有单次 Candidate Judge。
+
+    Args:
+        candidate_set_id: 候选召回工具返回的请求级候选集 ID。
+
+    Returns:
+        包含 action、product_cards、ranked_products、returned_count 和
+        empty_reason 的最终结构化推荐结果。
+    """
+    record = _candidate_registry().get(str(candidate_set_id or "").strip())
+    if not record:
+        return {
+            "action": "empty",
+            "product_cards": [],
+            "ranked_products": [],
+            "returned_count": 0,
+            "error": True,
+            "error_code": "SHOPPING_CANDIDATE_SET_EXPIRED",
+            "empty_reason": "候选结果已失效，请重新执行一次商品候选召回。",
+        }
+
+    search_result = record["result"]
+    context = await build_shopping_context_from_runtime(runtime)
+    result = await RecommendCapability().finalize_candidates(
+        query=record["query"],
+        context=context,
+        candidate_set=search_result.candidate_set,
+        limit=record["requested_limit"],
+        need=search_result.need,
+        trace=search_result.trace,
+    )
+    payload = result.model_dump(include={
+        "action",
+        "ranked_products",
+        "product_cards",
+        "clarify_question",
+        "empty_reason",
+    })
+    payload["requested_limit"] = record["requested_limit"]
     payload["returned_count"] = len(payload.get("product_cards") or [])
     return payload
 
@@ -127,6 +258,36 @@ async def answer_product_detail(
     return result.model_dump()
 
 
+# ---- Phase S5: unified bound-product fact tool --------------------------
+
+@tool(parse_docstring=True)
+async def load_bound_product_facts(
+    runtime: ToolRuntime,
+    purpose: Literal["compare", "detail"],
+    product_ids: Optional[List[int]] = None,
+) -> dict:
+    """读取 Router 已绑定商品的真实主档、价格、SKU、库存和规格事实。
+
+    用于 ``compare-products`` 或 ``inspect-product`` Skill；本工具不理解用户关注维度，
+    不从历史或自然语言猜商品 ID，也不替 Agent 做比较结论。
+
+    Args:
+        purpose: 当前 Skill 的用途；多商品比较传 compare，单商品详情传 detail。
+        product_ids: Router 已绑定 ID 的可选有序子集；不得传入未绑定的新 ID。
+
+    Returns:
+        compare_facts/detail_facts、真实 products、product_cards；绑定不清时返回
+        clarify，商品不存在或下架时返回 empty。
+    """
+    context = await build_shopping_context_from_runtime(runtime)
+    result = await BoundProductFactsCapability().run(
+        purpose=purpose,
+        context=context,
+        product_ids=product_ids,
+    )
+    return result.model_dump()
+
+
 # ---- Tool 4: get_user_shopping_context ----------------------------------
 
 @tool(parse_docstring=True)
@@ -159,11 +320,20 @@ async def get_user_shopping_context(
     )
 
 
-# ---- 工具集合（挂给 ShoppingAgent 的唯一入口）--------------------------
+# ---- 工具集合 ----------------------------------------------------------
 
-SHOPPING_HIGH_LEVEL_TOOLS: list = [
+# 关闭 DeepAgent 时的人工回滚链继续使用原有一体化推荐 Tool。
+SHOPPING_ROLLBACK_TOOLS: list = [
     recommend_products,
     compare_products,
     answer_product_detail,
+    get_user_shopping_context,
+]
+
+# Phase S4 主链：Skill 显式编排候选召回和结果终结。
+SHOPPING_HIGH_LEVEL_TOOLS: list = [
+    search_product_candidates,
+    finalize_product_recommendation,
+    load_bound_product_facts,
     get_user_shopping_context,
 ]

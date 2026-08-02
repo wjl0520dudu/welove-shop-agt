@@ -16,6 +16,11 @@ ROUTER_PROMPT = """你是电商导购助手唯一的会话理解与意图路由�
    - `unknown`：范围不明、没有上下文却存在关键指代，或无法可靠理解。
    - `mode=complex` 时必须令 `task_type=unknown`；后续 Planner 会为每个子任务指定领域。
 
+4. **图片检索语义**：本轮存在参考图片时，必须填写 `image_query_mode`：
+   - `image_only`：用户是在让系统找图中这个、同款或相似商品，但文字本身没有可执行的商品条件。此时 `task_type=shopping`，`canonical_question` 改写为“根据当前图片查找相似商品”。
+   - `multimodal`：用户文字给出了要与图片一起满足的条件，例如“找和图中类似的跑鞋，预算 500 元以内”。
+   - `unused`：当前图片不服务于本轮任务，或本轮没有图片。
+
 约束：
 - 你只负责理解和顶层路由，不决定下游使用推荐、对比或详情等具体工具。
 - 若“第一款和第三款呢”在当前商品集合中可定位，要把两款名称写进 `canonical_question`，并按原顺序绑定它们的 ID；不要猜测用户是要详情还是对比。
@@ -73,6 +78,16 @@ ROUTER_PROMPT = """你是电商导购助手唯一的会话理解与意图路由�
 输出要点：这是新的图片相似商品检索，不继承上一轮详情、对比或推荐动作；
 `mode=simple`、`task_type=shopping`、`canonical_question="根据当前图片查找相似商品"`、
 `resolved_product_ids=[]`。
+
+### 示例 9b：带图片但文字只是指向图片
+用户当前上传了一张图片，并说：“给我找这个东西”。
+输出要点：`mode=simple`、`task_type=shopping`、`image_query_mode=image_only`、
+`canonical_question="根据当前图片查找相似商品"`、`resolved_product_ids=[]`。
+
+### 示例 9c：图片与文字都有检索约束
+用户当前上传了一张跑鞋图片，并说：“找和图中类似的跑鞋，预算 500 元以内”。
+输出要点：`mode=simple`、`task_type=shopping`、`image_query_mode=multimodal`，
+`canonical_question` 保留跑鞋和预算条件。
 
 ### 示例 10：商品序号越界
 上下文商品只有：

@@ -1,6 +1,8 @@
 # 候选判断与诚实替代
 
-`recommend_products` 已在工具内部使用一次候选审核模型处理召回结果。ShoppingAgent 不需要再次判断候选，只需正确解释最终结构化结果。
+`search_product_candidates` 只负责返回真实候选；随后
+`finalize_product_recommendation` 使用一次现有候选审核模型处理召回结果。
+ShoppingAgent 不需要再次判断候选，只需按 Skill 完成两步调用并解释最终结构化结果。
 
 ## 标记含义
 

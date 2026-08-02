@@ -182,6 +182,21 @@ class CandidateSet(BaseModel):
 
 # ---- 三个高层 Tool 的返回契约 -------------------------------------------
 
+class CandidateSearchToolResult(BaseModel):
+    """候选召回窄 Tool 的内部契约。
+
+    ``candidates`` 只表示已经从真实商城召回的有限候选，还没有完成
+    exact / alternative 语义审核，也不会直接生成商品卡。
+    """
+
+    action: Literal["candidates", "clarify", "empty"]
+    need: Optional[ShoppingNeed] = None
+    candidate_set: Optional[CandidateSet] = None
+    clarify_question: Optional[str] = None
+    empty_reason: Optional[str] = None
+    trace: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class RecommendToolResult(BaseModel):
     """recommend_products 高层 Tool 返回的稳定结构。
 
@@ -203,10 +218,11 @@ class RecommendToolResult(BaseModel):
 
 
 class CompareToolResult(BaseModel):
-    """compare_products 高层 Tool 返回。
+    """旧回滚 ``compare_products`` Tool 返回。
 
     dimensions 是维度顺序（价格/评分/销量/成分/…），
-    comparison_rows 每行一个商品在各维度上的取值。
+    comparison_rows 每行一个商品在各维度上的取值；正常 DeepAgent 主链使用
+    ``BoundProductFactsToolResult``，不依赖本契约的 suggestion。
     """
 
     action: Literal["compare", "clarify", "empty"]
@@ -221,14 +237,10 @@ class CompareToolResult(BaseModel):
 
 
 class DetailToolResult(BaseModel):
-    """answer_product_detail 高层 Tool 返回。
+    """旧回滚 ``answer_product_detail`` Tool 返回。
 
-    facts 里的字段随 focus 变化：
-    - focus=price     → {price, sku_price_range, activity_price}
-    - focus=stock/sku → {skus:[{id, properties, price, stock}]}
-    - focus=overview  → {description, tags, rating, sales_count}
-    - focus=suitability → {suitable_skin, target_user, cautions}
-    - focus=ingredients → {core_ingredients, concentration, cautions}
+    当前回滚实现返回完整可信 facts，focus 仅为旧消息兼容字段；正常 DeepAgent
+    主链使用 ``BoundProductFactsToolResult``，由 Agent 理解开放详情问法。
     """
 
     action: Literal["detail", "clarify", "empty"]
@@ -238,6 +250,23 @@ class DetailToolResult(BaseModel):
     ]] = None
     facts: Dict[str, Any] = Field(default_factory=dict)
     product_cards: List[Dict[str, Any]] = Field(default_factory=list)
+    clarify_question: Optional[str] = None
+    empty_reason: Optional[str] = None
+    trace: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class BoundProductFactsToolResult(BaseModel):
+    """DeepAgent 主链统一的已绑定商品事实契约。
+
+    Agent 负责理解用户关心的比较或详情维度；Tool 只按 Router 已绑定 ID
+    返回真实商品与 SKU 事实，不从 query 猜测 focus，也不替 Agent 做选择。
+    """
+
+    action: Literal["compare_facts", "detail_facts", "clarify", "empty"]
+    purpose: Literal["compare", "detail"]
+    products: List[Dict[str, Any]] = Field(default_factory=list)
+    product_cards: List[Dict[str, Any]] = Field(default_factory=list)
+    missing_product_ids: List[int] = Field(default_factory=list)
     clarify_question: Optional[str] = None
     empty_reason: Optional[str] = None
     trace: List[Dict[str, Any]] = Field(default_factory=list)

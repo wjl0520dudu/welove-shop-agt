@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence
 
 from app.infrastructure.retrieval.multimodal_embeddings import (
@@ -23,6 +25,16 @@ from app.infrastructure.vectorstores.product.vector_store_v2 import get_product_
 from app.infrastructure.vectorstores.product.vector_store_three_path import get_product_milvus_store_three_path
 
 logger = logging.getLogger("ai-service.shopping.multimodal_search")
+
+# DashScope's image embedding and VL rerank SDK APIs are synchronous.  They
+# must never run on FastAPI/LangGraph's event loop: a slow upstream response
+# otherwise freezes unrelated requests (including /health/live).  A small,
+# shared executor also prevents repeatedly timed-out external calls from
+# creating an unbounded number of worker threads.
+_MULTIMODAL_RETRIEVAL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="shopping-multimodal",
+)
 
 
 def extract_explicit_product_filters(query_text: str) -> Dict[str, Any]:
@@ -239,7 +251,36 @@ async def search_multimodal_v1(
     top_k: int = 10,
     filters: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """接口①：三路融合 + qwen3-vl-rerank。"""
+    """三路融合 + qwen3-vl-rerank, isolated from the async event loop."""
+    timeout = max(0.1, float(config.SHOPPING_MULTIMODAL_RETRIEVAL_TIMEOUT_SECONDS))
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(
+        _MULTIMODAL_RETRIEVAL_EXECUTOR,
+        _search_multimodal_v1_sync,
+        query_text,
+        query_image_url,
+        top_k,
+        filters,
+    )
+    try:
+        return await asyncio.wait_for(future, timeout=timeout)
+    except TimeoutError:
+        # The SDK call may finish later in its bounded worker, but this request
+        # is released now and the event loop stays able to serve health/SSE.
+        logger.warning(
+            "multimodal retrieval timed out after %.1fs; returning control to caller",
+            timeout,
+        )
+        raise
+
+
+def _search_multimodal_v1_sync(
+    query_text: str,
+    query_image_url: str,
+    top_k: int,
+    filters: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Blocking portion of :func:`search_multimodal_v1`, run only in the pool."""
     top_k = max(int(top_k or 10), 1)
     # 生产开关仅影响最终选择的三路 v1；v2-v5 仍使用实验 collection，
     # 因为它们依赖生产 schema 刻意不保存的 multimodal_vector。

@@ -10,8 +10,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, patch
 
-from app.domain.shopping.capabilities.compare import CompareCapability, _extract_focus as extract_compare_focus
-from app.domain.shopping.capabilities.detail import DetailCapability, _extract_focus as extract_detail_focus
+from app.domain.shopping.capabilities.compare import CompareCapability
+from app.domain.shopping.capabilities.detail import DetailCapability
 from app.domain.shopping.schemas import ShoppingContext
 from app.domain.shopping.tools.shopping_tools import ProductFeatures
 
@@ -20,37 +20,6 @@ def _ctx(**kwargs):
     kw = {"conversation_id": "c1", "user_id": "u1"}
     kw.update(kwargs)
     return ShoppingContext(**kw)
-
-
-# ---- Compare focus/detail focus ------------------------------------------
-
-class TestExtractFocus:
-    def test_compare_price(self):
-        assert extract_compare_focus("哪个便宜") == "price"
-
-    def test_compare_rating(self):
-        assert extract_compare_focus("哪个评分高") == "rating"
-
-    def test_compare_skin_type(self):
-        assert extract_compare_focus("哪个适合敏感肌") == "skin_type"
-
-    def test_compare_default(self):
-        assert extract_compare_focus("对比一下") == "match"
-
-    def test_detail_price(self):
-        assert extract_detail_focus("多少钱") == "price"
-
-    def test_detail_stock(self):
-        assert extract_detail_focus("还有货吗") == "stock"
-
-    def test_detail_sku(self):
-        assert extract_detail_focus("有其他色号吗") == "sku"
-
-    def test_detail_ingredients(self):
-        assert extract_detail_focus("含什么成分") == "ingredients"
-
-    def test_detail_overview_default(self):
-        assert extract_detail_focus("讲讲这个") == "overview"
 
 
 # ---- Compare 主流程 -------------------------------------------------------
@@ -95,11 +64,8 @@ class TestCompareCapability:
         assert result.action == "compare"
         assert len(result.comparison_rows) == 2
         assert result.dimensions and "价格" in result.dimensions
-        # focus=match, 按 rating*0.6 + sales_norm*0.4 → B (rating 4.8, sales 300) vs A (4.5, 500)
-        # A: 0.6*(4.5/5)+0.4*(500/500)=0.54+0.4=0.94
-        # B: 0.6*(4.8/5)+0.4*(300/500)=0.576+0.24=0.816
-        # A 应该被选中
-        assert result.suggestion["recommended_product_id"] == 1
+        # 旧回滚 Tool 只给事实矩阵，不再通过关键词 focus 替 Agent 选赢家。
+        assert result.suggestion == {}
 
     def test_compare_uses_router_selected_product_ids(self):
         ctx = _ctx(
@@ -127,7 +93,7 @@ class TestCompareCapability:
         assert result.action == "compare"
         load.assert_awaited_once_with([1, 3])
 
-    def test_compare_focus_price_picks_cheapest(self):
+    def test_compare_open_question_does_not_require_a_focus_keyword_branch(self):
         cards = [
             {"product_id": 1, "title": "贵", "price": 500, "rating": 4.9, "sales_count": 100},
             {"product_id": 2, "title": "便宜", "price": 50, "rating": 4.0, "sales_count": 100},
@@ -143,7 +109,9 @@ class TestCompareCapability:
             new=AsyncMock(return_value={}),
         ):
             result = asyncio.run(cap.run(query="哪个便宜", context=ctx))
-        assert result.suggestion["recommended_product_id"] == 2
+        assert result.action == "compare"
+        assert result.suggestion == {}
+        assert [row["product_id"] for row in result.comparison_rows] == [1, 2]
 
     def test_compare_with_product_ids_hits_db(self):
         """显式传 product_ids → 从 PG 加载。"""
@@ -208,28 +176,24 @@ class TestDetailCapability:
             result = asyncio.run(DetailCapability().run(
                 query="有其他色号吗", context=_ctx(last_product_cards=cards, selected_product_ids=[1]),
             ))
-        assert result.focus == "sku"
+        assert result.focus is None
         assert result.facts["sku_count"] == 2
         assert result.facts["total_stock"] == 5
         assert result.facts["in_stock"] is True
 
-    def test_focus_ingredients_uses_llm_features(self):
+    def test_open_ingredient_question_uses_returned_product_facts_without_focus_rules(self):
         product = {"product_id": 5, "title": "A", "description": "含烟酰胺 5%"}
-        features = {5: ProductFeatures(core_ingredients=["烟酰胺"], concentration="5%")}
         with patch(
             "app.domain.shopping.capabilities.detail._load_product_detail_raw",
             new=AsyncMock(return_value=product),
-        ), patch(
-            "app.domain.shopping.capabilities.detail._extract_product_features",
-            new=AsyncMock(return_value=features),
         ):
             result = asyncio.run(DetailCapability().run(
                 query="含什么成分", context=_ctx(selected_product_ids=[5]),
                 product_id=5,
             ))
-        assert result.focus == "ingredients"
-        assert result.facts["core_ingredients"] == ["烟酰胺"]
-        assert result.facts["concentration"] == "5%"
+        assert result.focus is None
+        assert result.facts["description"] == "含烟酰胺 5%"
+        assert result.facts["in_stock"] is None
 
     def test_empty_when_product_missing(self):
         with patch(

@@ -8,11 +8,9 @@ if len < 2: return clarify
   ↓
 load_product_details(pids)         # 复用旧 shopping_tools.get_product_detail 逻辑
   ↓
-extract_focus(query)                # price/rating/skin_type/…
-  ↓
 _extract_product_features(products) # 复用旧 LLM 特征抽取
   ↓
-build_comparison_rows + choose_best_by_focus
+build_comparison_rows
   ↓
 CompareToolResult
 ```
@@ -44,24 +42,6 @@ _COMPARE_DIMENSIONS = [
 ]
 
 
-# focus 关键词：告诉排序器"用户最关心哪个维度"，给建议时用
-_FOCUS_MAP: Dict[str, List[str]] = {
-    "price": ["便宜", "性价比", "预算", "实惠", "多少钱"],
-    "rating": ["评分", "口碑", "评价"],
-    "sales": ["销量", "热卖", "卖得好"],
-    "skin_type": ["敏感肌", "油皮", "干皮", "混油", "肤质"],
-    "benefits": ["功效", "效果", "作用"],
-}
-
-
-def _extract_focus(query: str) -> str:
-    """从 query 提取用户最关心的对比维度。"""
-    for focus, keywords in _FOCUS_MAP.items():
-        if any(k in query for k in keywords):
-            return focus
-    return "match"
-
-
 async def _load_products_by_ids(product_ids: List[int]) -> List[Dict[str, Any]]:
     """按 product_id 列表批量拉商品主档。
 
@@ -71,27 +51,6 @@ async def _load_products_by_ids(product_ids: List[int]) -> List[Dict[str, Any]]:
     from app.infrastructure.vectorstores.product.active_store import load_active_products_by_ids
 
     return load_active_products_by_ids(product_ids)
-
-
-def _pick_best_by_focus(
-    rows: List[Dict[str, Any]],
-    focus: str,
-) -> Optional[Dict[str, Any]]:
-    """按 focus 挑一个最佳。行结构见 _row_from_product（价格/评分/销量是中文键）。"""
-    if not rows:
-        return None
-    if focus == "price":
-        return min(rows, key=lambda r: float(r.get("价格") or 1e12))
-    if focus == "rating":
-        return max(rows, key=lambda r: float(r.get("评分") or 0))
-    if focus == "sales":
-        return max(rows, key=lambda r: int(r.get("销量") or 0))
-    # match / benefits / skin_type：rating * 0.6 + sales_norm * 0.4
-    max_sales = max((int(r.get("销量") or 0) for r in rows), default=1) or 1
-    return max(rows, key=lambda r: (
-        0.6 * (float(r.get("评分") or 0) / 5.0)
-        + 0.4 * (int(r.get("销量") or 0) / max_sales)
-    ))
 
 
 def _row_from_product(p: Dict[str, Any], features: ProductFeatures) -> Dict[str, Any]:
@@ -119,6 +78,7 @@ class CompareCapability:
         product_ids: Optional[List[int]] = None,
     ) -> CompareToolResult:
         trace: List[Dict[str, Any]] = []
+        del query  # Open comparison dimensions are understood by the Agent.
 
         # Router is the sole cross-turn resolver.  A caller may narrow the
         # bound set, but must never introduce arbitrary ids or use a history
@@ -148,33 +108,18 @@ class CompareCapability:
                 trace=trace,
             )
 
-        # ── 2. focus 抽取 ──
-        focus = _extract_focus(query)
-        trace.append({"step": "extract_focus", "output": focus})
-
-        # ── 3. 特征抽取（复用旧 LLM）──
+        # 旧回滚 Tool 保留特征抽取，但不再通过关键词 focus 替 Agent 选赢家。
         features = await _extract_product_features(products)
         trace.append({"step": "extract_features", "output": {
             "product_ids": [int(p.get("product_id") or p.get("id", 0)) for p in products],
         }})
 
-        # ── 4. 组装 rows + 挑最佳 ──
+        # 组装完整事实行，比较维度与结论由 Agent 根据当前问题理解。
         rows: List[Dict[str, Any]] = []
         for p in products:
             pid = int(p.get("product_id") or p.get("id", 0))
             f = features.get(pid, ProductFeatures())
             rows.append(_row_from_product(p, f))
-
-        best = _pick_best_by_focus(rows, focus)
-        suggestion: Dict[str, Any] = {}
-        if best:
-            suggestion = {
-                "focus": focus,
-                "recommended_product_id": best.get("product_id"),
-                "recommended_title": best.get("title"),
-                "reason": _explain_pick(best, focus),
-            }
-        trace.append({"step": "choose_best", "output": suggestion})
 
         cards = _cards_from_products(products, limit=len(products))
 
@@ -183,7 +128,7 @@ class CompareCapability:
             products=products,
             dimensions=_COMPARE_DIMENSIONS,
             comparison_rows=rows,
-            suggestion=suggestion,
+            suggestion={},
             product_cards=cards,
             trace=trace,
         )
@@ -199,13 +144,3 @@ def _normalise_product_ids(values: Optional[List[int]]) -> List[int]:
         if product_id > 0 and product_id not in ids:
             ids.append(product_id)
     return ids
-
-
-def _explain_pick(best: Dict[str, Any], focus: str) -> str:
-    if focus == "price":
-        return f"「{best.get('title')}」在几款里价格最有优势（{best.get('价格')}元）。"
-    if focus == "rating":
-        return f"「{best.get('title')}」评分最高（{best.get('评分')}）。"
-    if focus == "sales":
-        return f"「{best.get('title')}」销量最好（{best.get('销量')}）。"
-    return f"综合评分/销量，我更推荐「{best.get('title')}」。"

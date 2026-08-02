@@ -107,6 +107,24 @@ def test_comparison_and_sku_scripts_only_transform_provided_facts():
                 "dimensions": [{"key": "facts.price", "label": "价格"}],
             },
         )
+        aggregate_matrix = await runner.run(
+            skill_name="compare-products",
+            script_name="build-comparison-matrix",
+            payload={
+                "products": [{
+                    "product_id": 1,
+                    "title": "A",
+                    "skus": [
+                        {"price": 99, "stock": 3},
+                        {"price": 109, "stock": 0},
+                    ],
+                }],
+                "dimensions": [
+                    {"key": "skus.price", "label": "SKU 价格区间", "aggregate": "range"},
+                    {"key": "skus.stock", "label": "总库存", "aggregate": "sum"},
+                ],
+            },
+        )
         sku = await runner.run(
             skill_name="inspect-product",
             script_name="summarize-sku-facts",
@@ -118,13 +136,16 @@ def test_comparison_and_sku_scripts_only_transform_provided_facts():
                 ],
             }},
         )
-        return units, matrix, sku
+        return units, matrix, aggregate_matrix, sku
 
-    units, matrix, sku = asyncio.run(run())
+    units, matrix, aggregate_matrix, sku = asyncio.run(run())
     assert units["result"]["rows"][0]["weight"]["value"] == 1200.0
     assert units["result"]["rows"][0]["storage"]["value"] == 1024.0
     assert units["result"]["rows"][0]["color"] == "black"
     assert matrix["result"]["matrix"][0]["values"] == {"价格": 99}
+    aggregate_values = aggregate_matrix["result"]["matrix"][0]["values"]
+    assert aggregate_values["SKU 价格区间"] == {"min": 99.0, "max": 109.0}
+    assert aggregate_values["总库存"] == 3.0
     assert sku["result"]["sku_count"] == 2
     assert sku["result"]["available_sku_count"] == 1
     assert sku["result"]["total_stock"] == 3

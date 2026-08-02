@@ -1,6 +1,6 @@
 # ShoppingAgent 基于 Deep Agents 与 Agent Skills 的重构方案
 
-> 文档状态：设计完成；Phase S0 至 Phase S3 已开发并通过离线验证，待进入 Phase S4
+> 文档状态：设计完成；Phase S0 至 Phase S5 已开发，Phase S4/S5 待真实服务冒烟
 >
 > 适用范围：`ai-service` 内部 ShoppingAgent，不改顶层 Router、Planner、DAG、SSE 和前端商品卡协议
 >
@@ -582,7 +582,7 @@ get_user_shopping_context
 | --- | --- |
 | `recommend_products` | `search_product_candidates` + Agent 语义判断 + `finalize_product_recommendation` |
 | `compare_products` | `load_bound_product_facts` + 可选特征抽取 + 对比 Script |
-| `answer_product_detail` | `get_bound_product_detail` + 可选 SKU Script / 特征 Tool |
+| `answer_product_detail` | `load_bound_product_facts(purpose=detail)` + 可选 SKU Script |
 | `get_user_shopping_context` | 保留为窄 Tool，按授权读取基础画像 |
 
 拆分的目的不是让 Agent 自由乱调更多工具，而是让 Skill 能组合稳定步骤，同时把每个 Tool 的输入输出变得清楚、可验证。
@@ -1198,6 +1198,21 @@ Shopping / Judge / 多模态 / SSE / 主图 / API 合并回归：120 passed
 
 完成标准：Skill 决定流程，Tool 提供事实，代码只校验候选和构造卡片。
 
+#### Phase S4 实现记录
+
+- DeepAgent 主链将一体化 `recommend_products` 替换为
+  `search_product_candidates → finalize_product_recommendation`；
+- `RecommendCapability` 拆出 `search_candidates()` 与 `finalize_candidates()`，
+  原 `run()` 保留为关闭 DeepAgent 时的人工回滚组合入口；
+- 文本、纯图和图文仍统一输出 `CandidateSet`，没有增加新的检索通道或语义规则；
+- 第一轮继续复用现有单次 Candidate Judge，没有新增 LLM 调用；
+- 候选集通过请求级随机 `candidate_set_id` 传递，终结 Tool 读取服务端保存的
+  原始候选，模型不能改写商品 ID、价格或候选事实；
+- 候选召回返回 `clarify/empty` 时直接结束，返回 `candidates` 时中间件强制继续
+  调用终结 Tool，未完成终结不能直接生成推荐回答；
+- `discover-products` Skill 已更新为两步编排，正常链路不重复运行候选脚本；
+- 原 `recommend_products` 仅保留在 `SHOPPING_DEEP_AGENT_ENABLED=false` 的人工回滚链。
+
 ### Phase S5：拆窄 Compare / Detail Tool
 
 目标：移除不断扩充的固定关注点关键词。
@@ -1211,6 +1226,46 @@ Shopping / Judge / 多模态 / SSE / 主图 / API 合并回归：120 passed
 - 删除无用 `_FOCUS_MAP` 分支，前提是回归通过。
 
 完成标准：新增一种对比维度或详情问法优先改 Skill/reference，不需要继续扩充关键词表。
+
+#### Phase S5 实现记录
+
+- DeepAgent 主链不再暴露一体化 `compare_products` 和
+  `answer_product_detail`，两者仅保留在
+  `SHOPPING_DEEP_AGENT_ENABLED=false` 的人工回滚链；
+- 新增统一 `load_bound_product_facts`，仅接收
+  `purpose=compare|detail` 和 Router 已绑定商品 ID 的可选有序子集，
+  不接收 query、focus 或自然语言关键词；
+- 新增 `BoundProductFactsCapability` 和稳定契约，一次返回真实商品主档、
+  价格、SKU、库存、规格及商品卡；不存在、下架、数量不足或绑定不清时返回
+  `empty/clarify`；
+- Compare Skill 由 Agent 根据当前完整问题理解开放比较维度，再按需运行
+  `normalize-units` 或 `build-comparison-matrix`；代码不再通过 `_FOCUS_MAP`
+  识别价格、评分、销量、肤质等固定词，也不替 Agent 选择赢家；矩阵 script
+  支持对任意真实字段路径做 `range/min/max/sum/count` 聚合，因此 SKU 价格区间、
+  总库存等新维度不需要继续扩充关键词映射代码；
+- Inspect Skill 由 Agent 根据当前完整问题理解详情关注点；只有 SKU 价格区间、
+  总库存或规格汇总需要确定性计算时才运行 `summarize-sku-facts`，普通基础价格
+  和商品描述不增加 script 调用；旧回滚 Detail Tool 也改为返回完整事实，删除
+  固定 `_FOCUS_KEYWORDS` 和按关键词分派的额外特征 LLM；
+- Skill 和 Tool Guard 继续双重限制：Compare 至少两个绑定商品，Detail 只能一个，
+  Agent 不能从历史文本、标题片段或自然语言创建、补充或替换商品 ID；
+- 统一事实 Tool 的能力观测由 `purpose` 映射为 `compare/detail`，最终商品卡、
+  `capability`、`dispatch_source=agent_tool_loop` 和 SSE 返回契约保持兼容；
+- 本阶段没有新增 LLM：比较维度和详情关注点由现有 ShoppingAgent 模型理解，
+  商品事实由 Tool 提供，单位、区间与矩阵由受控 scripts 确定性计算。
+
+离线验证：
+
+```text
+Phase S1-S5、High-level Tools、Tool Guard、旧 Capability：69 passed
+Shopping、Skills scripts、Judge、多模态、SSE、主图与 API 合并回归：141 passed
+python -m compileall -q app tests：通过
+四个 Shopping Skill quick_validate：全部通过
+git diff --check：通过
+```
+
+本阶段没有自动启动、停止或重启 AI Service。真实验收前由用户手动重启服务，
+再一起冒烟 Phase S4 推荐两步编排与 Phase S5 比较/详情事实加载。
 
 ### Phase S6：Sandbox、性能与旧逻辑清理
 

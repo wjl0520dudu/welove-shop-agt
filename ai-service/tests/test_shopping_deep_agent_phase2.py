@@ -74,6 +74,8 @@ def test_phase_s2_prompt_is_materially_smaller_than_the_previous_manual():
 def test_each_business_tool_has_one_explicit_skill_contract():
     assert SHOPPING_TOOL_SKILL_REQUIREMENTS == {
         "recommend_products": "discover-products",
+        "search_product_candidates": "discover-products",
+        "finalize_product_recommendation": "discover-products",
         "compare_products": "compare-products",
         "answer_product_detail": "inspect-product",
         "get_user_shopping_context": "use-shopping-profile",
@@ -134,7 +136,9 @@ def test_deep_agent_blocks_direct_business_call_then_recovers_after_skill_read(
     _EXECUTIONS.clear()
     monkeypatch.setattr(config, "SHOPPING_DEEP_AGENT_ENABLED", True)
     monkeypatch.setattr(config, "SHOPPING_SKILLS_ROOT", "/skills/shopping-agent/")
-    monkeypatch.setattr(shopping_agent_module, "_ALL_TOOLS", [_recommend_products])
+    monkeypatch.setattr(
+        shopping_agent_module, "_DEEP_AGENT_BUSINESS_TOOLS", [_recommend_products]
+    )
 
     model, result = asyncio.run(run())
 

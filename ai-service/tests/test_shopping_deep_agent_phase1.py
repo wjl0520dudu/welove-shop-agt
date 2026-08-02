@@ -239,7 +239,9 @@ def test_deep_agent_reads_task_skill_and_preserves_shopping_contract(
 
     monkeypatch.setattr(config, "SHOPPING_DEEP_AGENT_ENABLED", True)
     monkeypatch.setattr(config, "SHOPPING_SKILLS_ROOT", "/skills/shopping-agent/")
-    monkeypatch.setattr(shopping_agent_module, "_ALL_TOOLS", FAKE_BUSINESS_TOOLS)
+    monkeypatch.setattr(
+        shopping_agent_module, "_DEEP_AGENT_BUSINESS_TOOLS", FAKE_BUSINESS_TOOLS
+    )
 
     result = asyncio.run(run())
 
@@ -289,7 +291,9 @@ def test_profile_task_can_read_profile_then_discovery_skill(monkeypatch):
 
     monkeypatch.setattr(config, "SHOPPING_DEEP_AGENT_ENABLED", True)
     monkeypatch.setattr(config, "SHOPPING_SKILLS_ROOT", "/skills/shopping-agent/")
-    monkeypatch.setattr(shopping_agent_module, "_ALL_TOOLS", FAKE_BUSINESS_TOOLS)
+    monkeypatch.setattr(
+        shopping_agent_module, "_DEEP_AGENT_BUSINESS_TOOLS", FAKE_BUSINESS_TOOLS
+    )
 
     result = asyncio.run(run())
 
@@ -315,7 +319,9 @@ def test_disabled_switch_keeps_existing_langchain_agent_runtime(monkeypatch):
         )
 
     monkeypatch.setattr(config, "SHOPPING_DEEP_AGENT_ENABLED", False)
-    monkeypatch.setattr(shopping_agent_module, "_ALL_TOOLS", FAKE_BUSINESS_TOOLS)
+    monkeypatch.setattr(
+        shopping_agent_module, "_DEEP_AGENT_BUSINESS_TOOLS", FAKE_BUSINESS_TOOLS
+    )
 
     result = asyncio.run(run())
 

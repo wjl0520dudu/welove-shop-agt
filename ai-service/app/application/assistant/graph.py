@@ -819,8 +819,10 @@ class AssistantGraph:
             "mode": normalized.mode,
             "confidence": normalized.confidence,
             "reason": normalized.reason,
+            "image_query_mode": normalized.image_query_mode,
         }
         canonical_question = normalized.canonical_question or question
+        image_query_mode = normalized.image_query_mode
         resolved_product_ids = _restrict_to_active_product_set(
             normalized.resolved_product_ids,
             memory,
@@ -874,6 +876,23 @@ class AssistantGraph:
                 llm=llm_trace,
                 mode="complex",
                 canonical_question=canonical_question,
+                input_mode=image_query_mode,
+                business_memory=routed_memory,
+            )
+        # Whether the attached image is the actual search target is a semantic
+        # decision owned by Router LLM.  If it says image_only, do not let an
+        # otherwise vague text fragment turn the downstream retrieval into a
+        # text+image search.  This is not a keyword fallback.
+        if image_url and image_query_mode == "image_only":
+            return _route_result(
+                route="shopping",
+                confidence=normalized.confidence,
+                source="llm",
+                reason=normalized.reason or "LLM identified an image-led shopping request",
+                llm=llm_trace,
+                mode="simple",
+                canonical_question=canonical_question or "根据当前图片查找相似商品",
+                input_mode="image",
                 business_memory=routed_memory,
             )
         if normalized.task_type == "unknown":
@@ -885,6 +904,7 @@ class AssistantGraph:
                 llm=llm_trace,
                 fallback_used=True,
                 canonical_question=canonical_question,
+                input_mode=image_query_mode,
                 route_clarification=normalized.clarification,
                 business_memory=routed_memory,
             )
@@ -896,6 +916,7 @@ class AssistantGraph:
             llm=llm_trace,
             mode="simple",
             canonical_question=canonical_question,
+            input_mode=image_query_mode,
             business_memory=routed_memory,
         )
 
@@ -1231,6 +1252,7 @@ def _route_result(
     mode: str = "simple",
     canonical_question: str = "",
     route_clarification: str = "",
+    input_mode: str = "",
     business_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one stable routing trace for graph state, API and offline evals."""
@@ -1257,6 +1279,8 @@ def _route_result(
         # already-resolved turn, not raw conversational shorthand.
         result["question"] = canonical_question
         result["canonical_question"] = canonical_question
+    if input_mode in {"image", "multimodal", "text"}:
+        result["input_mode"] = input_mode
     if business_memory is not None:
         result["business_memory"] = business_memory
     return result

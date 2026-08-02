@@ -15,20 +15,23 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from app.domain.shopping.agent import _extract_high_level_tool_result
 from app.domain.shopping.context import build_shopping_context_from_runtime
-from app.domain.shopping.high_level_tools import SHOPPING_HIGH_LEVEL_TOOLS
+from app.domain.shopping.high_level_tools import (
+    SHOPPING_HIGH_LEVEL_TOOLS,
+    SHOPPING_ROLLBACK_TOOLS,
+)
 from app.domain.shopping.schemas import RecommendToolResult
 
 
 class TestToolCatalog:
-    def test_only_four_tools(self):
+    def test_phase_s5_exposes_four_composable_tools(self):
         assert len(SHOPPING_HIGH_LEVEL_TOOLS) == 4
 
     def test_tool_names(self):
         names = {t.name for t in SHOPPING_HIGH_LEVEL_TOOLS}
         assert names == {
-            "recommend_products",
-            "compare_products",
-            "answer_product_detail",
+            "search_product_candidates",
+            "finalize_product_recommendation",
+            "load_bound_product_facts",
             "get_user_shopping_context",
         }
 
@@ -45,15 +48,25 @@ class TestToolCatalog:
             assert "Skill" in tool.description
             assert len(tool.description) < 220
 
-    def test_recommend_args_schema(self):
+    def test_candidate_search_args_schema(self):
         """LLM 应该看到 query / limit，但不该看到 runtime。"""
-        tool = next(t for t in SHOPPING_HIGH_LEVEL_TOOLS if t.name == "recommend_products")
+        tool = next(
+            t for t in SHOPPING_HIGH_LEVEL_TOOLS
+            if t.name == "search_product_candidates"
+        )
         # tool.args 是 LangChain 暴露给 LLM 的参数 map
         args = tool.args
         assert "query" in args
         assert "limit" in args
         # runtime 由 LangGraph 自动注入，不能出现在 LLM 可见 args 里
         assert "runtime" not in args
+
+    def test_finalize_only_accepts_candidate_set_id(self):
+        tool = next(
+            t for t in SHOPPING_HIGH_LEVEL_TOOLS
+            if t.name == "finalize_product_recommendation"
+        )
+        assert set(tool.args) == {"candidate_set_id"}
 
 
 class TestBuildShoppingContextFromRuntime:
@@ -145,7 +158,7 @@ class TestExtractHighLevelToolResult:
 def test_recommend_tool_hides_internal_and_rejected_candidates_from_agent():
     async def run():
         tool = next(
-            item for item in SHOPPING_HIGH_LEVEL_TOOLS
+            item for item in SHOPPING_ROLLBACK_TOOLS
             if item.name == "recommend_products"
         )
         capability_result = RecommendToolResult(
