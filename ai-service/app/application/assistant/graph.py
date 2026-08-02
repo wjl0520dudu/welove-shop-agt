@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from langchain_core.messages import AIMessage
 from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
@@ -33,6 +34,10 @@ from app.application.assistant.router import (
 )
 from app.infrastructure.config import config
 from app.infrastructure.errors import ErrorCode
+from app.infrastructure.observability.langsmith import (
+    build_assistant_run_config,
+    child_run_config,
+)
 from app.application.assistant.router_tools import format_business_memory_for_router
 
 logger = logging.getLogger("ai-service.assistant.graph")
@@ -43,7 +48,14 @@ class AssistantGraph:
     子 agent 实例通过 make_nodes 闭包持有，不放进可序列化的 state。
     """
 
-    def __init__(self, llm, shopping_agent=None, knowledge_agent=None):
+    def __init__(
+        self,
+        llm,
+        shopping_agent=None,
+        knowledge_agent=None,
+        *,
+        use_platform_persistence: bool = False,
+    ):
         self.llm = llm
         self.shopping_agent = shopping_agent
         self.knowledge_agent = knowledge_agent
@@ -63,18 +75,29 @@ class AssistantGraph:
             if llm is not None
             else None
         )
+        self._use_platform_persistence = use_platform_persistence
         self.graph = self._build()
 
     def _build(self):
+        # LangGraph injects the current RunnableConfig only into parameters
+        # named ``config``.  Domain methods use the clearer ``run_config``
+        # internally, so this small adapter keeps the public node signature
+        # correct while preserving explicit config propagation below.
+        def traced_node(handler):
+            async def invoke(state: AssistantState, config: RunnableConfig):
+                return await handler(state, config)
+
+            return invoke
+
         g = StateGraph(AssistantState)
         g.add_node("resolve_context", self._resolve_context)
-        g.add_node("route_intent", self._route)
-        g.add_node("plan_complex", self._plan_complex)
-        g.add_node("shopping", self._nodes["shopping_node"])
-        g.add_node("knowledge", self._nodes["knowledge_node"])
-        g.add_node("chitchat", self._nodes["chitchat_node"])
-        g.add_node("unknown", self._nodes["unknown_node"])
-        g.add_node("execute_dag", self._execute_dag)
+        g.add_node("route_intent", traced_node(self._route))
+        g.add_node("plan_complex", traced_node(self._plan_complex))
+        g.add_node("shopping", traced_node(self._nodes["shopping_node"]))
+        g.add_node("knowledge", traced_node(self._nodes["knowledge_node"]))
+        g.add_node("chitchat", traced_node(self._nodes["chitchat_node"]))
+        g.add_node("unknown", traced_node(self._nodes["unknown_node"]))
+        g.add_node("execute_dag", traced_node(self._execute_dag))
         g.add_node("format_response", self._nodes["format_response"])
 
         g.add_edge(START, "resolve_context")
@@ -102,6 +125,11 @@ class AssistantGraph:
         # separate synthesis node would only delay the final response.
         g.add_edge("execute_dag", "format_response")
         g.add_edge("format_response", END)
+        # FastAPI owns the existing PostgreSQL/InMemory runtime itself.  In
+        # contrast, ``langgraph dev`` provisions checkpoint/store persistence
+        # for the graph and rejects custom instances at load time.
+        if self._use_platform_persistence:
+            return g.compile()
         # 从 runtime 模块动态读，确保拿到的是 init_runtime() 覆盖后的实例
         return g.compile(checkpointer=_runtime.checkpointer, store=_runtime.store)
 
@@ -127,7 +155,11 @@ class AssistantGraph:
         )
         return resolved
 
-    async def _plan_complex(self, state: AssistantState) -> dict:
+    async def _plan_complex(
+        self,
+        state: AssistantState,
+        run_config: RunnableConfig | None = None,
+    ) -> dict:
         """Generate a DAG only after the Router has declared this turn complex."""
         question = (state.get("canonical_question") or state.get("question") or "").strip()
         if not question:
@@ -153,7 +185,11 @@ class AssistantGraph:
         try:
             decision = await self._orchestrator_llm.ainvoke(
                 messages,
-                config={"tags": ["ai_internal"]},
+                config=child_run_config(
+                    run_config,
+                    run_name="assistant.planner",
+                    tags=["agent:planner"],
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("planner: structured plan generation failed", exc_info=True)
@@ -177,7 +213,11 @@ class AssistantGraph:
             try:
                 repaired = await self._orchestrator_llm.ainvoke(
                     repair_messages,
-                    config={"tags": ["ai_internal"]},
+                    config=child_run_config(
+                        run_config,
+                        run_name="assistant.planner.repair",
+                        tags=["agent:planner", "attempt:repair"],
+                    ),
                 )
                 if repaired is not None:
                     normalized = self._normalize_orchestrator_decision(
@@ -272,7 +312,11 @@ class AssistantGraph:
             return "complex"
         return "invalid"
 
-    async def _execute_dag(self, state: AssistantState) -> dict:
+    async def _execute_dag(
+        self,
+        state: AssistantState,
+        run_config: RunnableConfig | None = None,
+    ) -> dict:
         """按拓扑层执行任务：同层并发、跨层等待、每个任务使用隔离状态。"""
         try:
             tasks = scope_task_images(
@@ -386,6 +430,18 @@ class AssistantGraph:
                         base_memory=base_memory,
                         semaphore=semaphore,
                         token_sink=make_token_sink(task_id),
+                        run_config=child_run_config(
+                            run_config,
+                            run_name=f"assistant.task.{task_id}",
+                            tags=[
+                                "agent:dag-task",
+                                f"domain:{task_by_id[task_id].get('intent_hint') or 'unknown'}",
+                            ],
+                            metadata={
+                                "task_id": task_id,
+                                "task_level": level_index,
+                            },
+                        ),
                     )
                 except BaseException as exc:  # noqa: BLE001
                     return task_id, exc
@@ -513,6 +569,7 @@ class AssistantGraph:
         base_memory: dict[str, Any],
         semaphore: asyncio.Semaphore,
         token_sink=None,
+        run_config: RunnableConfig | None = None,
     ) -> dict[str, Any]:
         dependencies = [result_by_id[dep_id] for dep_id in (task.get("depends_on") or [])]
         failed_dependencies = [
@@ -581,7 +638,7 @@ class AssistantGraph:
         try:
             async with semaphore:
                 result = await asyncio.wait_for(
-                    self._run_business_task(task_state),
+                    self._run_business_task(task_state, run_config=run_config),
                     timeout=max(0.01, config.ORCHESTRATOR_TASK_TIMEOUT_SECONDS),
                 )
         except asyncio.TimeoutError:
@@ -705,7 +762,12 @@ class AssistantGraph:
         except Exception:  # noqa: BLE001
             logger.debug("subtask token stream writer unavailable", exc_info=True)
 
-    async def _run_business_task(self, task_state: AssistantState) -> dict[str, Any]:
+    async def _run_business_task(
+        self,
+        task_state: AssistantState,
+        *,
+        run_config: RunnableConfig | None,
+    ) -> dict[str, Any]:
         # Planner has already assigned the domain for every DAG task.  Do not
         # send subtasks back through the top-level Router or re-read history.
         task = task_state.get("active_subtask") or {}
@@ -725,9 +787,14 @@ class AssistantGraph:
         if node_key not in self._nodes:
             route = "unknown"
             node_key = "unknown_node"
-        node_result = await self._nodes[node_key](
-            {**task_state, **route_result, "route": route},
-        )
+        node_input = {**task_state, **route_result, "route": route}
+        # Keep direct unit-level execution compatible with injected test nodes
+        # that only accept state.  Real graph/DAG executions always supply the
+        # RunnableConfig so LangSmith callback lineage is preserved.
+        if run_config is None:
+            node_result = await self._nodes[node_key](node_input)
+        else:
+            node_result = await self._nodes[node_key](node_input, run_config)
         return {**node_result, **route_result, "route": route}
 
     @staticmethod
@@ -768,7 +835,11 @@ class AssistantGraph:
             "message": message,
         }
 
-    async def _route(self, state: AssistantState) -> dict:
+    async def _route(
+        self,
+        state: AssistantState,
+        run_config: RunnableConfig | None = None,
+    ) -> dict:
         question = (state.get("question") or "").strip()
         image_url = (state.get("image_url") or "").strip()
         if not question and not image_url:
@@ -821,7 +892,11 @@ class AssistantGraph:
         try:
             decision = await self._router_llm.ainvoke(
                 router_messages,
-                config={"tags": ["ai_internal"]},
+                config=child_run_config(
+                    run_config,
+                    run_name="assistant.router",
+                    tags=["agent:router"],
+                ),
             )
         except Exception:  # noqa: BLE001
             logger.warning("router: structured routing failed", exc_info=True)
@@ -1037,7 +1112,17 @@ class AssistantGraph:
         state, run_id, trace_id = self._make_initial_state(**kwargs)
         await self._sync_request_profile(state)
         conversation_id = state.get("conversation_id")
-        final = await self.graph.ainvoke(state, config={"configurable": {"thread_id": conversation_id}})
+        final = await self.graph.ainvoke(
+            state,
+            config=build_assistant_run_config(
+                conversation_id=conversation_id,
+                user_id=state.get("user_id"),
+                trace_id=trace_id,
+                stream=False,
+                has_image=bool(state.get("image_url")),
+                environment=config.LANGSMITH_ENVIRONMENT,
+            ),
+        )
         result = final.get("result") or {}
         result.setdefault("run_id", run_id)
         result.setdefault("trace_id", trace_id)
@@ -1085,7 +1170,14 @@ class AssistantGraph:
         # namespace_tuple: 空 = 主图，(node_name, task_id) = 子图
         async for chunk in self.graph.astream(
             state,
-            config={"configurable": {"thread_id": conversation_id}},
+            config=build_assistant_run_config(
+                conversation_id=conversation_id,
+                user_id=state.get("user_id"),
+                trace_id=trace_id,
+                stream=True,
+                has_image=bool(state.get("image_url")),
+                environment=config.LANGSMITH_ENVIRONMENT,
+            ),
             stream_mode=["updates", "messages", "custom"],
             subgraphs=True,
         ):

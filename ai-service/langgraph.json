@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "welove_shop_assistant": "./app/application/assistant/studio.py:graph"
+  },
+  "env": ".env"
+}

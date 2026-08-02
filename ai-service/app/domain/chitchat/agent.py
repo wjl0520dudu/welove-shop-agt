@@ -8,8 +8,10 @@ from typing import Any
 from langchain.agents import create_agent
 from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddleware
 from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.runnables import RunnableConfig
 
 from app.infrastructure.llm.middleware import build_summarization_middleware
+from app.infrastructure.observability.langsmith import child_run_config
 
 
 class ChitchatAgent:
@@ -31,6 +33,7 @@ class ChitchatAgent:
         messages: list,
         system_prompt: str,
         token_sink: Callable[[str], None] | None = None,
+        run_config: RunnableConfig | None = None,
     ) -> dict[str, Any]:
         """Generate one natural reply from the supplied conversation messages."""
         agent = create_agent(
@@ -48,7 +51,12 @@ class ChitchatAgent:
         result: dict[str, Any] = {}
         async for event in agent.astream(
             {"messages": messages},
-            config={"recursion_limit": 6},
+            config=child_run_config(
+                run_config,
+                run_name="chitchat-agent.tool-loop",
+                tags=["runtime:langchain-agent"],
+                recursion_limit=6,
+            ),
             stream_mode=["values", "messages"],
         ):
             mode, payload = event

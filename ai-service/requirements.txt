@@ -8,6 +8,9 @@ langchain-community>=0.3.31,<1.0.0
 langchain-openai>=1.3.3,<2.0.0
 langchain-text-splitters>=1.1.2,<2.0.0
 langgraph>=1.2.5,<1.3.0
+# Local LangGraph Server + LangSmith Studio.  This is a development-only
+# executable; the production FastAPI service continues to use uvicorn.
+langgraph-cli[inmem]>=0.4.30,<0.5.0
 pymilvus>=2.4.0
 python-dotenv>=1.0.1
 pydantic>=2.7.4,<3.0.0

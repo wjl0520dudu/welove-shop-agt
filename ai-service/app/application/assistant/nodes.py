@@ -5,11 +5,13 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 from langgraph.config import get_stream_writer
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from app.application.assistant.state import AssistantState
 from app.infrastructure.persistence.memory import get_business_memory, remember_product_cards
 from app.domain.shopping.preferences import build_preference_questions
 from app.prompts.prompts import CHITCHAT_PROMPT, UNKNOWN_FALLBACK_PROMPT
 from app.infrastructure.errors import ErrorCode
+from app.infrastructure.observability.langsmith import child_run_config
 from app.domain.chitchat.agent import ChitchatAgent
 from app.domain.shopping.agent import ShoppingAgent
 from app.domain.knowledge.agent import KnowledgeAgent
@@ -268,7 +270,10 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             _chitchat_holder["agent"] = ChitchatAgent(llm)
         return _chitchat_holder["agent"]
 
-    async def shopping_node(state: AssistantState) -> dict:
+    async def shopping_node(
+        state: AssistantState,
+        run_config: RunnableConfig | None = None,
+    ) -> dict:
         # Router controls image scope.  Text, pure-image and image+text turns
         # all enter the same ShoppingAgent; only recommend_products chooses a
         # different *retrieval* mode internally.
@@ -301,6 +306,11 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 image_url=image_url or None,
                 input_mode=input_mode,
                 token_sink=token_sink,
+                run_config=child_run_config(
+                    run_config,
+                    run_name="shopping-agent",
+                    tags=["agent:shopping"],
+                ),
             )
         except Exception as e:
             logger.exception("shopping node failed")
@@ -315,7 +325,10 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         return _merge_result(result, task_type="shopping",
                              extra={"messages": [AIMessage(content=result.get("answer", ""))]})
 
-    async def knowledge_node(state: AssistantState) -> dict:
+    async def knowledge_node(
+        state: AssistantState,
+        run_config: RunnableConfig | None = None,
+    ) -> dict:
         try:
             # KnowledgeAgent receives the canonical current question only.  Its
             # prior entity binding is already represented in that question by
@@ -337,6 +350,11 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                     state.get("subtask_token_sink")
                     if state.get("active_subtask")
                     else _graph_token_sink
+                ),
+                run_config=child_run_config(
+                    run_config,
+                    run_name="knowledge-agent",
+                    tags=["agent:knowledge"],
                 ),
             )
             # 无检索结果兜底：sources 为空 或 has_answer=False 时补一句引导，
@@ -365,7 +383,10 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         return _merge_result(result, task_type="knowledge",
                              extra={"messages": [AIMessage(content=result.get("answer", ""))]})
 
-    async def chitchat_node(state: AssistantState) -> dict:
+    async def chitchat_node(
+        state: AssistantState,
+        run_config: RunnableConfig | None = None,
+    ) -> dict:
         if llm is None:
             return {
                 "answer": "AI 助手暂未配置，无法闲聊。",
@@ -384,6 +405,11 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                     state.get("subtask_token_sink")
                     if state.get("active_subtask")
                     else _graph_token_sink
+                ),
+                run_config=child_run_config(
+                    run_config,
+                    run_name="chitchat-agent",
+                    tags=["agent:chitchat"],
                 ),
             )
             answer = str(result.get("answer") or "").strip()
@@ -404,7 +430,10 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             "messages": [AIMessage(content=answer)],
         }
 
-    async def unknown_node(state: AssistantState) -> dict:
+    async def unknown_node(
+        state: AssistantState,
+        run_config: RunnableConfig | None = None,
+    ) -> dict:
         fallback = state.get("route_clarification") or (
             "我还不确定你的需求，请清楚描述想找的商品或想了解的问题。"
         )
@@ -420,7 +449,14 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 )
                 chunks: list[str] = []
                 token_sink = None if state.get("active_subtask") else _graph_token_sink
-                async for chunk in llm.astream([SystemMessage(content=prompt)]):
+                async for chunk in llm.astream(
+                    [SystemMessage(content=prompt)],
+                    config=child_run_config(
+                        run_config,
+                        run_name="fallback-agent",
+                        tags=["agent:fallback"],
+                    ),
+                ):
                     content = _stream_text_content(getattr(chunk, "content", ""))
                     if not content:
                         continue

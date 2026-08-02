@@ -10,6 +10,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddleware
 from langchain.agents.middleware.tool_call_limit import ToolCallLimitMiddleware
 from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.domain.shopping.preferences import build_preference_questions
@@ -39,6 +40,7 @@ from app.domain.shopping.tool_guard import (
     ShoppingToolGuardMiddleware,
 )
 from app.infrastructure.config import config
+from app.infrastructure.observability.langsmith import child_run_config
 
 # 人工回滚链保留旧的一体化 Tool；DeepAgent 主链使用 S4/S5 窄 Tool。
 _ALL_TOOLS = SHOPPING_ROLLBACK_TOOLS
@@ -118,6 +120,7 @@ class ShoppingAgent:
         image_url: Optional[str] = None,
         input_mode: str = "text",
         token_sink: Optional[TokenSink] = None,
+        run_config: RunnableConfig | None = None,
     ) -> dict:
         """执行导购推荐。
 
@@ -203,14 +206,21 @@ class ShoppingAgent:
                 "image_url": image_url or "",
                 "input_mode": normalised_input_mode,
             }
-            agent_config = {
-                "configurable": {"thread_id": str(uuid4())},
+            agent_config = child_run_config(
+                run_config,
+                run_name="shopping-agent.tool-loop",
+                tags=["runtime:" + shopping_runtime],
+                metadata={"shopping_runtime": shopping_runtime},
+                # The child graph needs an isolated checkpoint thread.  Its
+                # callbacks/tags still come from the assistant request config,
+                # so LangSmith renders it below the parent trace.
+                thread_id=str(uuid4()),
                 # Deep Agents adds Skill/filesystem middleware graph steps.
                 # ToolCallLimit and ModelCallLimit remain the actual loop
                 # guards; this only prevents a healthy bounded run from being
                 # cut off before its final model response.
-                "recursion_limit": 40 if shopping_runtime == "deep_agent" else 12,
-            }
+                recursion_limit=40 if shopping_runtime == "deep_agent" else 12,
+            )
             with shopping_candidate_session():
                 if token_sink is None:
                     result = await agent.ainvoke(agent_input, config=agent_config)
@@ -238,6 +248,7 @@ class ShoppingAgent:
                 jwt_token=jwt_token,
                 business_memory=effective_memory,
                 token_sink=token_sink,
+                run_config=run_config,
             )
             if fallback is not None:
                 fallback["shopping_runtime"] = shopping_runtime
@@ -357,6 +368,7 @@ class ShoppingAgent:
         business_memory: Dict[str, Any],
         token_sink: Optional[TokenSink] = None,
         dispatch_source: str = "restricted_rule_fallback",
+        run_config: RunnableConfig | None = None,
     ) -> dict:
         """Execute a capability only after the Agent path has failed."""
         if decision.capability == "transaction_unsupported":
@@ -390,6 +402,7 @@ class ShoppingAgent:
             "answer": await _compose_capability_answer(
                 self._llm, decision.capability, question, payload,
                 token_sink=token_sink,
+                run_config=run_config,
             ),
             "task_type": "shopping",
             "product_cards": payload.get("product_cards") or [],
@@ -412,6 +425,7 @@ class ShoppingAgent:
         jwt_token: Optional[str],
         business_memory: Dict[str, Any],
         token_sink: Optional[TokenSink],
+        run_config: RunnableConfig | None = None,
     ) -> Optional[dict]:
         """Use the legacy dispatcher only as an observable failure fallback.
 
@@ -436,6 +450,7 @@ class ShoppingAgent:
             business_memory=business_memory,
             token_sink=token_sink,
             dispatch_source="restricted_rule_fallback",
+            run_config=run_config,
         )
 
 
@@ -504,6 +519,7 @@ async def _compose_capability_answer(
     payload: Dict[str, Any],
     *,
     token_sink: Optional[TokenSink] = None,
+    run_config: RunnableConfig | None = None,
 ) -> str:
     """A grounded deterministic fallback; the capability owns all business facts."""
     if payload.get("clarify_question"):
@@ -555,7 +571,14 @@ async def _compose_capability_answer(
     ]
     if token_sink is None:
         try:
-            response = await llm.ainvoke(messages)
+            response = await llm.ainvoke(
+                messages,
+                config=child_run_config(
+                    run_config,
+                    run_name="shopping-agent.fallback-render",
+                    tags=["agent:shopping", "stage:fallback-render"],
+                ),
+            )
             answer = str(getattr(response, "content", "") or "").strip()
             return answer or fallback
         except Exception:  # noqa: BLE001
@@ -566,7 +589,14 @@ async def _compose_capability_answer(
     # for ainvoke() and simulate a typewriter from the final string.
     chunks: list[str] = []
     try:
-        async for chunk in llm.astream(messages):
+        async for chunk in llm.astream(
+            messages,
+            config=child_run_config(
+                run_config,
+                run_name="shopping-agent.fallback-render",
+                tags=["agent:shopping", "stage:fallback-render"],
+            ),
+        ):
             content = _stream_text_content(getattr(chunk, "content", ""))
             if not content:
                 continue

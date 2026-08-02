@@ -14,6 +14,7 @@ from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddlewar
 from langchain.agents.middleware.tool_call_limit import ToolCallLimitMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import AIMessageChunk
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
@@ -23,6 +24,7 @@ from app.prompts.prompts import KNOWLEDGE_AGENT_PROMPT, KNOWLEDGE_PROMPT
 from app.application.assistant.state import KnowledgeAgentState
 from app.domain.knowledge.skill_observability import extract_knowledge_skill_reads
 from app.infrastructure.config import config
+from app.infrastructure.observability.langsmith import child_run_config
 from app.infrastructure.retrieval.retriever import get_retriever
 
 logger = logging.getLogger("ai-service.knowledge.agent")
@@ -382,7 +384,11 @@ _ENTITY_EXTRACT_PROMPT = """从用户的知识问答问题中提取关键实体�
    - "你好" → []"""
 
 
-async def _extract_entities_with_llm(query: str, max_entities: int = 5) -> Optional[List[str]]:
+async def _extract_entities_with_llm(
+    query: str,
+    max_entities: int = 5,
+    run_config: RunnableConfig | None = None,
+) -> Optional[List[str]]:
     """用 LLM 抽取实体。失败返回 None 触发正则兜底。"""
     from app.infrastructure.llm.llm import get_llm
     llm = get_llm()
@@ -396,7 +402,11 @@ async def _extract_entities_with_llm(query: str, max_entities: int = 5) -> Optio
                 {"role": "system", "content": _ENTITY_EXTRACT_PROMPT},
                 {"role": "user", "content": query},
             ],
-            config={"tags": ["ai_internal"]},
+            config=child_run_config(
+                run_config,
+                run_name="knowledge-agent.entity-extraction",
+                tags=["agent:knowledge", "stage:entity-extraction"],
+            ),
         )
     except Exception:
         logger.warning("LLM entity extraction failed, fallback to regex", exc_info=True)
@@ -496,7 +506,13 @@ _GROUNDING_CHECK_PROMPT = """你是宽松但明确的答案审核员。判断【
 **保守优先**：判断困难时倾向 grounded=true，宁可放过也不误杀。"""
 
 
-async def _grounding_check(llm, question: str, answer: str, knowledge_context: str) -> tuple[bool, str]:
+async def _grounding_check(
+    llm,
+    question: str,
+    answer: str,
+    knowledge_context: str,
+    run_config: RunnableConfig | None = None,
+) -> tuple[bool, str]:
     """让 LLM 自评答案是否完全来自参考资料。
 
     Returns:
@@ -530,7 +546,11 @@ async def _grounding_check(llm, question: str, answer: str, knowledge_context: s
                 {"role": "system", "content": _GROUNDING_CHECK_PROMPT},
                 {"role": "user", "content": check_input},
             ],
-            config={"tags": ["ai_internal"]},
+            config=child_run_config(
+                run_config,
+                run_name="knowledge-agent.grounding-check",
+                tags=["agent:knowledge", "stage:grounding-check"],
+            ),
         )
         if isinstance(result, GroundingResult):
             return bool(result.grounded), result.reason
@@ -606,6 +626,7 @@ class KnowledgeAgent:
         conversation_id: str = "",
         user_id: Optional[int | str] = None,
         token_sink: Callable[[str], None] | None = None,
+        run_config: RunnableConfig | None = None,
     ) -> dict:
         """执行知识问答。
 
@@ -649,7 +670,13 @@ class KnowledgeAgent:
         ) if question else ""
         if cache_key and cache_key in _knowledge_cache:
             cached = _knowledge_cache[cache_key]
-            await self._persist_entities(conversation_id, user_id, question, cached.get("sources") or [])
+            await self._persist_entities(
+                conversation_id,
+                user_id,
+                question,
+                cached.get("sources") or [],
+                run_config=run_config,
+            )
             if token_sink is not None:
                 for chunk in _stream_text_chunks(str(cached.get("answer") or "")):
                     token_sink(chunk)
@@ -664,10 +691,16 @@ class KnowledgeAgent:
             "conversation_id": conversation_id,
             "user_id": user_id,
         }
-        agent_config = {
-            "configurable": {"thread_id": str(uuid4())},
-            "recursion_limit": 32 if knowledge_runtime == "deep_agent" else 12,
-        }
+        agent_config = child_run_config(
+            run_config,
+            run_name="knowledge-agent.tool-loop",
+            tags=["runtime:" + knowledge_runtime],
+            metadata={"knowledge_runtime": knowledge_runtime},
+            # Isolate the DeepAgent checkpoint state without detaching its
+            # LangSmith callback lineage from the assistant request.
+            thread_id=str(uuid4()),
+            recursion_limit=32 if knowledge_runtime == "deep_agent" else 12,
+        )
         skill_source = "/skills/knowledge-agent/"
         if config.KNOWLEDGE_DEEP_AGENT_ENABLED:
             from app.domain.knowledge.deep_agent import KnowledgeDeepAgentAdapter
@@ -744,7 +777,11 @@ class KnowledgeAgent:
         # 自评异常时（LLM 挂 / JSON 失败）放过原答案，避免因审核环节导致用户拿不到答案。
         grounding_context = _extract_last_knowledge_context(result_messages)
         grounded, grounding_reason = await _grounding_check(
-            self._llm, question, answer, grounding_context,
+            self._llm,
+            question,
+            answer,
+            grounding_context,
+            run_config=agent_config,
         )
         if not grounded:
             logger.warning(
@@ -757,7 +794,13 @@ class KnowledgeAgent:
             logger.info("knowledge: 自评通过 reason=%s", grounding_reason)
 
         # 抽取本轮候选实体并写回 Store，供下一轮主路由绑定。
-        await self._persist_entities(conversation_id, user_id, question, sources)
+        await self._persist_entities(
+            conversation_id,
+            user_id,
+            question,
+            sources,
+            run_config=agent_config,
+        )
 
         output = {
             "answer": answer or "知识检索暂时不可用，请稍后再试。",
@@ -812,6 +855,7 @@ class KnowledgeAgent:
         user_id: Optional[int | str],
         question: str,
         sources: List[Dict[str, Any]],
+        run_config: RunnableConfig | None = None,
     ) -> None:
         """从当前 question + sources 抽取候选实体，写回 Store。
 
@@ -820,7 +864,7 @@ class KnowledgeAgent:
         """
         try:
             # LLM 优先，正则兜底
-            entities = await _extract_entities_with_llm(question)
+            entities = await _extract_entities_with_llm(question, run_config=run_config)
             if entities is None:
                 entities = _extract_entities_from_query(question)
             if not entities:

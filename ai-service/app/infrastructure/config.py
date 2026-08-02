@@ -204,6 +204,12 @@ class Config:
     LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
     LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY", "")
     LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "welove-shop-ai")
+    LANGSMITH_ENVIRONMENT = os.getenv("LANGSMITH_ENVIRONMENT", "development")
+    # LangSmith receives runnable inputs/outputs by default.  Keep the
+    # production-safe default masked; a local developer can explicitly opt in
+    # while diagnosing prompts and tool payloads.
+    LANGSMITH_HIDE_INPUTS = os.getenv("LANGSMITH_HIDE_INPUTS", "true").lower() in ("1", "true", "yes")
+    LANGSMITH_HIDE_OUTPUTS = os.getenv("LANGSMITH_HIDE_OUTPUTS", "true").lower() in ("1", "true", "yes")
 
     # 8. CORS 允许来源。逗号分隔多个源；"*" 表示允许所有（仅开发/内网）。
     # 生产环境建议明确列出前端域名（如 https://shop.welove.com,http://localhost:5173），
