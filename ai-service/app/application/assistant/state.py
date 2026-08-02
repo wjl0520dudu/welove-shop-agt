@@ -61,6 +61,9 @@ class AssistantState(TypedDict):
     capability: NotRequired[str]
     dispatch_source: NotRequired[str]
     model_call_count: NotRequired[int]
+    shopping_runtime: NotRequired[str]
+    skill_reads: NotRequired[list[str]]
+    script_calls: NotRequired[list[dict[str, Any]]]
 
     # ── 编排元数据 ──
     run_id: NotRequired[str]

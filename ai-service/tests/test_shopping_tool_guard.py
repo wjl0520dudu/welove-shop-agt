@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app.domain.shopping.tool_guard import (
     RequireInitialShoppingToolMiddleware,
+    RequireMatchingShoppingSkillMiddleware,
     ShoppingToolGuardMiddleware,
 )
 
@@ -86,10 +87,139 @@ def test_first_model_turn_requires_a_high_level_tool_but_final_answer_does_not()
                 ToolMessage(content='{"action":"recommend"}', tool_call_id="tc", name="recommend_products"),
             ],
         )
+        after_skill_contract_error = ModelRequest(
+            model=AsyncMock(),
+            messages=[
+                HumanMessage(content="推荐耳机"),
+                ToolMessage(
+                    content='{"error":true,"error_code":"SHOPPING_SKILL_REQUIRED"}',
+                    tool_call_id="blocked",
+                    name="recommend_products",
+                    status="error",
+                ),
+            ],
+        )
         await middleware.awrap_model_call(initial, handler)
+        await middleware.awrap_model_call(after_skill_contract_error, handler)
         await middleware.awrap_model_call(after_tool, handler)
 
-        assert observed == ["required", None]
+        assert observed == ["required", "required", None]
+
+    asyncio.run(run())
+
+
+def test_matching_skill_is_required_before_a_business_tool_executes():
+    async def run():
+        middleware = RequireMatchingShoppingSkillMiddleware()
+        business_handler = AsyncMock(side_effect=lambda request: _success(
+            call_id=request.tool_call["id"],
+        ))
+
+        blocked = await middleware.awrap_tool_call(
+            _request("recommend_products", {"query": "通勤耳机"}, call_id="blocked"),
+            business_handler,
+        )
+        assert business_handler.await_count == 0
+        assert blocked.status == "error"
+        assert json.loads(blocked.content)["required_skill"] == "discover-products"
+
+        async def read_handler(request):
+            return ToolMessage(
+                content="# discover-products",
+                tool_call_id=request.tool_call["id"],
+                name="read_file",
+            )
+
+        await middleware.awrap_tool_call(
+            _request(
+                "read_file",
+                {"file_path": "/skills/shopping-agent/discover-products/SKILL.md"},
+                call_id="read",
+            ),
+            read_handler,
+        )
+        executed = await middleware.awrap_tool_call(
+            _request("recommend_products", {"query": "通勤耳机"}, call_id="executed"),
+            business_handler,
+        )
+
+        assert executed.status != "error"
+        assert business_handler.await_count == 1
+        assert middleware.read_skills == ["discover-products"]
+        assert middleware.records[0]["error_code"] == "SHOPPING_SKILL_REQUIRED"
+
+    asyncio.run(run())
+
+
+def test_reading_an_unrelated_skill_does_not_authorize_the_selected_tool():
+    async def run():
+        middleware = RequireMatchingShoppingSkillMiddleware()
+
+        async def read_handler(request):
+            return ToolMessage(
+                content="# compare-products",
+                tool_call_id=request.tool_call["id"],
+                name="read_file",
+            )
+
+        await middleware.awrap_tool_call(
+            _request(
+                "read_file",
+                {"file_path": "/skills/shopping-agent/compare-products/SKILL.md"},
+                call_id="read-wrong",
+            ),
+            read_handler,
+        )
+        business_handler = AsyncMock()
+        blocked = await middleware.awrap_tool_call(
+            _request("recommend_products", {"query": "推荐耳机"}, call_id="wrong"),
+            business_handler,
+        )
+
+        assert middleware.read_skills == ["compare-products"]
+        assert business_handler.await_count == 0
+        assert blocked.status == "error"
+        assert json.loads(blocked.content)["required_skill"] == "discover-products"
+
+    asyncio.run(run())
+
+
+def test_script_runner_requires_the_skill_declared_in_its_arguments():
+    async def run():
+        middleware = RequireMatchingShoppingSkillMiddleware()
+
+        async def read_handler(request):
+            return ToolMessage(
+                content="# compare-products",
+                tool_call_id=request.tool_call["id"],
+                name="read_file",
+            )
+
+        await middleware.awrap_tool_call(
+            _request(
+                "read_file",
+                {"file_path": "/skills/shopping-agent/compare-products/SKILL.md"},
+                call_id="read-compare",
+            ),
+            read_handler,
+        )
+        handler = AsyncMock()
+        blocked = await middleware.awrap_tool_call(
+            _request(
+                "run_shopping_skill_script",
+                {
+                    "skill_name": "discover-products",
+                    "script_name": "validate-selection",
+                    "payload": {},
+                },
+                call_id="script-wrong-skill",
+            ),
+            handler,
+        )
+
+        assert handler.await_count == 0
+        assert blocked.status == "error"
+        assert json.loads(blocked.content)["required_skill"] == "discover-products"
 
     asyncio.run(run())
 

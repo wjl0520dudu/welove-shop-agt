@@ -22,6 +22,10 @@ from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolC
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from app.domain.shopping.deep_agent_runtime import SHOPPING_SKILL_SOURCE
+from app.domain.shopping.script_runner import SHOPPING_SCRIPT_TOOL_NAME
+from app.domain.shopping.skill_observability import shopping_skill_name_from_path
+
 
 _PRIMARY_CAPABILITIES = {
     "recommend_products": "recommend",
@@ -33,6 +37,13 @@ _SHOPPING_FACT_TOOLS = frozenset({
     *_PRIMARY_CAPABILITIES,
     "get_user_shopping_context",
 })
+
+SHOPPING_TOOL_SKILL_REQUIREMENTS = {
+    "recommend_products": "discover-products",
+    "compare_products": "compare-products",
+    "answer_product_detail": "inspect-product",
+    "get_user_shopping_context": "use-shopping-profile",
+}
 
 
 class RequireInitialShoppingToolMiddleware(AgentMiddleware):
@@ -53,6 +64,7 @@ class RequireInitialShoppingToolMiddleware(AgentMiddleware):
         has_tool_result = any(
             isinstance(message, ToolMessage)
             and str(getattr(message, "name", "") or "") in _SHOPPING_FACT_TOOLS
+            and getattr(message, "status", None) != "error"
             for message in (request.messages or [])
         )
         if not has_tool_result:
@@ -97,6 +109,75 @@ def _tool_result_status(result: ToolMessage | Command[Any]) -> str:
     return action if action in {"clarify", "empty"} else "success"
 
 
+class RequireMatchingShoppingSkillMiddleware(AgentMiddleware):
+    """Require the Skill matching the model-selected Shopping tool.
+
+    This middleware never interprets the user's language and never chooses a
+    capability. The LLM remains responsible for selecting a Skill and a high-
+    level business tool. Code only verifies the declared capability contract
+    immediately before execution.
+    """
+
+    def __init__(self, *, skill_source: str = SHOPPING_SKILL_SOURCE) -> None:
+        super().__init__()
+        self._skill_source = f"/{str(skill_source).strip('/')}/"
+        self.read_skills: list[str] = []
+        self.records: list[dict[str, Any]] = []
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        tool_call = dict(request.tool_call or {})
+        tool_name = str(tool_call.get("name") or getattr(request.tool, "name", "") or "")
+        args = tool_call.get("args") or {}
+        args = dict(args) if isinstance(args, dict) else {}
+        call_id = str(tool_call.get("id") or "shopping-skill-contract")
+
+        if tool_name == "read_file":
+            result = await handler(request)
+            if not _result_is_error(result):
+                skill_name = shopping_skill_name_from_path(
+                    args.get("file_path") or args.get("path"),
+                    skill_source=self._skill_source,
+                )
+                if skill_name and skill_name not in self.read_skills:
+                    self.read_skills.append(skill_name)
+            return result
+
+        required_skill = SHOPPING_TOOL_SKILL_REQUIREMENTS.get(tool_name)
+        if tool_name == SHOPPING_SCRIPT_TOOL_NAME:
+            required_skill = str(args.get("skill_name") or "").strip() or None
+        if required_skill is None or required_skill in self.read_skills:
+            return await handler(request)
+
+        required_path = f"{self._skill_source}{required_skill}/SKILL.md"
+        self.records.append({
+            "tool_call_id": call_id,
+            "tool_name": tool_name,
+            "required_skill": required_skill,
+            "loaded_skills": list(self.read_skills),
+            "status": "blocked",
+            "error_code": "SHOPPING_SKILL_REQUIRED",
+        })
+        payload = {
+            "error": True,
+            "error_code": "SHOPPING_SKILL_REQUIRED",
+            "required_skill": required_skill,
+            "message": (
+                f"调用 {tool_name} 前必须先使用 read_file 读取 "
+                f"{required_path}，遵循其中流程后再重试。"
+            ),
+        }
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False),
+            tool_call_id=call_id,
+            name=tool_name,
+            status="error",
+        )
+
+
 class ShoppingToolGuardMiddleware(AgentMiddleware):
     """Request-local guard for the four ShoppingAgent high-level tools.
 
@@ -123,6 +204,13 @@ class ShoppingToolGuardMiddleware(AgentMiddleware):
         state = dict(request.state or {})
         call_id = str(tool_call.get("id") or "shopping-tool-call")
         capability = _PRIMARY_CAPABILITIES.get(tool_name)
+
+        # Deep Agents adds read_file for progressive Skill loading.  It is an
+        # internal runtime operation, not a Shopping capability, so it must not
+        # affect business call deduplication or appear in Shopping tool traces.
+        if tool_name not in _SHOPPING_FACT_TOOLS:
+            return await handler(request)
+
         bound_ids = _normalise_ids(state.get("selected_product_ids"))
 
         invalid_reason = self._validate_bound_ids(

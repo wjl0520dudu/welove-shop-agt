@@ -24,15 +24,36 @@ from app.domain.shopping.capabilities import (
 )
 from app.domain.shopping.dispatcher import DispatchDecision, dispatch_shopping_capability
 from app.domain.shopping.high_level_tools import SHOPPING_HIGH_LEVEL_TOOLS
+from app.domain.shopping.script_tools import SHOPPING_SCRIPT_TOOLS
 from app.domain.shopping.schemas import ShoppingContext
+from app.domain.shopping.skill_observability import (
+    extract_shopping_script_calls,
+    extract_shopping_skill_reads,
+)
 from app.domain.shopping.tool_guard import (
     RequireInitialShoppingToolMiddleware,
     ShoppingToolGuardMiddleware,
 )
+from app.infrastructure.config import config
 
 # Phase 1a 关键变更：LLM 只面对 4 个高层 tool，底层 12 个工具全部退到 Capability 内部。
 # 见 shopping/high_level_tools.py 和 shopping/capabilities/*。
 _ALL_TOOLS = SHOPPING_HIGH_LEVEL_TOOLS
+_BUSINESS_TOOL_NAMES = frozenset(
+    str(getattr(tool, "name", "") or "") for tool in _ALL_TOOLS
+)
+
+
+def _deep_agent_tools() -> list:
+    """Return the DeepAgent surface without changing the rollback runtime."""
+    tools = list(_ALL_TOOLS)
+    if str(config.SHOPPING_SKILL_SCRIPT_MODE).lower() == "controlled":
+        existing = {str(getattr(tool, "name", "") or "") for tool in tools}
+        tools.extend(
+            tool for tool in SHOPPING_SCRIPT_TOOLS
+            if str(getattr(tool, "name", "") or "") not in existing
+        )
+    return tools
 
 logger = logging.getLogger("ai-service.shopping.agent")
 
@@ -110,6 +131,12 @@ class ShoppingAgent:
             return {
                 "answer": "导购 Agent 暂不可用。",
                 "task_type": "shopping",
+                "shopping_runtime": (
+                    "deep_agent" if config.SHOPPING_DEEP_AGENT_ENABLED
+                    else "langchain_agent"
+                ),
+                "skill_reads": [],
+                "script_calls": [],
                 "error": True,
                 "error_code": ErrorCode.LLM_NOT_CONFIGURED,
             }
@@ -126,31 +153,44 @@ class ShoppingAgent:
             image_url=image_url,
             input_mode=normalised_input_mode,
         )
-
-        # A new Agent instance makes its middleware cache request-scoped.  The
-        # LLM decides the high-level capability; Guard/middleware only enforce
-        # call boundaries and loop limits.
-        agent = create_agent(
-            model=self._llm,
-            checkpointer=_shopping_checkpointer,
-            system_prompt=system_prompt,
-            tools=_ALL_TOOLS,
-            state_schema=ShoppingAgentState,
-            middleware=[
-                # The LLM still selects the capability.  This only requires a
-                # real high-level product result before it may answer.
-                RequireInitialShoppingToolMiddleware(),
-                guard,
-                # A bounded global limit protects against malformed tool loops.
-                # The Guard still owns same-argument result reuse.
-                ToolCallLimitMiddleware(run_limit=3, exit_behavior="continue"),
-                ModelCallLimitMiddleware(run_limit=4, exit_behavior="end"),
-            ],
-        )
-
         agent_messages = self._build_messages(question, messages)
+        shopping_runtime = "langchain_agent"
+        skill_source = "/skills/shopping-agent/"
 
         try:
+            # A new Agent instance makes middleware state request-scoped.  The
+            # rollout switch changes only the runtime harness; the LLM still
+            # sees the same four high-level Shopping business tools.
+            if config.SHOPPING_DEEP_AGENT_ENABLED:
+                from app.domain.shopping.deep_agent import (
+                    SHOPPING_DEEP_AGENT_RUNTIME,
+                    ShoppingDeepAgentAdapter,
+                )
+
+                deep_runtime = ShoppingDeepAgentAdapter(
+                    llm=self._llm,
+                    tools=_deep_agent_tools(),
+                    checkpointer=_shopping_checkpointer,
+                    skills_root=config.SHOPPING_SKILLS_ROOT,
+                ).build(system_prompt=system_prompt, guard=guard)
+                agent = deep_runtime.graph
+                skill_source = deep_runtime.skill_source
+                shopping_runtime = SHOPPING_DEEP_AGENT_RUNTIME
+            else:
+                agent = create_agent(
+                    model=self._llm,
+                    checkpointer=_shopping_checkpointer,
+                    system_prompt=system_prompt,
+                    tools=_ALL_TOOLS,
+                    state_schema=ShoppingAgentState,
+                    middleware=[
+                        RequireInitialShoppingToolMiddleware(),
+                        guard,
+                        ToolCallLimitMiddleware(run_limit=3, exit_behavior="continue"),
+                        ModelCallLimitMiddleware(run_limit=4, exit_behavior="end"),
+                    ],
+                )
+
             # Most normal turns are select-tool → tool-result → answer.  Agent
             # middleware contributes graph steps too, so 8 can reject that
             # healthy three-step flow before its final model response.  The
@@ -167,7 +207,11 @@ class ShoppingAgent:
             }
             agent_config = {
                 "configurable": {"thread_id": str(uuid4())},
-                "recursion_limit": 12,
+                # Deep Agents adds Skill/filesystem middleware graph steps.
+                # ToolCallLimit and ModelCallLimit remain the actual loop
+                # guards; this only prevents a healthy bounded run from being
+                # cut off before its final model response.
+                "recursion_limit": 40 if shopping_runtime == "deep_agent" else 12,
             }
             if token_sink is None:
                 result = await agent.ainvoke(agent_input, config=agent_config)
@@ -197,6 +241,9 @@ class ShoppingAgent:
                 token_sink=token_sink,
             )
             if fallback is not None:
+                fallback["shopping_runtime"] = shopping_runtime
+                fallback["skill_reads"] = []
+                fallback["script_calls"] = []
                 return fallback
             return {
                 "answer": "导购 Agent 处理失败，请稍后再试。",
@@ -207,10 +254,23 @@ class ShoppingAgent:
                 "message": str(e),
                 "dispatch_source": "none",
                 "tool_calls": guard.records,
+                "shopping_runtime": shopping_runtime,
+                "skill_reads": [],
+                "script_calls": [],
             }
 
+        result_messages = result.get("messages", [])
+        skill_reads = extract_shopping_skill_reads(
+            result_messages,
+            skill_source=skill_source,
+        ) if shopping_runtime == "deep_agent" else []
+        script_calls = extract_shopping_script_calls(
+            result_messages,
+        ) if shopping_runtime == "deep_agent" else []
         collected_tool_calls = _extract_tool_calls(
-            result.get("messages", []), guard_records=guard.records,
+            result_messages,
+            guard_records=guard.records,
+            allowed_tool_names=_BUSINESS_TOOL_NAMES,
         )
 
         # A Shopping answer without any high-level ToolResult is not grounded
@@ -228,7 +288,10 @@ class ShoppingAgent:
                 "suggested_questions": [],
                 "capability": None,
                 "dispatch_source": "none",
-                "model_call_count": _count_model_calls(result.get("messages", [])),
+                "model_call_count": _count_model_calls(result_messages),
+                "shopping_runtime": shopping_runtime,
+                "skill_reads": skill_reads,
+                "script_calls": script_calls,
                 "error": True,
                 "error_code": ErrorCode.SHOPPING_ERROR,
                 "message": "ShoppingAgent completed without a high-level ToolResult.",
@@ -237,7 +300,7 @@ class ShoppingAgent:
         # ★ Phase 1a 关键变更：product_cards 优先从最近一次 ToolMessage 抽取，
         # 而不是无条件读 Store —— 避免"对比/详情"轮次误带上一轮推荐卡片。
         # 只有 ToolMessage 里没有 product_cards（LLM 没调工具，纯闲聊）时才回读 Store。
-        tool_result = _extract_high_level_tool_result(result.get("messages", []))
+        tool_result = _extract_high_level_tool_result(result_messages)
         if tool_result and "product_cards" in tool_result:
             product_cards = tool_result.get("product_cards") or []
         else:
@@ -245,7 +308,7 @@ class ShoppingAgent:
 
         # answer 从最后一条 AI 消息 content 提取
         answer = ""
-        for m in reversed(result.get("messages", [])):
+        for m in reversed(result_messages):
             mtype = getattr(m, "type", "")
             if mtype == "ai":
                 content = getattr(m, "content", "")
@@ -275,7 +338,10 @@ class ShoppingAgent:
             "suggested_questions": suggested_questions,
             "capability": capability,
             "dispatch_source": dispatch_source,
-            "model_call_count": _count_model_calls(result.get("messages", [])),
+            "model_call_count": _count_model_calls(result_messages),
+            "shopping_runtime": shopping_runtime,
+            "skill_reads": skill_reads,
+            "script_calls": script_calls,
             "error": False,
         }
 
@@ -543,12 +609,19 @@ def _extract_tool_calls(
     messages: list,
     *,
     guard_records: Optional[List[Dict[str, Any]]] = None,
+    allowed_tool_names: Optional[set[str] | frozenset[str]] = None,
 ) -> List[Dict[str, Any]]:
     """从 create_agent 的 result["messages"] 里抽取工具调用记录。"""
     records_by_id = {
         str(record.get("tool_call_id")): record
         for record in (guard_records or [])
         if record.get("tool_call_id")
+    }
+    failed_tool_call_ids = {
+        str(getattr(message, "tool_call_id", "") or "")
+        for message in (messages or [])
+        if getattr(message, "type", "") == "tool"
+        and getattr(message, "status", None) == "error"
     }
     out: List[Dict[str, Any]] = []
     for m in messages or []:
@@ -565,6 +638,12 @@ def _extract_tool_calls(
                 name = getattr(tc, "name", "") or ""
                 args = getattr(tc, "args", None) or getattr(tc, "arguments", None) or {}
             if not name:
+                continue
+            if allowed_tool_names is not None and name not in allowed_tool_names:
+                continue
+            # Skill-contract rejections are internal correction steps, not
+            # successful public Shopping business executions.
+            if str(call_id) in failed_tool_call_ids:
                 continue
             normalized_args = args if isinstance(args, dict) else {}
             trace = records_by_id.get(str(call_id), {})
@@ -590,6 +669,9 @@ def _extract_tool_calls(
     # dropping it from the trace.
     seen_ids = {str(item.get("tool_call_id")) for item in out}
     for record in guard_records or []:
+        record_name = str(record.get("tool_name") or record.get("name") or "")
+        if allowed_tool_names is not None and record_name not in allowed_tool_names:
+            continue
         if str(record.get("tool_call_id")) not in seen_ids:
             out.append(dict(record))
     return out

@@ -198,6 +198,18 @@ class AIResponse(FlexibleModel):
     sub_questions: List[Dict[str, Any]] = Field(default_factory=list, description="Orchestrator sub tasks")
     sub_results: List[Dict[str, Any]] = Field(default_factory=list, description="Orchestrator sub task results")
     task_levels: List[List[str]] = Field(default_factory=list, description="Topological task execution levels")
+    shopping_runtime: Optional[str] = Field(
+        None,
+        description="Shopping runtime implementation used for this turn",
+    )
+    skill_reads: List[str] = Field(
+        default_factory=list,
+        description="Privacy-safe Shopping Skill names read during this turn",
+    )
+    script_calls: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Privacy-safe controlled Shopping Skill script traces",
+    )
 
 
 class StreamEvent(FlexibleModel):

@@ -467,6 +467,9 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             "capability": state.get("capability"),
             "dispatch_source": state.get("dispatch_source"),
             "model_call_count": state.get("model_call_count"),
+            "shopping_runtime": state.get("shopping_runtime"),
+            "skill_reads": state.get("skill_reads", []),
+            "script_calls": state.get("script_calls", []),
             "error": bool(state.get("error", False)),
             "error_code": state.get("error_code"),
             "message": state.get("message"),
@@ -534,7 +537,8 @@ def _merge_result(result: Dict[str, Any], *, task_type: str,
     merged: Dict[str, Any] = {}
     for key in (
             "answer", "product_cards", "sources", "tool_calls", "suggested_questions", "retrieved_contexts",
-        "capability", "dispatch_source", "model_call_count", "hard_constraint_violation", "error", "error_code", "message",
+        "capability", "dispatch_source", "model_call_count", "shopping_runtime", "skill_reads", "script_calls",
+        "hard_constraint_violation", "error", "error_code", "message",
     ):
         if key in result:
             merged[key] = result[key]
@@ -543,6 +547,7 @@ def _merge_result(result: Dict[str, Any], *, task_type: str,
     merged.setdefault("product_cards", [])
     merged.setdefault("sources", [])
     merged.setdefault("tool_calls", [])
+    merged.setdefault("script_calls", [])
     merged.setdefault("suggested_questions", [])
     merged.setdefault("error", False)
     if extra:

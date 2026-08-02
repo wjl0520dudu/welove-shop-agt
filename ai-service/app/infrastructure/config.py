@@ -96,6 +96,23 @@ class Config:
     SHOPPING_LLM_JUDGE_ENABLED = os.getenv("SHOPPING_LLM_JUDGE_ENABLED", "true").lower() in ("1", "true", "yes")
     SHOPPING_LLM_JUDGE_MAX_CANDIDATES = int(os.getenv("SHOPPING_LLM_JUDGE_MAX_CANDIDATES", "10"))
     SHOPPING_LLM_JUDGE_MIN_SCORE = float(os.getenv("SHOPPING_LLM_JUDGE_MIN_SCORE", "0.55"))
+    # ShoppingAgent Deep Agents + Skills dual-track switch.  The Skill-driven
+    # runtime is the default; set false for an explicit manual rollback.
+    SHOPPING_DEEP_AGENT_ENABLED = os.getenv(
+        "SHOPPING_DEEP_AGENT_ENABLED", "true"
+    ).lower() in ("1", "true", "yes")
+    # Virtual path inside the read-only ai-service filesystem backend.
+    SHOPPING_SKILLS_ROOT = os.getenv(
+        "SHOPPING_SKILLS_ROOT", "/skills/shopping-agent/"
+    )
+    # Reviewed Skill scripts execute through a fixed whitelist runner. Generic
+    # shell/Deep Agents execute remains hidden from ShoppingAgent.
+    SHOPPING_SKILL_SCRIPT_MODE = os.getenv(
+        "SHOPPING_SKILL_SCRIPT_MODE", "controlled"
+    ).strip().lower()
+    SHOPPING_SKILL_SCRIPT_TIMEOUT_SECONDS = float(os.getenv(
+        "SHOPPING_SKILL_SCRIPT_TIMEOUT_SECONDS", "2"
+    ))
     # 多模态 embedding / rerank 走百炼业务空间专属端点；不配置时使用 dashscope SDK 默认端点。
     DASHSCOPE_MAAS_BASE_URL = os.getenv("DASHSCOPE_MAAS_BASE_URL", "")
 

@@ -37,21 +37,13 @@ class TestToolCatalog:
             assert t.description
             assert len(t.description) > 30   # 有实质内容，让 LLM 有依据挑
 
-    def test_primary_tools_publish_closed_loop_operation_manuals(self):
-        """高层工具说明是 Agent 的固定执行手册，不应退化成只有一句用途。"""
-        primary_names = {
-            "recommend_products",
-            "compare_products",
-            "answer_product_detail",
-        }
+    def test_tools_publish_concise_boundaries_and_delegate_workflows_to_skills(self):
+        """Phase S2 后 Tool 只说明接口，固定工作方法由 Skill 按需加载。"""
         for tool in SHOPPING_HIGH_LEVEL_TOOLS:
-            if tool.name not in primary_names:
-                continue
-            assert "固定执行闭环" in tool.description
-            assert "工具内部" in tool.description
-            assert "返回分支" in tool.description
-            assert "完成后" in tool.description
-            assert "最终输出" in tool.description
+            assert "固定执行闭环" not in tool.description
+            assert "典型示例" not in tool.description
+            assert "Skill" in tool.description
+            assert len(tool.description) < 220
 
     def test_recommend_args_schema(self):
         """LLM 应该看到 query / limit，但不该看到 runtime。"""

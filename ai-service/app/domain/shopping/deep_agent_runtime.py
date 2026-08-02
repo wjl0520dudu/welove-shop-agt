@@ -118,13 +118,15 @@ class ShoppingDeepAgentToolSurfaceMiddleware(AgentMiddleware):
 
 def shopping_skill_permissions(
     *,
+    skill_source: str = SHOPPING_SKILL_SOURCE,
     include_shared: bool = False,
 ) -> list[FilesystemPermission]:
     """Build first-match filesystem rules for a read-only Skill source."""
+    source = f"/{str(skill_source).strip('/')}/"
     rules = [
         FilesystemPermission(
             operations=["read"],
-            paths=[f"{SHOPPING_SKILL_SOURCE}**"],
+            paths=[f"{source}**"],
             mode="allow",
         ),
     ]

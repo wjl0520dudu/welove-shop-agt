@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.tools import tool
 
 from app.domain.shopping.agent import ShoppingAgent
+from app.infrastructure.config import config
+
+
+@pytest.fixture(autouse=True)
+def _use_phase2_legacy_runtime(monkeypatch):
+    """Phase 2 tests isolate the explicit manual rollback implementation."""
+    monkeypatch.setattr(config, "SHOPPING_DEEP_AGENT_ENABLED", False)
 
 
 class _FakeAgent:
@@ -186,43 +195,38 @@ def test_agent_without_a_high_level_tool_never_returns_an_ungrounded_recommendat
     asyncio.run(run())
 
 
-def test_prompt_has_closed_loop_operation_manuals_but_disallows_history_reresolution():
+def test_prompt_is_a_short_role_contract_without_embedded_operation_manuals():
     prompt = ShoppingAgent(MagicMock())._build_system_prompt(
         selected_product_ids=[11, 13],
         image_url="https://cdn.example.test/p.png",
         input_mode="multimodal",
     )
 
-    # 总览层：先让 Agent 清楚自己只做高层能力选择和结果收尾。
     assert "你的职责" in prompt
-    assert "你可以使用的工具（只有这 4 个）" in prompt
-    assert "工具选择规则" in prompt
-    assert "推荐一下" in prompt
-    assert "Plan-and-Execute" in prompt
-    assert "recommend_products" in prompt
-    assert "compare_products" in prompt
-    assert "answer_product_detail" in prompt
     assert "不要再读取或猜测会话历史" in prompt
     assert "11, 13" in prompt
-    assert "操作手册 A：推荐或发现新商品" in prompt
-    assert "操作手册 B：比较已绑定商品" in prompt
-    assert "操作手册 C：查询单个已绑定商品详情" in prompt
-    assert "工具内部完成需求解析" in prompt
-    assert "得到结果后如何处理" in prompt
-    assert "禁止重复处理" in prompt
-    assert "最终输出" in prompt
+    assert "操作手册 A" not in prompt
+    assert "操作手册 B" not in prompt
+    assert "操作手册 C" not in prompt
+    assert "Plan-and-Execute" not in prompt
+    assert "Few-shot" not in prompt
 
 
-def test_prompt_limits_answer_products_to_the_rendered_card_count():
+def test_detailed_recommendation_result_rules_live_in_the_discovery_skill():
     prompt = ShoppingAgent(MagicMock())._build_system_prompt(
         selected_product_ids=[],
         image_url=None,
         input_mode="text",
     )
 
-    assert "returned_count" in prompt
-    assert "product_cards" in prompt
-    assert "不得为了满足数量" in prompt
+    skill_text = Path(
+        "skills/shopping-agent/discover-products/SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert "returned_count" not in prompt
+    assert "returned_count" in skill_text
+    assert "product_cards" in skill_text
+    assert "不要从历史或常识补齐" in skill_text
 
 
 def test_real_create_agent_tool_loop_executes_the_high_level_tool_once():
