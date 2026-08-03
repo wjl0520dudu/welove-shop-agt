@@ -53,7 +53,10 @@ public class ConversationContextServiceImpl implements ConversationContextServic
     }
 
     @Override
-    public void updateConversationContext(Long conversationId, Long userId,          ctx.setConversationId(conversationId);
+    public void updateConversationContext(Long conversationId, Long userId, Message newMessage) {
+        invalidateConversationContext(conversationId);
+        ConversationContext ctx = new ConversationContext();
+        ctx.setConversationId(conversationId);
         ctx.setUserId(userId);
         ctx.setWindowSize(windowSize);
         ctx.setImportanceScore(0.5);
@@ -65,6 +68,19 @@ public class ConversationContextServiceImpl implements ConversationContextServic
     @Override
     public void invalidateConversationContext(Long conversationId) {
         redisTemplate.delete(REDIS_PREFIX + conversationId);
+    }
+
+    @Override
+    public ConversationContext getRollingSummaryContext(Long conversationId) {
+        return ctxMapper.selectByConversationId(conversationId);
+    }
+
+    @Override
+    public boolean updateRollingSummary(Long conversationId, String summary, Long coveredMessageId) {
+        if (conversationId == null || coveredMessageId == null || summary == null || summary.isBlank()) {
+            return false;
+        }
+        return ctxMapper.updateRollingSummary(conversationId, summary, coveredMessageId) > 0;
     }
 
     @Override

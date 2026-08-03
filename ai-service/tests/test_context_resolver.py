@@ -1,4 +1,5 @@
 from app.application.assistant import resolve_turn_context
+from app.application.assistant.context_resolver import build_shared_conversation_messages
 
 
 TEXT_CARDS = [
@@ -112,3 +113,20 @@ def test_preparation_uses_store_cards_when_history_has_no_rendered_cards():
         "source_type": "recommendation",
         "product_ids": [11, 12],
     }
+
+
+def test_preparation_injects_persisted_summary_once_before_recent_visible_messages():
+    result = resolve_turn_context(
+        question="我刚刚问了什么？",
+        business_memory={},
+        conversation_summary="用户此前询问果酸和视黄醇能否同用。",
+        conversation_history=[
+            {"id": 41, "role": "user", "content": "我刚刚问了什么？"},
+        ],
+    )
+
+    messages = result["messages"]
+    assert messages[0].type == "system"
+    assert "果酸和视黄醇" in messages[0].content
+    assert messages[1].type == "human"
+    assert messages[1].content == "我刚刚问了什么？"

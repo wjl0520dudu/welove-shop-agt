@@ -19,6 +19,34 @@ class SummaryRequest(BaseModel):
     question: str = Field(..., description="Conversation question used to generate a title")
 
 
+class RollingSummaryMessage(FlexibleModel):
+    """A user-visible persisted message eligible for rolling compression."""
+
+    id: Optional[int] = Field(None, description="Persisted chat message ID")
+    role: str = Field(..., description="Only user or assistant is accepted")
+    content: str = Field("", description="User-visible text")
+    image_url: Optional[str] = Field(None, description="Optional user-visible image")
+    product_cards: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Optional rendered product cards, kept only as visible facts",
+    )
+
+
+class RollingSummaryRequest(BaseModel):
+    """Internal chat-service → ai-service request for one rolling summary update."""
+
+    previous_summary: str = Field("", description="Previously persisted prefix summary")
+    messages: List[RollingSummaryMessage] = Field(
+        default_factory=list,
+        description="Newly eligible visible messages, sorted chronologically",
+    )
+    max_chars: int = Field(1600, ge=200, le=4000, description="Maximum persisted summary length")
+
+
+class RollingSummaryResponse(BaseModel):
+    summary: str = Field(..., description="Merged compact summary for the covered visible prefix")
+
+
 class ChatRequest(BaseModel):
     question: str = Field(..., description="User input text")
     context: str = Field("", description="Conversation context passed by Java")
@@ -37,6 +65,10 @@ class ChatRequest(BaseModel):
     conversation_history: List[Dict[str, Any]] = Field(
         default_factory=list,
         description="Recent persisted messages with product/image artifacts, supplied by chat-service",
+    )
+    conversation_summary: str = Field(
+        "",
+        description="Persisted summary of the older visible conversation prefix, supplied by chat-service",
     )
 
 

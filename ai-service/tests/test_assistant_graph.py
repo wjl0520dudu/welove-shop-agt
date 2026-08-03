@@ -334,7 +334,10 @@ def test_stream_uses_custom_as_the_only_user_visible_token_channel():
 
         assert captured["stream_mode"] == ["updates", "custom"]
         assert captured["subgraphs"] is True
-        assert len(captured["reset_values"]["messages"]) == 2
+        # ContextResolver owns construction of the shared summary + recent
+        # visible messages. Before graph execution the Checkpointer is cleared
+        # rather than seeded with a second raw-history copy.
+        assert len(captured["reset_values"]["messages"]) == 1
         assert [event["data"]["content"] for event in events if event["type"] == "token"] == ["只发一次"]
         assert next(event["data"] for event in events if event["type"] == "final")["answer"] == "只发一次"
 

@@ -55,6 +55,7 @@ public class ChatServiceImpl implements ChatService {
     private final QaLogMapper qaLogMapper;
     private final AiService aiService;
     private final ConversationContextService ctxService;
+    private final RollingConversationSummaryService rollingSummaryService;
     private final StringRedisTemplate redisTemplate;
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
@@ -110,6 +111,8 @@ public class ChatServiceImpl implements ChatService {
         aiMsg.setMessageType("text"); aiMsg.setTaskType(String.valueOf(aiResp.getOrDefault("task_type", "")));
         aiMsg.setCreateTime(LocalDateTime.now());
         msgMapper.insert(aiMsg);
+        ctxService.invalidateConversationContext(conversationId);
+        rollingSummaryService.scheduleUpdate(conversationId);
         saveQaLog(userId, conversationId, content, aiMsg.getContent(), aiMsg.getTaskType(), duration);
         return aiMsg;
     }
@@ -188,6 +191,7 @@ public class ChatServiceImpl implements ChatService {
                 aiBody.put("conversation_id", conversationId.toString());
                 aiBody.put("user_id", userId.toString());
                 aiBody.put("conversation_history", buildConversationHistory(conversationId));
+                aiBody.put("conversation_summary", buildConversationSummary(conversationId));
                 aiBody.put("username", username);
                 aiBody.put("is_admin", false);
                 if (jwtToken != null) aiBody.put("jwt_token", jwtToken);
@@ -302,6 +306,7 @@ public class ChatServiceImpl implements ChatService {
                         aiMsg.setCreateTime(LocalDateTime.now());
                         msgMapper.insert(aiMsg);
                         ctxService.invalidateConversationContext(conversationId);
+                        rollingSummaryService.scheduleUpdate(conversationId);
                         long streamDuration = System.currentTimeMillis() - streamStartMs;
                         saveQaLog(userId, conversationId, content, answer, taskType[0].isEmpty() ? "shopping" : taskType[0], streamDuration);
                         // 发送 done 事件并关闭 (set finalized 已在上面 compareAndSet 完成)
@@ -429,6 +434,7 @@ public class ChatServiceImpl implements ChatService {
                 aiBody.put("conversation_id", conversationId.toString());
                 aiBody.put("user_id", userId.toString());
                 aiBody.put("conversation_history", buildConversationHistory(conversationId));
+                aiBody.put("conversation_summary", buildConversationSummary(conversationId));
                 aiBody.put("username", username);
                 aiBody.put("is_admin", false);
                 if (jwtToken != null) aiBody.put("jwt_token", jwtToken);
@@ -529,6 +535,7 @@ public class ChatServiceImpl implements ChatService {
                         aiMsg.setCreateTime(LocalDateTime.now());
                         msgMapper.insert(aiMsg);
                         ctxService.invalidateConversationContext(conversationId);
+                        rollingSummaryService.scheduleUpdate(conversationId);
                         saveQaLog(userId, conversationId,
                                 safeContent.isEmpty() ? "[图片]" : safeContent,
                                 answer,
@@ -772,6 +779,16 @@ public class ChatServiceImpl implements ChatService {
             history.add(item);
         }
         return history;
+    }
+
+    /**
+     * The Router and ChitchatAgent receive this same persisted summary through
+     * the assistant request.  Raw messages remain in chat_svc.message; this
+     * method never treats Redis as the source of summary truth.
+     */
+    private String buildConversationSummary(Long conversationId) {
+        var context = ctxService.getRollingSummaryContext(conversationId);
+        return context == null || context.getSummary() == null ? "" : context.getSummary();
     }
 
     private static void captureFinalAgentMeta(Map<String, Object> event, Map<String, Object> agentMeta) {

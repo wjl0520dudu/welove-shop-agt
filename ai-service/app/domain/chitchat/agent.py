@@ -10,7 +10,6 @@ from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddlewar
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.runnables import RunnableConfig
 
-from app.infrastructure.llm.middleware import build_summarization_middleware
 from app.infrastructure.observability.langsmith import child_run_config
 
 
@@ -18,10 +17,9 @@ class ChitchatAgent:
     """Handle natural conversation and conversation review without business tools.
 
     The parent AssistantGraph remains the owner of persisted conversation state.
-    This Agent receives that state as messages and uses LangChain's
-    ``SummarizationMiddleware`` only to compact the model input for a long turn.
-    It deliberately has no independent checkpointer: a child-local history would
-    miss Shopping/Knowledge turns and could diverge from chat-service history.
+    This Agent receives the same already-compressed visible messages as Router.
+    It deliberately has no independent checkpointer or summarization middleware:
+    a child-local summary could diverge from chat-service's persisted summary.
     """
 
     def __init__(self, llm: Any):
@@ -41,10 +39,6 @@ class ChitchatAgent:
             tools=[],
             system_prompt=system_prompt,
             middleware=[
-                # Triggers only for genuinely long inputs.  The summary is an
-                # input-time compression, while the parent graph/chat-service
-                # remains authoritative for durable conversation history.
-                build_summarization_middleware(self._llm),
                 ModelCallLimitMiddleware(run_limit=2, exit_behavior="end"),
             ],
         )

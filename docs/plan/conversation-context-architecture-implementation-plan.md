@@ -58,3 +58,24 @@
 - Python 相关模块 `py_compile`；
 - `git diff --check`；
 - `mvn -pl services/chat-service -am compile -DskipTests`。
+
+## 统一滚动摘要实现（2026-08）
+
+当前上下文主链已收敛为：
+
+```text
+chat_svc.message（完整、权威原文）
+  → conversation_context.summary（已压缩的较早前缀）
+  + 最近 N 条可见原文
+  → resolve_context 组装唯一 messages
+  → Router / ChitchatAgent 共用
+```
+
+- `chat-service` 在助手消息落库后异步执行摘要更新；当前 SSE 回复不等待该 LLM 调用。
+- `conversation_context` 仍保持每会话一行；V7 仅增加 `summary_covered_message_id`，记录摘要已覆盖到的消息，避免重复压缩，不新建第二套记忆表。
+- 摘要仅接收用户/助手的可见文本、图片标记与展示商品卡关键字段；不输入 Tool、DAG、Judge、Prompt 或运行时状态。
+- `resolve_context` 将“持久化摘要 + 最近原文”作为同一份 LangChain messages 注入 Router 与 Chitchat；Shopping / Knowledge 继续只获取 Router 已消解的当前任务和绑定实体。
+- ChitchatAgent 不再独立使用 `SummarizationMiddleware`，避免与持久化摘要产生两份不同的会话事实。
+- 阈值统一配置：`ROUTER_ROLLING_SUMMARY_ENABLED`、`ROUTER_SUMMARY_TURN_THRESHOLD`、`ROUTER_SUMMARY_CHAR_THRESHOLD`、`ROUTER_CONTEXT_RECENT_MESSAGE_WINDOW`、`ROUTER_SUMMARY_MAX_CHARS`。AI Service 的 `.env` 与 `.env.example` 已同步；chat-service 使用同名环境变量或其默认值。
+
+默认策略为：保留最近 10 条可见原文；当可压缩的新前缀达到 4 个完整轮次（8 条消息）或 4000 字符时，异步更新摘要。未达到窗口边界时不摘要，因为全部对话仍以原文形式可见。

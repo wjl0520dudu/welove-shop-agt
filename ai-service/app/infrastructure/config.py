@@ -28,6 +28,20 @@ class Config:
         os.getenv("ROUTER_ORCHESTRATOR_HINT_CONFIDENCE", "0.90")
     )
 
+    # One persisted rolling summary is shared by Router and Chitchat. The
+    # actual trigger/write happens in chat-service because it owns chat_svc;
+    # ai-service uses this switch to decide whether an incoming summary may be
+    # injected into the shared visible message list.
+    ROUTER_ROLLING_SUMMARY_ENABLED = os.getenv(
+        "ROUTER_ROLLING_SUMMARY_ENABLED", "true"
+    ).lower() in ("1", "true", "yes")
+    ROUTER_SUMMARY_TURN_THRESHOLD = int(os.getenv("ROUTER_SUMMARY_TURN_THRESHOLD", "4"))
+    ROUTER_SUMMARY_CHAR_THRESHOLD = int(os.getenv("ROUTER_SUMMARY_CHAR_THRESHOLD", "4000"))
+    ROUTER_CONTEXT_RECENT_MESSAGE_WINDOW = int(
+        os.getenv("ROUTER_CONTEXT_RECENT_MESSAGE_WINDOW", "10")
+    )
+    ROUTER_SUMMARY_MAX_CHARS = int(os.getenv("ROUTER_SUMMARY_MAX_CHARS", "1600"))
+
     # 1c. Preference-aware soft reranking. These are bounded adjustments applied
     # after relevance retrieval; current-turn hard constraints remain authoritative.
     PERSONALIZATION_POSITIVE_BOOST = float(os.getenv("PERSONALIZATION_POSITIVE_BOOST", "0.08"))

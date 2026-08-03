@@ -34,6 +34,10 @@ class AssistantState(TypedDict):
     # supplied by chat-service on every turn.  They are not LangGraph messages:
     # ContextResolver consumes the structured cards/image metadata first.
     conversation_history: NotRequired[list[dict[str, Any]]]
+    # Persisted compressed prefix supplied by chat-service.  ContextResolver
+    # injects it once into ``messages`` so Router and Chitchat share exactly
+    # the same summary + recent original messages.
+    conversation_summary: NotRequired[str]
     context_resolution: NotRequired[dict[str, Any]]
     canonical_question: NotRequired[str]
     # Router-owned image retrieval semantics.  This is deliberately separate

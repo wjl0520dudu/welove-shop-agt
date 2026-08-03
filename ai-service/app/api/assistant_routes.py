@@ -11,7 +11,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import Field
 
 from app.api.response_adapter import build_error_response, normalize_ai_response
-from app.api.schemas import AIResponse, ChatRequest
+from app.api.schemas import (
+    AIResponse,
+    ChatRequest,
+    RollingSummaryRequest,
+    RollingSummaryResponse,
+)
+from app.application.assistant.conversation_summary import build_rolling_summary
 from app.application.assistant.graph import AssistantGraph
 from app.infrastructure.errors import ErrorCode
 from app.infrastructure.llm.llm import get_llm
@@ -34,6 +40,27 @@ class AssistantRunRequest(ChatRequest):
     sku_id: Optional[int] = Field(None, description="[deprecated] 不再由 Agent 处理")
     cart_item_id: Optional[int] = Field(None, description="[deprecated] 不再由 Agent 处理")
     quantity: int = Field(1, ge=1, description="[deprecated] 不再由 Agent 处理")
+
+
+@router.post("/conversation-summary", response_model=RollingSummaryResponse)
+async def create_conversation_summary(request: RollingSummaryRequest) -> RollingSummaryResponse:
+    """Internal best-effort endpoint used by chat-service after a turn is saved."""
+    llm = get_llm()
+    if llm is None:
+        raise HTTPException(status_code=503, detail="LLM is not configured")
+    try:
+        summary = await build_rolling_summary(
+            llm,
+            previous_summary=request.previous_summary,
+            messages=request.messages,
+            max_chars=request.max_chars,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("rolling summary generation failed")
+        raise HTTPException(status_code=502, detail="rolling summary generation failed") from exc
+    if not summary:
+        raise HTTPException(status_code=502, detail="rolling summary generation returned empty text")
+    return RollingSummaryResponse(summary=summary)
 
 
 def _parse_user_id(value: Optional[str]) -> Optional[int]:
@@ -87,6 +114,7 @@ async def run_assistant(request: AssistantRunRequest, http_request: Request) -> 
             skin_type=request.skin_type,
             preference_tags=request.preference_tags,
             conversation_history=request.conversation_history,
+            conversation_summary=request.conversation_summary,
             trace_id=trace_id,
             image_url=image_url,
         )
@@ -161,6 +189,7 @@ async def stream_assistant(request: AssistantRunRequest, http_request: Request):
                 skin_type=request.skin_type,
                 preference_tags=request.preference_tags,
                 conversation_history=request.conversation_history,
+                conversation_summary=request.conversation_summary,
                 trace_id=trace_id,
                 image_url=image_url,
             ):
@@ -352,6 +381,7 @@ async def run_multimodal_assistant(
             trace_id=trace_id,
             image_url=image_url,
             conversation_history=request.conversation_history,
+            conversation_summary=request.conversation_summary,
         )
     except MultimodalImageError as e:
         # 第二道防线：HEAD 通过但 DashScope 拒识别（图片格式非法 / CDN 拒绝
@@ -426,6 +456,7 @@ async def stream_multimodal_assistant(
                 trace_id=trace_id,
                 image_url=image_url,
                 conversation_history=request.conversation_history,
+                conversation_summary=request.conversation_summary,
             ):
                 if await http_request.is_disconnected():
                     logger.info(

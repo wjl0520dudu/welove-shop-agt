@@ -153,6 +153,10 @@ class AssistantGraph:
             question=state.get("question", ""),
             conversation_history=state.get("conversation_history") or [],
             business_memory={**persisted, **dict(state.get("business_memory") or {})},
+            conversation_summary=(
+                state.get("conversation_summary") or ""
+                if config.ROUTER_ROLLING_SUMMARY_ENABLED else ""
+            ),
         )
         return resolved
 
@@ -1031,10 +1035,9 @@ class AssistantGraph:
         trace_id = kwargs.get("trace_id") or str(uuid4())
         question = kwargs.get("question", "") or ""
         image_url = (kwargs.get("image_url") or "").strip() or None
-        # 纯图搜索时 question 可能为空，此时给 messages 一个占位描述，
-        # 让 checkpointer / summarization middleware 能有内容处理；
-        # 若 question 非空，直接透传给 HumanMessage。
-        human_content = question.strip() or "[用户上传了一张图片，未附文字说明]"
+        # Pure-image search may have an empty text question. ContextResolver
+        # turns its persisted image-bearing history into the shared visible
+        # message list before Router runs.
         conversation_history = _normalize_conversation_history(
             kwargs.get("conversation_history") or [], question, image_url,
         )
@@ -1076,10 +1079,12 @@ class AssistantGraph:
             "run_id": run_id,
             "trace_id": trace_id,
             "conversation_history": conversation_history,
+            "conversation_summary": str(kwargs.get("conversation_summary") or "").strip(),
             "context_resolution": {},
-            # Router receives the complete history supplied by chat-service;
-            # structured card/image artifacts remain available separately.
-            "messages": _history_to_messages(conversation_history) or [HumanMessage(content=human_content)],
+            # resolve_context creates the one shared, compressed visible
+            # context. Keeping the initial channel empty also prevents a stale
+            # checkpointer turn from merging with chat-service history.
+            "messages": [],
             "error": False,
             "error_code": None,
             "message": None,
@@ -1527,8 +1532,6 @@ def _dedupe_product_cards(cards_iter) -> list[dict[str, Any]]:
         seen.add(key)
         out.append(card)
     return out
-
-
 def _dedupe_sources(sources_iter) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1582,23 +1585,3 @@ def _normalize_conversation_history(
     if not out or out[-1].get("role") != "user" or out[-1].get("content") != (question or "").strip():
         out.append({"role": "user", "content": (question or "").strip(), "image_url": image_url or ""})
     return out
-
-
-def _history_to_messages(history: list[dict[str, Any]]) -> list:
-    """Convert the textual portion of persisted history into LangChain messages."""
-    messages: list = []
-    for item in history:
-        content = str(item.get("content") or "").strip()
-        if item.get("image_url") and not content:
-            content = "[用户上传了一张图片]"
-        if not content:
-            continue
-        message_id = str(item.get("id")) if item.get("id") is not None else None
-        role = item.get("role")
-        if role == "user":
-            messages.append(HumanMessage(content=content, id=message_id))
-        elif role == "assistant":
-            messages.append(AIMessage(content=content, id=message_id))
-        elif role == "system":
-            messages.append(SystemMessage(content=content, id=message_id))
-    return messages

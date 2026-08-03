@@ -5,6 +5,8 @@ import com.welove.shop.chat.entity.ConversationContext;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.Update;
 
 @Mapper
 public interface ConversationContextMapper extends BaseMapper<ConversationContext> {
@@ -30,4 +32,29 @@ public interface ConversationContextMapper extends BaseMapper<ConversationContex
                 update_time = EXCLUDED.update_time
             """)
     int upsertActivity(@Param("context") ConversationContext context);
+
+    @Select("""
+            SELECT * FROM conversation_context
+            WHERE conversation_id = #{conversationId}
+            LIMIT 1
+            """)
+    ConversationContext selectByConversationId(@Param("conversationId") Long conversationId);
+
+    /**
+     * Persists a newer summary only.  The covered message ID is a lightweight
+     * watermark: it prevents two asynchronous jobs from repeatedly summarizing
+     * the same visible prefix.
+     */
+    @Update("""
+            UPDATE conversation_context
+            SET summary = #{summary},
+                summary_covered_message_id = #{coveredMessageId},
+                update_time = CURRENT_TIMESTAMP
+            WHERE conversation_id = #{conversationId}
+              AND (summary_covered_message_id IS NULL
+                   OR summary_covered_message_id <= #{coveredMessageId})
+            """)
+    int updateRollingSummary(@Param("conversationId") Long conversationId,
+                             @Param("summary") String summary,
+                             @Param("coveredMessageId") Long coveredMessageId);
 }
