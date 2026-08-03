@@ -12,7 +12,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.tools import tool
 
-from app.domain.shopping.agent import ShoppingAgent
+from app.domain.shopping.agent import ShoppingAgent, _is_user_visible_stream_chunk
 from app.infrastructure.config import config
 
 
@@ -43,6 +43,18 @@ class _FakeStreamingAgent(_FakeAgent):
         yield "messages", (AIMessageChunk(content="字"), {})
         yield "messages", (AIMessageChunk(content="回答"), {})
         yield "values", self.result
+
+
+def test_internal_judge_chunks_are_not_forwarded_to_user_sse():
+    assert not _is_user_visible_stream_chunk(
+        AIMessageChunk(content='{"candidate_index": 1, "decision": "exact"}'),
+        {"config": {"tags": ["ai_internal", "shopping_candidate_filter"]}},
+    )
+    assert not _is_user_visible_stream_chunk(
+        AIMessageChunk(content="", tool_call_chunks=[{"name": "recommend_products"}]),
+        {},
+    )
+    assert _is_user_visible_stream_chunk(AIMessageChunk(content="自然导购回答"), {})
 
 
 class _ToolBoundFakeModel(FakeMessagesListChatModel):

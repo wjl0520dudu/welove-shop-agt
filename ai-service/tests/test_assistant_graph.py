@@ -308,6 +308,39 @@ def test_complex_stream_emits_completed_subtasks_before_final():
     asyncio.run(run())
 
 
+def test_stream_uses_custom_as_the_only_user_visible_token_channel():
+    async def run():
+        graph = AssistantGraph(llm=None)
+        captured = {}
+
+        class FakeCompiledGraph:
+            async def aupdate_state(self, config, values):
+                captured["reset_config"] = config
+                captured["reset_values"] = values
+
+            async def astream(self, state, config, stream_mode, subgraphs):
+                captured["stream_mode"] = stream_mode
+                captured["subgraphs"] = subgraphs
+                yield (), "custom", {"type": "token", "data": {"content": "只发一次"}}
+                yield (), "updates", {"format_response": {"result": {"answer": "只发一次"}}}
+
+        graph.graph = FakeCompiledGraph()
+        events = [
+            event async for event in graph.astream(
+                question="你好",
+                conversation_id="single-token-channel",
+            )
+        ]
+
+        assert captured["stream_mode"] == ["updates", "custom"]
+        assert captured["subgraphs"] is True
+        assert len(captured["reset_values"]["messages"]) == 2
+        assert [event["data"]["content"] for event in events if event["type"] == "token"] == ["只发一次"]
+        assert next(event["data"] for event in events if event["type"] == "final")["answer"] == "只发一次"
+
+    asyncio.run(run())
+
+
 def test_complex_planner_failure_does_not_use_heuristic_splitter():
     async def run():
         graph = AssistantGraph(llm=_dummy_llm(), shopping_agent=FakeShoppingAgent(), knowledge_agent=FakeKnowledgeAgent())
@@ -374,7 +407,7 @@ def test_unknown_node_uses_llm_to_naturally_express_fallback():
         def __init__(self):
             self.prompts = []
 
-        async def astream(self, messages):
+        async def astream(self, messages, **_kwargs):
             self.prompts = messages
             yield FakeChunk()
 

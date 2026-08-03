@@ -7,10 +7,11 @@ from typing import Any, AsyncIterator, Dict
 from uuid import uuid4
 
 from langchain_core.messages import AIMessage
-from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from app.infrastructure.persistence.memory import get_business_memory, remember_product_cards, remember_user_preferences
 from app.application.assistant.schemas import IntentDecision, OrchestratorDecision
@@ -1112,17 +1113,16 @@ class AssistantGraph:
         state, run_id, trace_id = self._make_initial_state(**kwargs)
         await self._sync_request_profile(state)
         conversation_id = state.get("conversation_id")
-        final = await self.graph.ainvoke(
-            state,
-            config=build_assistant_run_config(
-                conversation_id=conversation_id,
-                user_id=state.get("user_id"),
-                trace_id=trace_id,
-                stream=False,
-                has_image=bool(state.get("image_url")),
-                environment=config.LANGSMITH_ENVIRONMENT,
-            ),
+        run_config = build_assistant_run_config(
+            conversation_id=conversation_id,
+            user_id=state.get("user_id"),
+            trace_id=trace_id,
+            stream=False,
+            has_image=bool(state.get("image_url")),
+            environment=config.LANGSMITH_ENVIRONMENT,
         )
+        await self._refresh_runtime_messages(state, run_config)
+        final = await self.graph.ainvoke(state, config=run_config)
         result = final.get("result") or {}
         result.setdefault("run_id", run_id)
         result.setdefault("trace_id", trace_id)
@@ -1145,14 +1145,27 @@ class AssistantGraph:
         - error        出错
         - done         结束标志（前端可关流）
 
-        用 stream_mode=["updates", "messages"] + subgraphs=True，同时拿到：
+        用户可见文本只从 custom 流发出：领域 Agent 已通过 token_sink
+        发布真实模型增量；DAG 也在同一通道保证任务顺序。不要同时订阅
+        messages 流，否则同一子 Agent 的 chunk 会被转发两次。
+
+        用 stream_mode=["updates", "custom"] + subgraphs=True，同时拿到：
         - updates: 每个节点结束时的 state 增量（用于 route / tool_call / tool_result）
-        - messages: 主图 + 子图 LLM 产生的每个 AIMessageChunk（token 流）
+        - custom: 领域 Agent 主动发布的、唯一的用户可见 token
         - subgraphs: 让子图（ShoppingAgent 内的 create_agent）事件冒泡
         """
         state, run_id, trace_id = self._make_initial_state(**kwargs)
         await self._sync_request_profile(state)
         conversation_id = state.get("conversation_id")
+        run_config = build_assistant_run_config(
+            conversation_id=conversation_id,
+            user_id=state.get("user_id"),
+            trace_id=trace_id,
+            stream=True,
+            has_image=bool(state.get("image_url")),
+            environment=config.LANGSMITH_ENVIRONMENT,
+        )
+        await self._refresh_runtime_messages(state, run_config)
 
         # start 事件：告诉前端 trace_id / run_id
         yield {
@@ -1165,20 +1178,12 @@ class AssistantGraph:
         }
 
         final_result: Dict[str, Any] = {}
-        complex_turn = False
         # LangGraph subgraphs=True 时事件格式为 (namespace_tuple, mode, payload)
         # namespace_tuple: 空 = 主图，(node_name, task_id) = 子图
         async for chunk in self.graph.astream(
             state,
-            config=build_assistant_run_config(
-                conversation_id=conversation_id,
-                user_id=state.get("user_id"),
-                trace_id=trace_id,
-                stream=True,
-                has_image=bool(state.get("image_url")),
-                environment=config.LANGSMITH_ENVIRONMENT,
-            ),
-            stream_mode=["updates", "messages", "custom"],
+            config=run_config,
+            stream_mode=["updates", "custom"],
             subgraphs=True,
         ):
             # 兼容 subgraphs=True/False 两种输出结构
@@ -1190,19 +1195,7 @@ class AssistantGraph:
             else:
                 continue
 
-            if mode == "messages":
-                # payload = (message_chunk, metadata_dict)
-                msg_chunk, meta = payload
-                async for event in self._translate_message_event(msg_chunk, meta, namespace):
-                    if complex_turn and event.get("type") == "token":
-                        # Complex responses become user-visible only when an
-                        # Artifact is complete.  Suppress any nested model
-                        # chunks here as a final guard against duplicated
-                        # partial text from a child Agent implementation.
-                        continue
-                    yield event
-
-            elif mode == "custom":
+            if mode == "custom":
                 # Domain nodes publish genuine model chunks through
                 # langgraph.config.get_stream_writer().
                 if isinstance(payload, dict) and payload.get("type") == "token":
@@ -1225,8 +1218,6 @@ class AssistantGraph:
                 # payload = {node_name: {state_delta_key: value, ...}}
                 for node_name, node_output in (payload or {}).items():
                     async for event in self._translate_update_event(node_name, node_output):
-                        if event.get("type") == "route" and (event.get("data") or {}).get("mode") == "complex":
-                            complex_turn = True
                         yield event
                     # format_response 节点会把整个 result 写到 state["result"]
                     if node_name == "format_response" and isinstance(node_output, dict):
@@ -1240,63 +1231,26 @@ class AssistantGraph:
         # done 事件：前端可关流
         yield {"type": "done", "data": {}}
 
-    async def _translate_message_event(
+    async def _refresh_runtime_messages(
         self,
-        msg_chunk,
-        meta,
-        namespace=(),
-    ) -> AsyncIterator[Dict[str, Any]]:
-        """把 messages 流的 AIMessageChunk 翻译成 token 事件。"""
-        # 只流式 LLM 的增量 chunk（AIMessageChunk）。节点写回 state 的完整 AIMessage 会被
-        # messages 流再整段发一次，与已逐 token 流过的内容重复（答案发两遍），这里跳过。
-        if not isinstance(msg_chunk, AIMessageChunk):
-            return
-        content = getattr(msg_chunk, "content", "")
-        if self._should_suppress_token(meta, namespace, content):
-            return
-        # content 可能是 str，也可能是 list（多模态 / tool_call 结构）
-        if isinstance(content, str) and content:
-            yield {"type": "token", "data": {"content": content}}
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
-                    yield {"type": "token", "data": {"content": part["text"]}}
+        state: AssistantState,
+        run_config: RunnableConfig,
+    ) -> None:
+        """Replace stale Checkpointer messages with chat-service history.
 
-    def _should_suppress_token(self, meta, namespace, content: Any) -> bool:
-        """过滤不应展示给用户的 messages 流片段。"""
-        meta = meta or {}
-        namespace = namespace or ()
-
-        # 内部结构化调用（如槽位抽取 with_structured_output）会打 ai_internal tag。
-        # 不同 LangChain/LangGraph 版本可能把 tags 放在顶层或 metadata/config 下，统一兼容。
-        tags = _collect_tags(meta)
-        if "ai_internal" in tags:
-            return True
-
-        # Tool 节点里的内部 LLM 调用不应进入聊天气泡；否则会把 ShoppingNeed JSON
-        # 之类的中间产物按 token 泄漏给前端。
-        graph_node = str(meta.get("langgraph_node") or "")
-        graph_path = _flatten_namespace(meta.get("langgraph_path") or ())
-        namespace_text = " ".join(_flatten_namespace(namespace))
-        if graph_node in {"tools", "tool"} or "tools" in graph_path or "tools" in namespace_text:
-            return True
-
-        # 主图业务节点返回的 {"messages": [AIMessage(content=完整答案)]} 会被 messages
-        # stream 再发一次；这个片段不是 LLM 增量，而是节点回写的完整答案，必须过滤。
-        main_nodes = {
-            "route_intent",
-            "plan_complex",
-            "shopping",
-            "knowledge",
-            "chitchat",
-            "unknown",
-            "execute_dag",
-            "format_response",
-        }
-        if not namespace and graph_node in main_nodes:
-            return True
-
-        return False
+        The assistant receives the authoritative visible history from
+        chat-service every turn.  Its assistant rows carry database IDs,
+        whereas a prior LangGraph run generated UUIDs.  Letting ``add_messages``
+        merge both versions duplicates the same reply.  Resetting the runtime
+        message channel before each run preserves a single Checkpointer thread
+        for observability while keeping its visible history identical to the
+        database history supplied for the current request.
+        """
+        messages = list(state.get("messages") or [])
+        await self.graph.aupdate_state(
+            run_config,
+            {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *messages]},
+        )
 
     async def _translate_update_event(self, node_name: str, node_output) -> AsyncIterator[Dict[str, Any]]:
         """把 updates 流翻译成 route / tool_call / tool_result 事件。"""
@@ -1648,29 +1602,3 @@ def _history_to_messages(history: list[dict[str, Any]]) -> list:
         elif role == "system":
             messages.append(SystemMessage(content=content, id=message_id))
     return messages
-
-
-def _collect_tags(meta: Dict[str, Any]) -> set[str]:
-    tags: set[str] = set()
-    stack = [meta]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, dict):
-            for key, value in item.items():
-                if key == "tags" and isinstance(value, (list, tuple, set)):
-                    tags.update(str(v) for v in value)
-                elif key in {"metadata", "config"} and isinstance(value, dict):
-                    stack.append(value)
-        elif isinstance(item, (list, tuple, set)):
-            tags.update(str(v) for v in item)
-    return tags
-
-
-def _flatten_namespace(value: Any) -> list[str]:
-    out: list[str] = []
-    if isinstance(value, (list, tuple, set)):
-        for part in value:
-            out.extend(_flatten_namespace(part))
-    elif value is not None:
-        out.append(str(value))
-    return out

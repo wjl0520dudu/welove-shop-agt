@@ -7,8 +7,11 @@ from langgraph.graph import add_messages
 
 
 class AssistantState(TypedDict):
-    """Supervisor 共享状态。messages 通过 add_messages reducer 自动累积，
-    checkpointer 负责跨轮持久化，所有子节点共享同一份对话记忆。
+    """Supervisor 共享状态。
+
+    ``messages`` is the clean visible conversation used during one graph run.
+    chat-service is the cross-turn source of truth and refreshes this field on
+    every request; the checkpointer only persists runtime state for that run.
     """
     # ── 核心累积字段 ──
     messages: Annotated[list[AnyMessage], add_messages]

@@ -137,7 +137,6 @@ public class ChatServiceImpl implements ChatService {
         Map<String, Object>[] cartSelection = new Map[]{null};
         String[] sources = {""};
         Map<String, Object>[] agentMeta = new Map[]{new java.util.LinkedHashMap<>()};
-        boolean[] receivedSubtaskResults = {false};
 
         // ============= SseEmitter 生命周期回调 =============
         // onCompletion: 流正常关闭时调用(包括 emitter.complete() 和客户端正常断开)
@@ -239,7 +238,6 @@ public class ChatServiceImpl implements ChatService {
                             captureOrchestratorMeta(eventType, event, agentMeta[0]);
                             break;
                         case "subtask_result":
-                            receivedSubtaskResults[0] = true;
                             captureSubtaskResult(event, answerBuilder, productCards[0]);
                             break;
                         case "token":
@@ -252,13 +250,10 @@ public class ChatServiceImpl implements ChatService {
                             captureFinalAgentMeta(event, agentMeta[0]);
                             // ai-service 的 final data 即完整 AIResponse，字段在顶层(非嵌套 response)
                             Object finalAnswer = event.get("answer");
-                            String finalTaskType = String.valueOf(event.getOrDefault("task_type", ""));
-                            if (isComplexTask(finalTaskType) && !receivedSubtaskResults[0]
-                                    && finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
-                                // 兼容未升级的上游：没有逐任务事件时，final.answer 仍可作为完整结果。
+                            if (finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
+                                // final.answer is authoritative. Token frames are only for
+                                // progressive rendering and may include intermediate text.
                                 answerBuilder.setLength(0);
-                                answerBuilder.append(finalAnswer);
-                            } else if (answerBuilder.length() == 0 && finalAnswer != null) {
                                 answerBuilder.append(finalAnswer);
                             }
                             if (event.containsKey("task_type")) taskType[0] = String.valueOf(event.get("task_type"));
@@ -306,6 +301,7 @@ public class ChatServiceImpl implements ChatService {
                         if (!agentMeta[0].isEmpty()) aiMsg.setAgentMeta(agentMeta[0]);
                         aiMsg.setCreateTime(LocalDateTime.now());
                         msgMapper.insert(aiMsg);
+                        ctxService.invalidateConversationContext(conversationId);
                         long streamDuration = System.currentTimeMillis() - streamStartMs;
                         saveQaLog(userId, conversationId, content, answer, taskType[0].isEmpty() ? "shopping" : taskType[0], streamDuration);
                         // 发送 done 事件并关闭 (set finalized 已在上面 compareAndSet 完成)
@@ -389,7 +385,6 @@ public class ChatServiceImpl implements ChatService {
         Map<String, Object>[] cartSelection = new Map[]{null};
         String[] sources = {""};
         Map<String, Object>[] agentMeta = new Map[]{new java.util.LinkedHashMap<>()};
-        boolean[] receivedSubtaskResults = {false};
 
         emitter.onCompletion(() -> log.debug("SseEmitter[MM] onCompletion conv={}", conversationId));
         emitter.onTimeout(() -> {
@@ -475,7 +470,6 @@ public class ChatServiceImpl implements ChatService {
                             captureOrchestratorMeta(eventType, event, agentMeta[0]);
                             break;
                         case "subtask_result":
-                            receivedSubtaskResults[0] = true;
                             captureSubtaskResult(event, answerBuilder, productCards[0]);
                             break;
                         case "token":
@@ -487,13 +481,10 @@ public class ChatServiceImpl implements ChatService {
                         case "final":
                             captureFinalAgentMeta(event, agentMeta[0]);
                             Object finalAnswer = event.get("answer");
-                            String finalTaskType = String.valueOf(event.getOrDefault("task_type", ""));
-                            if (isComplexTask(finalTaskType) && !receivedSubtaskResults[0]
-                                    && finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
-                                // 兼容没有逐任务结果的旧上游响应。
+                            if (finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
+                                // Keep persisted history aligned with the final response,
+                                // never with intermediate multimodal/tool chunks.
                                 answerBuilder.setLength(0);
-                                answerBuilder.append(finalAnswer);
-                            } else if (answerBuilder.length() == 0 && finalAnswer != null) {
                                 answerBuilder.append(finalAnswer);
                             }
                             if (event.containsKey("task_type")) taskType[0] = String.valueOf(event.get("task_type"));
@@ -537,6 +528,7 @@ public class ChatServiceImpl implements ChatService {
                         if (!agentMeta[0].isEmpty()) aiMsg.setAgentMeta(agentMeta[0]);
                         aiMsg.setCreateTime(LocalDateTime.now());
                         msgMapper.insert(aiMsg);
+                        ctxService.invalidateConversationContext(conversationId);
                         saveQaLog(userId, conversationId,
                                 safeContent.isEmpty() ? "[图片]" : safeContent,
                                 answer,

@@ -53,18 +53,18 @@ public class ConversationContextServiceImpl implements ConversationContextServic
     }
 
     @Override
-    public void updateConversationContext(Long conversationId, Long userId, Message newMessage) {
-        String key = REDIS_PREFIX + conversationId;
-        redisTemplate.delete(key);
-        // 感知:触发长期记忆保存(简化版,不计算重要性)
-        ConversationContext ctx = new ConversationContext();
-        ctx.setConversationId(conversationId);
+    public void updateConversationContext(Long conversationId, Long userId,          ctx.setConversationId(conversationId);
         ctx.setUserId(userId);
         ctx.setWindowSize(windowSize);
         ctx.setImportanceScore(0.5);
         ctx.setUpdateTime(LocalDateTime.now());
         ctx.setCreateTime(LocalDateTime.now());
-        ctxMapper.insert(ctx);
+        ctxMapper.upsertActivity(ctx);
+    }
+
+    @Override
+    public void invalidateConversationContext(Long conversationId) {
+        redisTemplate.delete(REDIS_PREFIX + conversationId);
     }
 
     @Override

@@ -234,8 +234,8 @@ class ShoppingAgent:
                         if mode == "values" and isinstance(payload, dict):
                             result = payload
                         elif mode == "messages":
-                            message, _metadata = payload
-                            if isinstance(message, AIMessageChunk):
+                            message, metadata = payload
+                            if isinstance(message, AIMessageChunk) and _is_user_visible_stream_chunk(message, metadata):
                                 content = _stream_text_content(message.content)
                                 if content:
                                     _emit_token(token_sink, content)
@@ -634,6 +634,31 @@ def _emit_token(token_sink: TokenSink, content: str) -> None:
     except Exception:  # noqa: BLE001
         # Client disconnection must not invalidate the completed business result.
         logger.debug("shopping token sink unavailable", exc_info=True)
+
+
+def _is_user_visible_stream_chunk(message: AIMessageChunk, metadata: Any) -> bool:
+    """Exclude nested Judge/tool chunks from the public SSE stream."""
+    if "ai_internal" in _stream_tags(metadata):
+        return False
+    if getattr(message, "tool_call_chunks", None) or getattr(message, "tool_calls", None):
+        return False
+    node = str((metadata or {}).get("langgraph_node") or "") if isinstance(metadata, dict) else ""
+    return node not in {"tools", "tool"}
+
+
+def _stream_tags(metadata: Any) -> set[str]:
+    tags: set[str] = set()
+    pending = [metadata]
+    while pending:
+        value = pending.pop()
+        if not isinstance(value, dict):
+            continue
+        for key, item in value.items():
+            if key == "tags" and isinstance(item, (list, tuple, set)):
+                tags.update(str(tag) for tag in item)
+            elif key in {"config", "metadata"} and isinstance(item, dict):
+                pending.append(item)
+    return tags
 
 
 def _extract_tool_calls(
