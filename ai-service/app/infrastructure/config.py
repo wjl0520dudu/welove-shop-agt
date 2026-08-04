@@ -219,6 +219,11 @@ class Config:
     LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY", "")
     LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "welove-shop-ai")
     LANGSMITH_ENVIRONMENT = os.getenv("LANGSMITH_ENVIRONMENT", "development")
+    # P2 的离线 Golden Dataset 名称。它与在线请求 Trace 项目可以相同，
+    # 但数据集本身始终由本地 JSONL 幂等同步，不能在 LangSmith UI 手改。
+    LANGSMITH_EVAL_DATASET = os.getenv(
+        "LANGSMITH_EVAL_DATASET", "welove-shop-agent-golden-v1"
+    )
     # LangSmith receives runnable inputs/outputs by default.  Keep the
     # production-safe default masked; a local developer can explicitly opt in
     # while diagnosing prompts and tool payloads.

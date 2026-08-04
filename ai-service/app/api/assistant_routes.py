@@ -31,6 +31,14 @@ logger = logging.getLogger("ai-service.assistant")
 # 超过 3 秒当作不可达处理，避免拖慢用户请求。
 _IMAGE_HEAD_TIMEOUT = 3.0
 
+_EVALUATION_HEADER_MAP = {
+    "run_id": "X-Evaluation-Run-Id",
+    "case_id": "X-Evaluation-Case-Id",
+    "dataset": "X-Evaluation-Dataset",
+    "variant": "X-Evaluation-Variant",
+    "operation": "X-Evaluation-Operation",
+}
+
 
 class AssistantRunRequest(ChatRequest):
     # 购物车写操作已交给前端，这些字段保留兼容旧调用方，不再被 graph 消费。
@@ -70,6 +78,22 @@ def _parse_user_id(value: Optional[str]) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _evaluation_context(http_request: Request) -> dict[str, str]:
+    """Read evaluator-only trace labels without changing business request data.
+
+    These labels are sent exclusively by ``evals.run_agent_eval``. They have
+    no influence on routing, tools, prompts or response content; they merely
+    make a Golden Case searchable in LangSmith. Bound every value so an
+    arbitrary client cannot attach an unbounded metadata payload.
+    """
+
+    return {
+        key: value[:128]
+        for key, header in _EVALUATION_HEADER_MAP.items()
+        if (value := str(http_request.headers.get(header) or "").strip())
+    }
 
 
 def _raise_multimodal_image_error(trace_id: str, error: MultimodalImageError) -> None:
@@ -117,6 +141,7 @@ async def run_assistant(request: AssistantRunRequest, http_request: Request) -> 
             conversation_summary=request.conversation_summary,
             trace_id=trace_id,
             image_url=image_url,
+            evaluation_context=_evaluation_context(http_request),
         )
     except MultimodalImageError as e:
         _raise_multimodal_image_error(trace_id, e)
@@ -192,6 +217,7 @@ async def stream_assistant(request: AssistantRunRequest, http_request: Request):
                 conversation_summary=request.conversation_summary,
                 trace_id=trace_id,
                 image_url=image_url,
+                evaluation_context=_evaluation_context(http_request),
             ):
                 # 客户端断开后提前停 LLM,避免空跑 token
                 if await http_request.is_disconnected():
@@ -380,6 +406,7 @@ async def run_multimodal_assistant(
             preference_tags=request.preference_tags,
             trace_id=trace_id,
             image_url=image_url,
+            evaluation_context=_evaluation_context(http_request),
             conversation_history=request.conversation_history,
             conversation_summary=request.conversation_summary,
         )
@@ -455,6 +482,7 @@ async def stream_multimodal_assistant(
                 preference_tags=request.preference_tags,
                 trace_id=trace_id,
                 image_url=image_url,
+                evaluation_context=_evaluation_context(http_request),
                 conversation_history=request.conversation_history,
                 conversation_summary=request.conversation_summary,
             ):

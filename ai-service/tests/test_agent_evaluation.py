@@ -52,6 +52,24 @@ def test_contract_accepts_legacy_product_search_capability_alias():
     assert result["passed"] is True
 
 
+def test_contract_accepts_current_skill_tools_for_legacy_capability_expectations():
+    result = validate_agent_contract(
+        _case(routes=["orchestrator"], task_types=["orchestrator"], required_tools=["recommend_products"]),
+        {
+            "response": {
+                "route": "complex",
+                "task_type": "complex",
+                "answer": "已完成推荐",
+                "tool_calls": [
+                    {"tool_name": "search_product_candidates", "input_params": {}},
+                    {"tool_name": "finalize_product_recommendation", "input_params": {}},
+                ],
+            },
+        },
+    )
+    assert result["passed"] is True
+
+
 def test_metrics_treat_judge_as_task_success_gate_and_compare_baseline():
     rows = [
         {"id": "a", "scenario": "shopping", "latency_ms": 100, "ttft_ms": 20,

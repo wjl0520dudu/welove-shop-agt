@@ -12,7 +12,17 @@ from fnmatch import fnmatchcase
 from typing import Any
 
 
-_TOOL_ALIASES = {"search_products": {"recommend_products"}}
+_TOOL_ALIASES = {
+    # Golden Dataset 用面向能力的高层名字；当前 Skills runtime 会把推荐
+    # 展开成候选召回 + 最终整理两个真实工具。两者都属于 recommend 能力。
+    "recommend_products": {"search_product_candidates", "finalize_product_recommendation"},
+    "search_products": {"recommend_products", "search_product_candidates", "finalize_product_recommendation"},
+    "search_multimodal_v1": {"search_product_candidates"},
+}
+_ROUTE_ALIASES = {
+    "orchestrator": {"complex"},
+    "complex": {"orchestrator"},
+}
 
 
 def validate_agent_contract(case: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
@@ -33,12 +43,20 @@ def validate_agent_contract(case: dict[str, Any], observation: dict[str, Any]) -
     expected_routes = _as_strings(expected.get("routes") or expected.get("route"))
     actual_route = str(response.get("route") or response.get("task_type") or "unknown")
     if expected_routes:
-        check("route", actual_route in expected_routes, f"expected={expected_routes}, actual={actual_route}")
+        check(
+            "route",
+            any(actual_route == expected or actual_route in _ROUTE_ALIASES.get(expected, set()) for expected in expected_routes),
+            f"expected={expected_routes}, actual={actual_route}",
+        )
 
     expected_types = _as_strings(expected.get("task_types") or expected.get("task_type"))
     actual_type = str(response.get("task_type") or "unknown")
     if expected_types:
-        check("task_type", actual_type in expected_types, f"expected={expected_types}, actual={actual_type}")
+        check(
+            "task_type",
+            any(actual_type == expected or actual_type in _ROUTE_ALIASES.get(expected, set()) for expected in expected_types),
+            f"expected={expected_types}, actual={actual_type}",
+        )
 
     expected_error_codes = _as_strings(expected.get("error_codes"))
     if expected_error_codes:

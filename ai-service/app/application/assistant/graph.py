@@ -1125,6 +1125,7 @@ class AssistantGraph:
             stream=False,
             has_image=bool(state.get("image_url")),
             environment=config.LANGSMITH_ENVIRONMENT,
+            evaluation_context=kwargs.get("evaluation_context"),
         )
         await self._refresh_runtime_messages(state, run_config)
         final = await self.graph.ainvoke(state, config=run_config)
@@ -1169,6 +1170,7 @@ class AssistantGraph:
             stream=True,
             has_image=bool(state.get("image_url")),
             environment=config.LANGSMITH_ENVIRONMENT,
+            evaluation_context=kwargs.get("evaluation_context"),
         )
         await self._refresh_runtime_messages(state, run_config)
 

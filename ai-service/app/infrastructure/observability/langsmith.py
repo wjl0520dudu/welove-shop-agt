@@ -25,6 +25,7 @@ def build_assistant_run_config(
     stream: bool,
     has_image: bool,
     environment: str | None = None,
+    evaluation_context: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the root config for exactly one assistant request.
 
@@ -43,6 +44,13 @@ def build_assistant_run_config(
     ]
     if str(environment or "").strip():
         tags.append(f"env:{str(environment).strip()}")
+    evaluation_metadata = {
+        f"evaluation_{key}": str(value).strip()
+        for key, value in dict(evaluation_context or {}).items()
+        if str(key).strip() and str(value).strip()
+    }
+    if evaluation_metadata:
+        tags.append("evaluation:golden-dataset")
     metadata = {
         "request_ref": _fingerprint(trace_id),
         "conversation_ref": _fingerprint(conversation_id),
@@ -50,6 +58,7 @@ def build_assistant_run_config(
         "stream": stream,
         "has_image": has_image,
         "environment": str(environment).strip() if environment else None,
+        **evaluation_metadata,
     }
     return {
         "run_name": "assistant.request",

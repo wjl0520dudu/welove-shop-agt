@@ -1,0 +1,1 @@
+{"id":"shop-001","latency_ms":120,"ttft_ms":30,"sse_events":["start","route","final","done"],"response":{"route":"shopping","task_type":"shopping","answer":"推荐一款清爽控油的防晒霜。","tool_calls":[{"tool_name":"recommend_products","input_params":{"query":"适合油皮的防晒霜"}}],"product_cards":[{"product_id":10,"title":"清爽防晒霜","sub_category":"防晒"}]}}

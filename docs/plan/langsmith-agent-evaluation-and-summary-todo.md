@@ -18,9 +18,11 @@
 
 ## P2：LangSmith Dataset 与实验运行
 
-- [ ] 编写 JSONL → LangSmith Dataset 同步命令，支持 dry-run、数据集版本/指纹和幂等更新。
-- [ ] 为每次评测运行写入实验元数据：Git commit、Shopping/Knowledge runtime、滚动摘要开关、模型、Prompt 指纹和检索配置。
-- [ ] 将本地评测的每条 Case 关联到 LangSmith trace，方便从报告跳转至具体 Route、Skill、Tool 和耗时。
+- [x] 编写 JSONL → LangSmith Dataset 同步命令，支持 dry-run、数据集版本/指纹和稳定 Example ID 幂等更新。
+- [x] 为每次评测运行写入实验元数据：Git commit、Shopping/Knowledge runtime、滚动摘要开关、模型、Prompt 指纹和检索配置。
+- [x] 将本地评测的每条 Case 关联到 LangSmith trace；根 Trace 与子节点可按 evaluation_run_id、case_id、variant 过滤。
+- [x] 新增 P2 操作指南，覆盖 Dataset 首次同步、小型实验运行和 Trace 查询。
+- [x] 启动 ai-service 后运行 HTTP Case，确认远端 Trace 可按 `evaluation_run_id` 与 `evaluation_case_id` 查询；Knowledge Case 的业务失败仅因本次 Milvus 未连接。
 
 ## P3：评测器与指标
 
