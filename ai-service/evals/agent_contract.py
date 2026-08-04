@@ -129,9 +129,13 @@ def validate_agent_contract(case: dict[str, Any], observation: dict[str, Any]) -
         check("latency", actual_latency is not None and float(actual_latency) <= float(max_latency_ms),
               f"limit={max_latency_ms}, actual={actual_latency}")
 
-    if expected.get("require_sse"):
-        events = {str(event).lower() for event in observation.get("sse_events") or []}
-        check("sse_final_done", {"final", "done"}.issubset(events), f"events={sorted(events)}")
+    # ``require_sse`` is a Golden Case contract. ``sse_checked`` is set by the
+    # offline evaluator's --include-stream sampling mode. Both use the same
+    # strict sequence validation, so the Experiment and local report cannot
+    # disagree about a streaming regression.
+    if expected.get("require_sse") or observation.get("sse_checked"):
+        events = [str(event).lower() for event in observation.get("sse_events") or []]
+        check("sse_final_done", _valid_sse_sequence(events), f"events={events}")
 
     failures = [item for item in checks if not item["passed"]]
     return {
@@ -202,3 +206,22 @@ def _as_strings(value: Any) -> list[str]:
 
 def _tool_matches(expected_pattern: str, actual_name: str) -> bool:
     return fnmatchcase(actual_name, expected_pattern) or actual_name in _TOOL_ALIASES.get(expected_pattern, set())
+
+
+def _valid_sse_sequence(events: list[str]) -> bool:
+    """Validate the visible terminal SSE lifecycle without internal events.
+
+    The assistant can emit route/tool/subtask events between these markers.
+    A successful visible answer must start, produce at least one token, then
+    finish and terminate in that order. Error-only streams are intentionally
+    not considered successful SSE output.
+    """
+
+    try:
+        start = events.index("start")
+        token = events.index("token")
+        final = events.index("final")
+        done = events.index("done")
+    except ValueError:
+        return False
+    return start < token < final < done

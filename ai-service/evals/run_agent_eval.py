@@ -510,6 +510,7 @@ def evaluate(
             "latency_ms": observation.get("latency_ms"),
             "ttft_ms": observation.get("ttft_ms"),
             "sse_events": observation.get("sse_events") or [],
+            "token_usage": observation.get("token_usage") or {"available": False},
             "langsmith_trace": observation.get("langsmith_trace"),
             "langsmith_stream_trace": observation.get("langsmith_stream_trace"),
             "response": response,
@@ -581,6 +582,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     metrics = report["metrics"]
     latency = metrics["latency_ms"]
     ttft = metrics["ttft_ms"]
+    tokens = metrics.get("token_usage") or {}
     judge = report.get("judge_summary") or {}
     ragas = report.get("ragas_summary") or {}
     retrieval = report.get("retrieval_summary") or {}
@@ -598,6 +600,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"| P50 Latency | {latency['p50'] if latency['p50'] is not None else '-'} ms |",
         f"| P95 Latency | {latency['p95'] if latency['p95'] is not None else '-'} ms |",
         f"| P95 TTFT | {ttft['p95'] if ttft['p95'] is not None else '-'} ms |",
+        f"| Token 样本数 | {tokens.get('sample_count', 0)} |",
+        f"| Total Token | {tokens.get('total', 0) if tokens.get('sample_count', 0) else '-'} |",
+        f"| P50 Total Token / 请求 | {tokens.get('total_p50') if tokens.get('total_p50') is not None else '-'} |",
         f"| DeepEval Pass Rate | {_display_percent(judge.get('pass_rate'))} |",
         f"| DeepEval Avg Score | {_display_num(judge.get('average_score'))} |",
         f"| RAGAS Evaluated Cases | {ragas.get('evaluated_case_count', 0)} |",

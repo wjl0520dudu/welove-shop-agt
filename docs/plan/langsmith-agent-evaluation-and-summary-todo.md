@@ -26,10 +26,11 @@
 
 ## P3：评测器与指标
 
-- [ ] 程序化断言：路由准确率、工具选择、复杂任务覆盖、商品卡相关/无关率、约束满足和 SSE 完整性。
-- [ ] 低频 LLM-as-a-Judge：指代正确率、商品相关率、知识正确性；仅消费最终可见答案。
-- [ ] 从本地记录与 LangSmith Trace 汇总 TTFT、P50/P95、Token、失败归因。
-- [ ] 输出版本可比较的 JSON/Markdown 报告与失败样本列表。
+- [x] 程序化断言：路由准确率、工具选择、复杂任务覆盖、商品卡相关/无关率和 SSE 完整性，复用 Golden Contract 并作为 LangSmith Feedback 写回。
+- [x] 低频 LLM-as-a-Judge：通过 `--deepeval` 显式启用；默认不调用，且不进入线上主链。
+- [x] 从本地实测与 LangSmith Experiment Feedback 汇总 TTFT、P50/P95、真实 LLM Leaf Token 与失败归因；`--include-stream` 验证 `start → token → final → done`。
+- [x] 输出版本可比较的 JSON/Markdown 报告与失败样本列表，`--baseline` 生成版本增量。
+- [x] 真实环境完成流式/Token 冒烟与 142 条全量 Experiment 基线。
 
 ## P4：对比实验与报告
 

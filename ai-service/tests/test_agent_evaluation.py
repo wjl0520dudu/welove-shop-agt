@@ -21,7 +21,7 @@ def test_contract_accepts_complete_multi_agent_result():
     )
     observation = {
         "latency_ms": 800,
-        "sse_events": ["start", "final", "done"],
+        "sse_events": ["start", "token", "final", "done"],
         "response": {
             "route": "complex", "task_type": "complex", "answer": "已完成推荐和说明。",
             "product_cards": [{"product_id": 1, "title": "清爽防晒", "sub_category": "防晒"}],
@@ -42,6 +42,14 @@ def test_contract_reports_route_and_sse_failures():
     )
     assert result["passed"] is False
     assert {"route", "product_cards", "sse_final_done"}.issubset(result["failure_reasons"])
+
+
+def test_stream_sampling_requires_visible_token_in_order():
+    case = _case(routes=["shopping"])
+    base = {"response": {"route": "shopping", "answer": "ok"}, "sse_checked": True}
+    assert validate_agent_contract(case, {**base, "sse_events": ["start", "token", "final", "done"]})["passed"] is True
+    sampled = validate_agent_contract(case, {**base, "sse_events": ["start", "final", "done"]})
+    assert "sse_final_done" in sampled["failure_reasons"]
 
 
 def test_contract_accepts_legacy_product_search_capability_alias():

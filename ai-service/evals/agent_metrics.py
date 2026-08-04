@@ -28,6 +28,7 @@ def calculate_agent_metrics(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
 
     latencies = _numbers(row.get("latency_ms") for row in items)
     ttfts = _numbers(row.get("ttft_ms") for row in items)
+    token_rows = [row.get("token_usage") or {} for row in items if (row.get("token_usage") or {}).get("available")]
     return {
         "case_count": total,
         "contract_pass_rate": _ratio(contract_passed, total),
@@ -35,6 +36,7 @@ def calculate_agent_metrics(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "pass@1": _ratio(task_passed, total),
         "latency_ms": _latency_summary(latencies),
         "ttft_ms": _latency_summary(ttfts),
+        "token_usage": _token_summary(token_rows),
         "scenario_breakdown": {
             name: {
                 "case_count": len(group),
@@ -101,6 +103,7 @@ def _empty_metrics() -> dict[str, Any]:
         "pass@1": 0.0,
         "latency_ms": _latency_summary([]),
         "ttft_ms": _latency_summary([]),
+        "token_usage": _token_summary([]),
         "scenario_breakdown": {},
         "failure_reason_counts": {},
     }
@@ -150,3 +153,25 @@ def _optional_delta(current: Any, baseline: Any) -> float | None:
         return round(float(current) - float(baseline), 4)
     except (TypeError, ValueError):
         return None
+
+
+def _token_summary(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    """Aggregate only token usage read from real LangSmith LLM leaf runs."""
+
+    values: dict[str, list[float]] = {"input_tokens": [], "output_tokens": [], "total_tokens": []}
+    for row in rows:
+        for key in values:
+            try:
+                values[key].append(float(row.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+    total_values = values["total_tokens"]
+    return {
+        "sample_count": len(rows),
+        "input_total": int(sum(values["input_tokens"])),
+        "output_total": int(sum(values["output_tokens"])),
+        "total": int(sum(total_values)),
+        "total_p50": _percentile(total_values, 0.50) if total_values else None,
+        "total_p95": _percentile(total_values, 0.95) if total_values else None,
+        "total_mean": round(sum(total_values) / len(total_values), 2) if total_values else None,
+    }
