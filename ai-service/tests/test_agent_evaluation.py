@@ -1,4 +1,8 @@
+import json
+from pathlib import Path
+
 from evals.agent_contract import validate_agent_contract
+from evals.dataset_contract import GOLDEN_CASE_COUNT, SCENARIO_COUNTS, validate_golden_dataset
 from evals.agent_metrics import calculate_agent_metrics, compare_reports
 from evals.run_agent_eval import DEFAULT_DATASET, evaluate, load_jsonl
 from evals.retrieval_metrics import retrieval_metrics_at_k
@@ -66,10 +70,16 @@ def test_metrics_treat_judge_as_task_success_gate_and_compare_baseline():
 
 def test_golden_dataset_is_stratified_and_evaluate_is_dependency_free():
     cases = load_jsonl(DEFAULT_DATASET)
-    # V2 数据集共 142 条 case，覆盖 5 大场景
-    assert len(cases) >= 130, f"Golden dataset shrunk unexpectedly: {len(cases)} cases"
+    assert len(cases) == GOLDEN_CASE_COUNT
+    assert validate_golden_dataset(cases) == []
     scenarios = {case["scenario"] for case in cases}
     assert {"shopping", "knowledge", "multimodal_shopping", "multi_agent", "chitchat"}.issubset(scenarios)
+    assert {scenario: sum(case["scenario"] == scenario for case in cases) for scenario in scenarios} == SCENARIO_COUNTS
+
+    manifest_path = Path(DEFAULT_DATASET).with_name("agent_golden_cases.manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["case_count"] == GOLDEN_CASE_COUNT
+    assert manifest["scenarios"] == SCENARIO_COUNTS
 
     case = _case(routes=["shopping"], task_types=["shopping"])
     report = evaluate([case], {"case-1": {"id": "case-1", "latency_ms": 12, "response": {"route": "shopping", "task_type": "shopping", "answer": "可以"}}})

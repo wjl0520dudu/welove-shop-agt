@@ -1,0 +1,19 @@
+{
+  "name": "welove-shop-agent-golden",
+  "version": "v1",
+  "format": "jsonl",
+  "case_count": 142,
+  "scenarios": {
+    "shopping": 46,
+    "knowledge": 32,
+    "chitchat": 32,
+    "multimodal_shopping": 20,
+    "multi_agent": 12
+  },
+  "purpose": "Current agent architecture's deterministic regression baseline and LangSmith Dataset source.",
+  "notes": [
+    "Use `setup` turns with one generated conversation_id for multi-turn cases.",
+    "Use only the visible final response for answer-quality judging; do not judge internal tool or Candidate Judge chunks.",
+    "Real image URLs are intentionally kept in request.image_url and must be HEAD-accessible before an online run."
+  ]
+}

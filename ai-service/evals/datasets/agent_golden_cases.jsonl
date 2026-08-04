@@ -1,4 +1,4 @@
-# V2 Golden Dataset — 130 case，覆盖 shopping/knowledge/chitchat/dag/multimodal/adversarial
+# Agent Golden Dataset v1 — 142 条 Case，覆盖 shopping/knowledge/chitchat/dag/multimodal/adversarial
 # 每条 case 尽可能标注 retrieval_grades（用于计算 Recall@5 / MRR@5 / NDCG@5）
 {"id": "shop-001", "scenario": "shopping", "tags": ["single_turn", "recommend", "beauty", "sunscreen"], "input": "推荐几款适合油皮的防晒霜", "expected": {"routes": ["shopping"], "task_types": ["shopping"], "required_tools": ["recommend_products"], "require_product_cards": true, "product_categories": ["防晒"], "retrieval_grades": {"10": 2, "23": 2, "6": 1}, "reference_answer": "推荐清爽控油、易敏肌可用的防晒。", "max_latency_ms": 15000}}
 {"id": "shop-002", "scenario": "shopping", "tags": ["single_turn", "recommend", "beauty", "sunscreen", "budget"], "input": "预算200元以内的防晒霜推荐一款", "expected": {"routes": ["shopping"], "task_types": ["shopping"], "required_tools": ["recommend_products"], "require_product_cards": true, "product_categories": ["防晒"], "retrieval_grades": {"6": 2}, "reference_answer": "推荐 200 元以内的防晒商品并说明选择依据。", "max_latency_ms": 15000}}
