@@ -156,16 +156,16 @@ def test_router_routes_empty_text_image_as_a_new_shopping_search():
     asyncio.run(run())
 
 
-def test_router_routes_image_led_vague_text_as_pure_image_search():
-    """Image semantics come from the Router LLM, not a wording keyword list."""
+def test_router_keeps_image_led_vague_text_in_multimodal_shopping():
+    """Non-empty image text is no longer coerced by Router into pure-image mode."""
     async def run():
         router = FakeStructuredRouter(IntentDecision(
             mode="simple",
             task_type="shopping",
             confidence=0.96,
             reason="用户要求根据当前图片查找商品",
-            canonical_question="根据当前图片查找相似商品",
-            image_query_mode="image_only",
+            canonical_question="给我找当前图片中的这个商品",
+            image_query_mode="multimodal",
         ))
         graph = _graph_with_router(router)
         result = await graph._route({
@@ -176,9 +176,79 @@ def test_router_routes_image_led_vague_text_as_pure_image_search():
         })
 
         assert result["route"] == "shopping"
-        assert result["question"] == "根据当前图片查找相似商品"
-        assert result["input_mode"] == "image"
+        assert result["question"] == "给我找当前图片中的这个商品"
+        assert result["input_mode"] == "multimodal"
         assert result["route_source"] == "llm"
+
+    asyncio.run(run())
+
+
+def test_router_marks_attached_but_unused_image_as_text_shopping_input():
+    async def run():
+        router = FakeStructuredRouter(IntentDecision(
+            mode="simple",
+            task_type="shopping",
+            confidence=0.94,
+            reason="文字商品需求明确，图片不参与本轮",
+            canonical_question="推荐通勤耳机",
+            image_query_mode="unused",
+        ))
+        graph = _graph_with_router(router)
+        result = await graph._route({
+            "question": "推荐通勤耳机",
+            "image_url": "https://img.example.test/unrelated-shoe.jpg",
+            "messages": [],
+            "business_memory": {},
+        })
+
+        assert result["route"] == "shopping"
+        assert result["input_mode"] == "text"
+
+    asyncio.run(run())
+
+
+def test_router_reuses_pending_conflict_image_only_when_llm_explicitly_selects_it():
+    async def run():
+        pending = {
+            "image_url": "https://img.example.test/running-shoes.jpg",
+            "image_subject": "跑鞋",
+            "text_target": "降噪耳机",
+        }
+        image_router = FakeStructuredRouter(IntentDecision(
+            mode="simple",
+            task_type="shopping",
+            confidence=0.98,
+            reason="用户明确选择按图片继续",
+            canonical_question="根据上一轮图片查找相似跑鞋",
+            image_query_mode="multimodal",
+            use_pending_image=True,
+        ))
+        image_result = await _graph_with_router(image_router)._route({
+            "question": "按图片找",
+            "messages": [],
+            "business_memory": {"pending_multimodal_choice": pending},
+        })
+        assert image_result["route"] == "shopping"
+        assert image_result["input_mode"] == "multimodal"
+        assert image_result["image_url"] == pending["image_url"]
+
+        text_router = FakeStructuredRouter(IntentDecision(
+            mode="simple",
+            task_type="shopping",
+            confidence=0.98,
+            reason="用户明确选择按文字继续",
+            canonical_question="推荐降噪耳机",
+            image_query_mode="unused",
+            use_pending_image=False,
+        ))
+        text_result = await _graph_with_router(text_router)._route({
+            "question": "按文字找",
+            "messages": [],
+            "business_memory": {"pending_multimodal_choice": pending},
+        })
+        assert text_result["route"] == "shopping"
+        assert text_result["input_mode"] == "text"
+        assert "image_url" not in text_result
 
     asyncio.run(run())
 

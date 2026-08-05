@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 # 主图只产 shopping|knowledge|chitchat|unknown；cart 仅为兼容旧购物车库保留。
 TaskType = Literal["shopping", "knowledge", "chitchat", "unknown", "cart"]
 RouteMode = Literal["simple", "complex"]
-ImageQueryMode = Literal["unused", "image_only", "multimodal"]
+ImageQueryMode = Literal["unused", "multimodal"]
 OrchestratorIntentHint = Literal["shopping", "knowledge", "chitchat", "unknown"]
 
 
@@ -59,9 +59,15 @@ class IntentDecision(BaseModel):
     image_query_mode: ImageQueryMode = Field(
         "unused",
         description=(
-            "仅当前轮带参考图片时使用：image_only=用户文字没有额外的商品条件，"
-            "应以图搜相似商品；multimodal=文字包含需要与图片共同满足的商品条件；"
-            "unused=图片与当前任务无关或本轮没有图片。"
+            "仅当前轮带参考图片时使用：multimodal=图片需要与用户文字共同参与商品发现；"
+            "unused=图片与当前任务无关或本轮没有图片。仅上传图片的纯图检索由主图输入模式直接处理。"
+        ),
+    )
+    use_pending_image: bool = Field(
+        False,
+        description=(
+            "仅当前轮没有新图片、但会话存在图文冲突待确认图片时使用。"
+            "用户明确确认“按图片/按图中这个找”才为 true；按文字找、新话题或无法确定时为 false。"
         ),
     )
 

@@ -279,13 +279,21 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         # different *retrieval* mode internally.
         active_task = state.get("active_subtask") or {}
         image_allowed = not active_task or bool(active_task.get("use_image"))
-        image_url = (state.get("image_url") or "").strip() if image_allowed else ""
+        router_image_mode = str(state.get("input_mode") or "text").strip().lower()
+        # Router/Planner owns image scope. An attached image that Router marks
+        # unused must never quietly become ShoppingAgent multimodal input.
+        image_in_scope = router_image_mode in {"image", "multimodal"}
+        image_url = (
+            (state.get("image_url") or "").strip()
+            if image_allowed and image_in_scope
+            else ""
+        )
         question = str(state.get("question") or "").strip()
         if image_url and not question:
             question = "根据当前图片查找相似商品"
-        input_mode = "text"
-        if image_url:
-            input_mode = "image" if state.get("input_mode") == "image" else "multimodal"
+        input_mode = "image" if image_url and router_image_mode == "image" else "text"
+        if image_url and router_image_mode == "multimodal":
+            input_mode = "multimodal"
         # Simple turns stream through the graph sink.  Complex turns receive a
         # task-scoped sink from the DAG executor so concurrent Agents cannot
         # interleave their tokens in the user-visible answer.

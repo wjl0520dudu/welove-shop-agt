@@ -23,12 +23,13 @@ from app.domain.shopping.schemas import RecommendToolResult
 
 
 class TestToolCatalog:
-    def test_phase_s5_exposes_four_composable_tools(self):
-        assert len(SHOPPING_HIGH_LEVEL_TOOLS) == 4
+    def test_phase_s5_exposes_five_composable_tools(self):
+        assert len(SHOPPING_HIGH_LEVEL_TOOLS) == 5
 
     def test_tool_names(self):
         names = {t.name for t in SHOPPING_HIGH_LEVEL_TOOLS}
         assert names == {
+            "check_multimodal_consistency",
             "search_product_candidates",
             "finalize_product_recommendation",
             "load_bound_product_facts",

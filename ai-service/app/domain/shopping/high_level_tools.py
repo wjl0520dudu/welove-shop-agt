@@ -28,6 +28,10 @@ from app.domain.shopping.capabilities import (
     UserShoppingContextCapability,
 )
 from app.domain.shopping.context import build_shopping_context_from_runtime
+from app.domain.shopping.multimodal_consistency import (
+    assess_multimodal_consistency,
+    build_multimodal_conflict_question,
+)
 
 logger = logging.getLogger("ai-service.shopping.high_level_tools")
 
@@ -59,6 +63,94 @@ def _candidate_registry() -> dict[str, dict[str, Any]]:
     return registry
 
 
+_MULTIMODAL_CONSISTENCY_SESSION_KEY = "__multimodal_consistency__"
+
+
+def remember_multimodal_consistency(assessment: dict[str, Any]) -> None:
+    """Keep one preflight result in the request-local candidate session.
+
+    The preflight may be initiated by the explicit Tool or by the execution
+    middleware that protects a multimodal discovery call.  Both paths must
+    feed the exact same request-local decision into candidate retrieval so an
+    ``uncertain`` result can consistently choose text-first retrieval when a
+    concrete text target exists.
+    """
+    _candidate_registry()[_MULTIMODAL_CONSISTENCY_SESSION_KEY] = dict(assessment or {})
+
+
+def _apply_multimodal_consistency_strategy(context):
+    """Use text-first retrieval only when visual inspection is genuinely uncertain.
+
+    A concrete textual target remains usable even if the image is blurred or
+    multi-subject.  Conversely, vague text such as “找这个” keeps the image in
+    the existing multimodal retrieval, because dropping it would create an
+    empty text query.  The decision is request-local, never persisted.
+    """
+    assessment = _candidate_registry().get(_MULTIMODAL_CONSISTENCY_SESSION_KEY) or {}
+    if (
+        context.input_mode == "multimodal"
+        and assessment.get("decision") == "uncertain"
+        and str(assessment.get("text_target") or "").strip()
+    ):
+        return context.model_copy(update={"image_url": None, "input_mode": "text"}), "text_first"
+    return context, "multimodal"
+
+
+# ---- 图文一致性预检 ------------------------------------------------------
+
+@tool(parse_docstring=True)
+async def check_multimodal_consistency(
+    runtime: ToolRuntime,
+    query: str,
+) -> dict:
+    """检查图文商品目标是否明显冲突，不执行商品检索或推荐。
+
+    仅用于 ``multimodal-consistency`` Skill，且仅在当前运行时同时提供图片和
+    图文模式时调用。结果为 conflict 时必须直接使用 clarify_question 澄清，
+    不得继续调用商品候选召回；consistent 或 uncertain 时继续已读取的发现
+    商品流程。
+
+    Args:
+        query: Router 已消解的当前商品需求，保留完整文字条件。
+
+    Returns:
+        action=clarify 表示图文目标明显冲突并包含 clarify_question；
+        action=consistency 表示可继续，包含 decision 与安全的观测字段。
+    """
+    context = await build_shopping_context_from_runtime(runtime)
+    if context.input_mode != "multimodal" or not context.image_url:
+        return {
+            "action": "consistency",
+            "decision": "uncertain",
+            "reason": "当前不是图文商品发现，不需要执行视觉一致性检查。",
+            "checked": False,
+            "fallback_used": False,
+            "duration_ms": 0,
+        }
+
+    result = await assess_multimodal_consistency(
+        query=query,
+        image_url=context.image_url,
+        run_config=getattr(runtime, "config", None),
+    )
+    payload = result.model_dump()
+    payload["checked"] = True
+    # Share only this request's small decision with the following discovery
+    # Tool.  It is not conversation memory and never reaches another request.
+    remember_multimodal_consistency(payload)
+    if result.decision == "conflict":
+        payload.update({
+            "action": "clarify",
+            "multimodal_consistency": "conflict",
+            "clarify_question": build_multimodal_conflict_question(result),
+            "product_cards": [],
+            "ranked_products": [],
+        })
+    else:
+        payload["action"] = "consistency"
+    return payload
+
+
 # ---- Tool 1: recommend_products -----------------------------------------
 
 @tool(parse_docstring=True)
@@ -81,6 +173,7 @@ async def recommend_products(
         returned_count、clarify_question 和 empty_reason 的结构化结果。
     """
     context = await build_shopping_context_from_runtime(runtime)
+    context, retrieval_strategy = _apply_multimodal_consistency_strategy(context)
     result = await RecommendCapability().run(query=query, context=context, limit=limit)
     # CandidateSet and trace are internal observability artifacts. Exposing
     # rejected candidates to the final Agent lets it mention products that the
@@ -97,6 +190,7 @@ async def recommend_products(
     })
     payload["requested_limit"] = max(1, int(limit or 3))
     payload["returned_count"] = len(payload.get("product_cards") or [])
+    payload["multimodal_retrieval_strategy"] = retrieval_strategy
     return payload
 
 
@@ -122,6 +216,7 @@ async def search_product_candidates(
         action=clarify/empty 时返回对应原因并终止推荐流程。
     """
     context = await build_shopping_context_from_runtime(runtime)
+    context, retrieval_strategy = _apply_multimodal_consistency_strategy(context)
     requested_limit = max(1, int(limit or 3))
     result = await RecommendCapability().search_candidates(
         query=query,
@@ -135,6 +230,7 @@ async def search_product_candidates(
         "empty_reason",
     })
     payload["requested_limit"] = requested_limit
+    payload["multimodal_retrieval_strategy"] = retrieval_strategy
     candidate_set = result.candidate_set
     payload["candidate_count"] = len(candidate_set.candidates) if candidate_set else 0
     if result.action == "candidates" and candidate_set is not None:
@@ -324,6 +420,7 @@ async def get_user_shopping_context(
 
 # 关闭 DeepAgent 时的人工回滚链继续使用原有一体化推荐 Tool。
 SHOPPING_ROLLBACK_TOOLS: list = [
+    check_multimodal_consistency,
     recommend_products,
     compare_products,
     answer_product_detail,
@@ -332,6 +429,7 @@ SHOPPING_ROLLBACK_TOOLS: list = [
 
 # Phase S4 主链：Skill 显式编排候选召回和结果终结。
 SHOPPING_HIGH_LEVEL_TOOLS: list = [
+    check_multimodal_consistency,
     search_product_candidates,
     finalize_product_recommendation,
     load_bound_product_facts,

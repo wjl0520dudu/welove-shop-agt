@@ -1,7 +1,8 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from app.application.assistant import AssistantGraph
 from app.application.assistant.graph import _build_task_business_memory
@@ -304,6 +305,59 @@ def test_complex_stream_emits_completed_subtasks_before_final():
             if event["type"] == "token"
         )
         assert visible_text == final["answer"]
+
+    asyncio.run(run())
+
+
+def test_direct_request_recovers_visible_checkpointer_history_when_history_omitted():
+    async def run():
+        graph = AssistantGraph(llm=None)
+
+        class FakeCompiledGraph:
+            async def aget_state(self, _config):
+                return SimpleNamespace(values={"messages": [
+                    HumanMessage(content="first question", id="u1"),
+                    AIMessage(content="first answer", id="a1"),
+                ]})
+
+        graph.graph = FakeCompiledGraph()
+        state, _, _ = graph._make_initial_state(
+            question="what did I ask?",
+            conversation_id="direct-context-fallback",
+            conversation_history_supplied=False,
+        )
+        await graph._recover_direct_request_history(
+            state,
+            {"configurable": {"thread_id": "direct-context-fallback"}},
+        )
+
+        assert [item["content"] for item in state["conversation_history"]] == [
+            "first question", "first answer", "what did I ask?",
+        ]
+
+    asyncio.run(run())
+
+
+def test_explicit_history_does_not_read_checkpointer_fallback():
+    async def run():
+        graph = AssistantGraph(llm=None)
+
+        class FakeCompiledGraph:
+            async def aget_state(self, _config):
+                raise AssertionError("explicit history must not read Checkpointer")
+
+        graph.graph = FakeCompiledGraph()
+        state, _, _ = graph._make_initial_state(
+            question="new question",
+            conversation_id="authoritative-history",
+            conversation_history=[{"role": "user", "content": "history from chat service"}],
+            conversation_history_supplied=True,
+        )
+        await graph._recover_direct_request_history(
+            state,
+            {"configurable": {"thread_id": "authoritative-history"}},
+        )
+        assert state["conversation_history"][0]["content"] == "history from chat service"
 
     asyncio.run(run())
 

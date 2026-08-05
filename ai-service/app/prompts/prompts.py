@@ -22,9 +22,13 @@ ROUTER_PROMPT = """你是电商导购助手唯一的会话理解与意图路由�
    - 对同一句中同时存在“推荐商品”和“解释知识”的两个独立目标，保持 `mode=complex`，不要强行归入任一 simple 路由。
 
 4. **图片检索语义**：本轮存在参考图片时，必须填写 `image_query_mode`：
-   - `image_only`：用户是在让系统找图中这个、同款或相似商品，但文字本身没有可执行的商品条件。此时 `task_type=shopping`，`canonical_question` 改写为“根据当前图片查找相似商品”。
-   - `multimodal`：用户文字给出了要与图片一起满足的条件，例如“找和图中类似的跑鞋，预算 500 元以内”。
+   - `multimodal`：Shopping 请求只要带有参考图片，默认让图片和用户文字共同进入商品发现，例如“找和图中类似的跑鞋，预算 500 元以内”、“给我找这个东西”或“推荐一副降噪耳机”。即使文字没有提到图片，也先交给图文一致性 Skill 判断是否冲突；不要仅因文字本身可以独立完成就标记为 `unused`。
    - `unused`：当前图片不服务于本轮任务，或本轮没有图片。
+     只有用户明确表示“忽略这张图”“按文字找，不看图片”等，或当前任务明确是知识/闲聊而图片不参与时，才使用 `unused`。
+5. **图文冲突后图片确认**：如果上下文出现 `[图文冲突待确认]`，说明上一轮图片与文字目标冲突，系统暂存了一张待确认图片：
+   - 用户明确说“按图片找”“按图中这个找”“找图里的”时，设置 `use_pending_image=true` 且 `image_query_mode=multimodal`，并把 `canonical_question` 改成按图片主体检索的完整问题。
+   - 用户明确说“按文字找”“还是找耳机”等时，设置 `use_pending_image=false`、`image_query_mode=unused`，按文字目标完成当前任务。
+   - 用户发起无关新话题或含义不清时，`use_pending_image=false`；不能把待确认图片自动带入新话题。
 
 约束：
 - 你只负责理解和顶层路由，不决定下游使用推荐、对比或详情等具体工具。
@@ -99,13 +103,25 @@ ROUTER_PROMPT = """你是电商导购助手唯一的会话理解与意图路由�
 
 ### 示例 9b：带图片但文字只是指向图片
 用户当前上传了一张图片，并说：“给我找这个东西”。
-输出要点：`mode=simple`、`task_type=shopping`、`image_query_mode=image_only`、
-`canonical_question="根据当前图片查找相似商品"`、`resolved_product_ids=[]`。
+输出要点：`mode=simple`、`task_type=shopping`、`image_query_mode=multimodal`；
+`canonical_question` 保留“给我找这个东西”的图片指向语义，`resolved_product_ids=[]`。不要自动改写成纯图检索。
 
 ### 示例 9c：图片与文字都有检索约束
 用户当前上传了一张跑鞋图片，并说：“找和图中类似的跑鞋，预算 500 元以内”。
 输出要点：`mode=simple`、`task_type=shopping`、`image_query_mode=multimodal`，
 `canonical_question` 保留跑鞋和预算条件。
+
+### 示例 9d：图片主体与文字目标可能冲突
+用户当前上传了一张图片，并说：“推荐一副降噪耳机”。
+输出要点：`mode=simple`、`task_type=shopping`、`image_query_mode=multimodal`；
+不要在 Router 阶段猜测图片是否与耳机冲突，交给 ShoppingAgent 的图文一致性 Skill 判断。
+
+### 示例 9e：图文冲突后的确认
+上下文存在 `[图文冲突待确认]`：图片主体是跑鞋，文字目标是降噪耳机。
+用户：“按图片找”。
+输出要点：`mode=simple`、`task_type=shopping`、`use_pending_image=true`、`image_query_mode=multimodal`，`canonical_question` 明确为“根据上一轮图片查找相似跑鞋”。
+用户：“按文字找耳机”。
+输出要点：`mode=simple`、`task_type=shopping`、`use_pending_image=false`、`image_query_mode=unused`，`canonical_question` 明确为“推荐降噪耳机”。
 
 ### 示例 10：商品序号越界
 上下文商品只有：

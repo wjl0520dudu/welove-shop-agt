@@ -34,6 +34,11 @@ class AssistantState(TypedDict):
     # supplied by chat-service on every turn.  They are not LangGraph messages:
     # ContextResolver consumes the structured cards/image metadata first.
     conversation_history: NotRequired[list[dict[str, Any]]]
+    # Whether the request explicitly supplied ``conversation_history``.  The
+    # distinction matters for direct AI-service callers: an omitted field may
+    # safely fall back to the same-thread visible Checkpointer history, while
+    # an explicit empty list means the caller intentionally starts fresh.
+    conversation_history_supplied: NotRequired[bool]
     # Persisted compressed prefix supplied by chat-service.  ContextResolver
     # injects it once into ``messages`` so Router and Chitchat share exactly
     # the same summary + recent original messages.

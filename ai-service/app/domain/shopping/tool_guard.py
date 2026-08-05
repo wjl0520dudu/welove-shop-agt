@@ -23,6 +23,11 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
 from app.domain.shopping.deep_agent_runtime import SHOPPING_SKILL_SOURCE
+from app.domain.shopping.high_level_tools import remember_multimodal_consistency
+from app.domain.shopping.multimodal_consistency import (
+    assess_multimodal_consistency,
+    build_multimodal_conflict_question,
+)
 from app.domain.shopping.script_runner import SHOPPING_SCRIPT_TOOL_NAME
 from app.domain.shopping.skill_observability import shopping_skill_name_from_path
 
@@ -50,6 +55,7 @@ _SHOPPING_FACT_TOOLS = frozenset({
 })
 
 SHOPPING_TOOL_SKILL_REQUIREMENTS = {
+    "check_multimodal_consistency": "multimodal-consistency",
     "recommend_products": "discover-products",
     "search_product_candidates": "discover-products",
     "finalize_product_recommendation": "discover-products",
@@ -71,6 +77,7 @@ def _required_skill_for_tool(tool_name: str, args: dict[str, Any]) -> str | None
     return SHOPPING_TOOL_SKILL_REQUIREMENTS.get(tool_name)
 
 _TERMINAL_SHOPPING_TOOLS = frozenset({
+    "check_multimodal_consistency",
     "recommend_products",
     "finalize_product_recommendation",
     "compare_products",
@@ -92,6 +99,10 @@ def _is_terminal_shopping_result(message: Any) -> bool:
     if not isinstance(message, ToolMessage) or getattr(message, "status", None) == "error":
         return False
     name = str(getattr(message, "name", "") or "")
+    if name == "check_multimodal_consistency":
+        # A normal consistency result is only a preflight; conflict is the
+        # sole terminal outcome because it carries the user clarification.
+        return _tool_message_action(message) == "clarify"
     if name in _TERMINAL_SHOPPING_TOOLS:
         return True
     # Candidate search is terminal only when there is nothing to finalize.
@@ -229,6 +240,150 @@ class RequireMatchingShoppingSkillMiddleware(AgentMiddleware):
             name=tool_name,
             status="error",
         )
+
+
+class RequireMultimodalConsistencyMiddleware(AgentMiddleware):
+    """Enforce the Skill-declared image/text preflight only for multimodal discovery.
+
+    This guard deliberately does not inspect the user query or recognize product
+    categories.  It only remembers the result of the visual Tool and prevents
+    candidate retrieval from bypassing a required preflight.
+    """
+
+    _CHECK_TOOL = "check_multimodal_consistency"
+    _DISCOVERY_TOOLS = frozenset({"recommend_products", "search_product_candidates"})
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._decision = ""
+        self._clarify_question = ""
+        self._image_subject = ""
+        self._text_target = ""
+        self.records: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _is_multimodal(state: dict[str, Any]) -> bool:
+        return (
+            str(state.get("input_mode") or "").strip().lower() == "multimodal"
+            and bool(str(state.get("image_url") or "").strip())
+        )
+
+    @staticmethod
+    def _payload(result: ToolMessage | Command[Any]) -> dict[str, Any]:
+        if not isinstance(result, ToolMessage) or getattr(result, "status", None) == "error":
+            return {}
+        try:
+            value = json.loads(str(result.content or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    async def _run_automatic_preflight(
+        self,
+        *,
+        request: ToolCallRequest,
+        call_id: str,
+    ) -> dict[str, Any]:
+        """Run the one mandatory visual preflight without a second agent loop.
+
+        The discovery Skill remains the procedure contract.  The middleware
+        merely enforces its first, safety-critical step when the model tries
+        to enter retrieval directly.  Returning an error and waiting for the
+        model to discover that missing step made real DeepAgent runs consume
+        their whole model-call budget and fall back to legacy text retrieval.
+        """
+        state = dict(request.state or {})
+        args = dict((request.tool_call or {}).get("args") or {})
+        query = str(args.get("query") or state.get("question") or "").strip()
+        image_url = str(state.get("image_url") or "").strip()
+        started = time.perf_counter()
+        result = await assess_multimodal_consistency(
+            query=query,
+            image_url=image_url,
+        )
+        payload = result.model_dump()
+        payload.update({"checked": True})
+        remember_multimodal_consistency(payload)
+        self._decision = result.decision
+        self._image_subject = result.image_subject.strip()
+        self._text_target = result.text_target.strip()
+        self._clarify_question = (
+            build_multimodal_conflict_question(result)
+            if result.decision == "conflict"
+            else ""
+        )
+        self.records.append({
+            "tool_call_id": f"{call_id}:preflight",
+            "tool_name": self._CHECK_TOOL,
+            "name": self._CHECK_TOOL,
+            "input_params": {"query": query},
+            "args": {"query": query},
+            "capability": None,
+            "dispatch_source": "multimodal_preflight",
+            "input_mode": "multimodal",
+            "status": "clarify" if result.decision == "conflict" else "completed",
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+            "deduplicated": False,
+            "fallback_stage": None,
+            "error_code": None,
+            "decision": result.decision,
+            "image_subject": self._image_subject,
+            "text_target": self._text_target,
+            "fallback_used": result.fallback_used,
+        })
+        return payload
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        tool_call = dict(request.tool_call or {})
+        tool_name = str(tool_call.get("name") or getattr(request.tool, "name", "") or "")
+        state = dict(request.state or {})
+        if not self._is_multimodal(state):
+            return await handler(request)
+
+        call_id = str(tool_call.get("id") or "shopping-multimodal-consistency")
+        if tool_name == self._CHECK_TOOL:
+            result = await handler(request)
+            payload = self._payload(result)
+            decision = str(payload.get("decision") or "").strip()
+            if decision in {"consistent", "conflict", "uncertain"}:
+                self._decision = decision
+                self._clarify_question = str(payload.get("clarify_question") or "").strip()
+                self._image_subject = str(payload.get("image_subject") or "").strip()
+                self._text_target = str(payload.get("text_target") or "").strip()
+            return result
+
+        if tool_name not in self._DISCOVERY_TOOLS:
+            return await handler(request)
+
+        # A real model sometimes loads the discovery Skill and calls its first
+        # retrieval Tool directly, instead of spending another LLM turn to
+        # issue the explicitly documented preflight Tool call.  The check is
+        # mandatory and has no capability-selection semantics, so execute it
+        # once here rather than repeatedly returning a Tool error until the
+        # model call limit is exhausted.
+        if self._decision not in {"consistent", "conflict", "uncertain"}:
+            await self._run_automatic_preflight(request=request, call_id=call_id)
+
+        if self._decision == "conflict":
+            return ToolMessage(
+                content=json.dumps({
+                    "action": "clarify",
+                    "clarify_question": self._clarify_question
+                    or "图片和文字描述的商品目标不一致。请确认希望按图片还是按文字查找。",
+                    "multimodal_consistency": "conflict",
+                    "image_subject": self._image_subject,
+                    "text_target": self._text_target,
+                }, ensure_ascii=False),
+                tool_call_id=call_id,
+                name=tool_name,
+                status="success",
+            )
+
+        return await handler(request)
 
 
 class ShoppingToolGuardMiddleware(AgentMiddleware):

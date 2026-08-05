@@ -23,6 +23,7 @@ from app.domain.shopping.skill_backend import (
 from app.domain.shopping.tool_guard import (
     RequireInitialShoppingToolMiddleware,
     RequireMatchingShoppingSkillMiddleware,
+    RequireMultimodalConsistencyMiddleware,
     ShoppingToolGuardMiddleware,
 )
 
@@ -61,6 +62,7 @@ class ShoppingDeepAgentAdapter:
         *,
         system_prompt: str,
         guard: ShoppingToolGuardMiddleware,
+        multimodal_guard: RequireMultimodalConsistencyMiddleware,
     ) -> ShoppingDeepAgentRuntime:
         validate_shopping_deepagents_runtime()
         business_tool_names = {
@@ -82,6 +84,7 @@ class ShoppingDeepAgentAdapter:
             middleware=[
                 RequireInitialShoppingToolMiddleware(),
                 skill_contract,
+                multimodal_guard,
                 guard,
                 surface,
                 # Six calls support one correction plus profile/business Skill,

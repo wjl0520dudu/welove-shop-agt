@@ -17,6 +17,7 @@ from app.domain.shopping.preferences import build_preference_questions
 from app.prompts.prompts import SHOPPING_AGENT_PROMPT
 from app.application.assistant.state import ShoppingAgentState
 from app.infrastructure.errors import ErrorCode
+from app.infrastructure.persistence.memory import remember_pending_multimodal_choice
 from app.domain.shopping.capabilities import (
     CompareCapability,
     DetailCapability,
@@ -29,6 +30,10 @@ from app.domain.shopping.high_level_tools import (
     SHOPPING_ROLLBACK_TOOLS,
     shopping_candidate_session,
 )
+from app.domain.shopping.multimodal_consistency import (
+    assess_multimodal_consistency,
+    build_multimodal_conflict_question,
+)
 from app.domain.shopping.script_tools import SHOPPING_SCRIPT_TOOLS
 from app.domain.shopping.schemas import ShoppingContext
 from app.domain.shopping.skill_observability import (
@@ -38,6 +43,7 @@ from app.domain.shopping.skill_observability import (
 from app.domain.shopping.tool_guard import (
     RequireInitialShoppingToolMiddleware,
     ShoppingToolGuardMiddleware,
+    RequireMultimodalConsistencyMiddleware,
 )
 from app.infrastructure.config import config
 from app.infrastructure.observability.langsmith import child_run_config
@@ -51,9 +57,26 @@ _BUSINESS_TOOL_NAMES = frozenset(
 )
 
 
-def _deep_agent_tools() -> list:
+def _tools_for_input_mode(
+    tools: list,
+    *,
+    include_multimodal_consistency: bool,
+) -> list:
+    """Keep the visual preflight Tool off non-multimodal model surfaces."""
+    if include_multimodal_consistency:
+        return list(tools)
+    return [
+        tool for tool in tools
+        if str(getattr(tool, "name", "") or "") != "check_multimodal_consistency"
+    ]
+
+
+def _deep_agent_tools(*, include_multimodal_consistency: bool = True) -> list:
     """Return the DeepAgent surface without changing the rollback runtime."""
-    tools = list(_DEEP_AGENT_BUSINESS_TOOLS)
+    tools = _tools_for_input_mode(
+        list(_DEEP_AGENT_BUSINESS_TOOLS),
+        include_multimodal_consistency=include_multimodal_consistency,
+    )
     if str(config.SHOPPING_SKILL_SCRIPT_MODE).lower() == "controlled":
         existing = {str(getattr(tool, "name", "") or "") for tool in tools}
         tools.extend(
@@ -149,6 +172,7 @@ class ShoppingAgent:
         bound_product_ids = list(effective_memory.get("selected_product_ids") or [])
         normalised_input_mode = _normalise_input_mode(image_url, input_mode)
         guard = ShoppingToolGuardMiddleware()
+        multimodal_guard = RequireMultimodalConsistencyMiddleware()
         system_prompt = self._build_system_prompt(
             selected_product_ids=bound_product_ids,
             image_url=image_url,
@@ -170,10 +194,16 @@ class ShoppingAgent:
 
                 deep_runtime = ShoppingDeepAgentAdapter(
                     llm=self._llm,
-                    tools=_deep_agent_tools(),
+                    tools=_deep_agent_tools(
+                        include_multimodal_consistency=(normalised_input_mode == "multimodal"),
+                    ),
                     checkpointer=_shopping_checkpointer,
                     skills_root=config.SHOPPING_SKILLS_ROOT,
-                ).build(system_prompt=system_prompt, guard=guard)
+                ).build(
+                    system_prompt=system_prompt,
+                    guard=guard,
+                    multimodal_guard=multimodal_guard,
+                )
                 agent = deep_runtime.graph
                 skill_source = deep_runtime.skill_source
                 shopping_runtime = SHOPPING_DEEP_AGENT_RUNTIME
@@ -182,10 +212,14 @@ class ShoppingAgent:
                     model=self._llm,
                     checkpointer=_shopping_checkpointer,
                     system_prompt=system_prompt,
-                    tools=_ALL_TOOLS,
+                    tools=_tools_for_input_mode(
+                        list(_ALL_TOOLS),
+                        include_multimodal_consistency=(normalised_input_mode == "multimodal"),
+                    ),
                     state_schema=ShoppingAgentState,
                     middleware=[
                         RequireInitialShoppingToolMiddleware(),
+                        multimodal_guard,
                         guard,
                         ToolCallLimitMiddleware(run_limit=3, exit_behavior="continue"),
                         ModelCallLimitMiddleware(run_limit=4, exit_behavior="end"),
@@ -247,6 +281,8 @@ class ShoppingAgent:
                 user_id=user_id,
                 jwt_token=jwt_token,
                 business_memory=effective_memory,
+                image_url=image_url,
+                input_mode=normalised_input_mode,
                 token_sink=token_sink,
                 run_config=run_config,
             )
@@ -279,7 +315,7 @@ class ShoppingAgent:
         ) if shopping_runtime == "deep_agent" else []
         collected_tool_calls = _extract_tool_calls(
             result_messages,
-            guard_records=guard.records,
+            guard_records=[*multimodal_guard.records, *guard.records],
             allowed_tool_names=_BUSINESS_TOOL_NAMES,
         )
 
@@ -341,6 +377,24 @@ class ShoppingAgent:
         capability = action_to_capability.get(str((tool_result or {}).get("action") or ""))
         dispatch_source = "agent_tool_loop" if collected_tool_calls else "none"
 
+        if (
+            (tool_result or {}).get("action") == "clarify"
+            and (tool_result or {}).get("multimodal_consistency") == "conflict"
+            and image_url
+        ):
+            try:
+                await remember_pending_multimodal_choice(
+                    conversation_id,
+                    user_id,
+                    {
+                        "image_url": image_url,
+                        "image_subject": (tool_result or {}).get("image_subject"),
+                        "text_target": (tool_result or {}).get("text_target"),
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("could not persist pending multimodal choice", exc_info=True)
+
         return {
             "answer": answer or "暂时没能找到合适的商品，能再说详细一点吗？",
             "product_cards": product_cards,
@@ -366,6 +420,8 @@ class ShoppingAgent:
         user_id: Optional[int | str],
         jwt_token: Optional[str],
         business_memory: Dict[str, Any],
+        image_url: Optional[str] = None,
+        input_mode: str = "text",
         token_sink: Optional[TokenSink] = None,
         dispatch_source: str = "restricted_rule_fallback",
         run_config: RunnableConfig | None = None,
@@ -388,6 +444,8 @@ class ShoppingAgent:
             selected_product_ids=list(business_memory.get("selected_product_ids") or []),
             last_focused_product=business_memory.get("last_focused_product"),
             user_preferences=dict(business_memory.get("user_preferences") or {}),
+            image_url=image_url or None,
+            input_mode=_normalise_input_mode(image_url, input_mode),
         )
         if decision.capability == "recommend":
             payload = (await RecommendCapability().run(question, context)).model_dump()
@@ -424,6 +482,8 @@ class ShoppingAgent:
         user_id: Optional[int | str],
         jwt_token: Optional[str],
         business_memory: Dict[str, Any],
+        image_url: Optional[str],
+        input_mode: str,
         token_sink: Optional[TokenSink],
         run_config: RunnableConfig | None = None,
     ) -> Optional[dict]:
@@ -436,6 +496,49 @@ class ShoppingAgent:
         decision = dispatch_shopping_capability(question, business_memory)
         if decision is None:
             return None
+
+        # The legacy failure fallback must never silently discard a Router
+        # scoped image.  Otherwise a primary DeepAgent error could turn a
+        # verified image/text conflict into an unrelated text recommendation.
+        normalised_input_mode = _normalise_input_mode(image_url, input_mode)
+        if (
+            decision.capability == "recommend"
+            and normalised_input_mode == "multimodal"
+            and image_url
+        ):
+            assessment = await assess_multimodal_consistency(
+                query=question,
+                image_url=image_url,
+            )
+            if assessment.decision == "conflict":
+                clarify_question = build_multimodal_conflict_question(assessment)
+                return {
+                    "answer": clarify_question,
+                    "task_type": "shopping",
+                    "product_cards": [],
+                    "sources": [],
+                    "suggested_questions": [],
+                    "capability": "clarify",
+                    "dispatch_source": "restricted_multimodal_fallback",
+                    "tool_calls": [{
+                        "tool_name": "check_multimodal_consistency",
+                        "name": "check_multimodal_consistency",
+                        "input_params": {"query": question},
+                        "args": {"query": question},
+                        "status": "clarify",
+                        "dispatch_source": "restricted_multimodal_fallback",
+                        "input_mode": "multimodal",
+                        "duration_ms": assessment.duration_ms,
+                        "decision": assessment.decision,
+                    }],
+                    "error": False,
+                }
+            # A concrete text target remains usable when visual analysis is
+            # uncertain, exactly like the main Tool path.  Vague text keeps
+            # the existing multimodal retrieval intact.
+            if assessment.decision == "uncertain" and assessment.text_target.strip():
+                image_url = None
+                normalised_input_mode = "text"
         logger.warning(
             "shopping restricted rule fallback capability=%s reason=%s",
             decision.capability,
@@ -448,6 +551,8 @@ class ShoppingAgent:
             user_id=user_id,
             jwt_token=jwt_token,
             business_memory=business_memory,
+            image_url=image_url,
+            input_mode=normalised_input_mode,
             token_sink=token_sink,
             dispatch_source="restricted_rule_fallback",
             run_config=run_config,
@@ -679,6 +784,27 @@ def _extract_tool_calls(
         if getattr(message, "type", "") == "tool"
         and getattr(message, "status", None) == "error"
     }
+    # A multimodal discovery call may be intercepted before the retrieval
+    # handler runs because the preflight found a verified image/text conflict.
+    # It is an internal attempted call, not a user-visible business execution;
+    # expose the preflight record only and do not make observability claim a
+    # candidate retrieval took place.
+    multimodal_conflict_call_ids: set[str] = set()
+    for message in messages or []:
+        if getattr(message, "type", "") != "tool":
+            continue
+        try:
+            payload = json.loads(str(getattr(message, "content", "") or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("action") == "clarify"
+            and payload.get("multimodal_consistency") == "conflict"
+        ):
+            multimodal_conflict_call_ids.add(
+                str(getattr(message, "tool_call_id", "") or "")
+            )
     out: List[Dict[str, Any]] = []
     for m in messages or []:
         tcs = getattr(m, "tool_calls", None)
@@ -699,7 +825,7 @@ def _extract_tool_calls(
                 continue
             # Skill-contract rejections are internal correction steps, not
             # successful public Shopping business executions.
-            if str(call_id) in failed_tool_call_ids:
+            if str(call_id) in failed_tool_call_ids or str(call_id) in multimodal_conflict_call_ids:
                 continue
             normalized_args = args if isinstance(args, dict) else {}
             trace = records_by_id.get(str(call_id), {})

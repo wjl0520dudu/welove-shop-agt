@@ -29,6 +29,7 @@ EXPECTED_SKILLS = {
     "discover-products",
     "compare-products",
     "inspect-product",
+    "multimodal-consistency",
     "use-shopping-profile",
 }
 
@@ -111,7 +112,7 @@ FAKE_BUSINESS_TOOLS = [
 ]
 
 
-def test_phase_s1_has_four_standard_agent_skills_and_reserved_namespaces():
+def test_shopping_agent_skills_and_reserved_namespaces_are_complete():
     assert {path.name for path in SKILLS_ROOT.iterdir() if path.is_dir()} == EXPECTED_SKILLS
     for name in EXPECTED_SKILLS:
         text = (SKILLS_ROOT / name / "SKILL.md").read_text(encoding="utf-8")

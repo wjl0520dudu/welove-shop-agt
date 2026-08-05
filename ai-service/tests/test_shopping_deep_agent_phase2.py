@@ -73,6 +73,7 @@ def test_phase_s2_prompt_is_materially_smaller_than_the_previous_manual():
 
 def test_each_business_tool_has_one_explicit_skill_contract():
     assert SHOPPING_TOOL_SKILL_REQUIREMENTS == {
+        "check_multimodal_consistency": "multimodal-consistency",
         "recommend_products": "discover-products",
         "search_product_candidates": "discover-products",
         "finalize_product_recommendation": "discover-products",
@@ -101,6 +102,19 @@ def test_discovery_skill_links_the_candidate_judging_reference():
     assert "exact" in reference_text
     assert "alternative" in reference_text
     assert "基础偏好软排序" in reference_text
+
+
+def test_discovery_skill_requires_multimodal_consistency_skill_before_retrieval():
+    skill_text = (DISCOVERY_SKILL / "SKILL.md").read_text(encoding="utf-8")
+    consistency_skill = (
+        AI_SERVICE_ROOT / "skills" / "shopping-agent" / "multimodal-consistency" / "SKILL.md"
+    )
+
+    assert "multimodal-consistency/SKILL.md" in skill_text
+    assert consistency_skill.is_file()
+    consistency_text = consistency_skill.read_text(encoding="utf-8")
+    assert "check_multimodal_consistency" in consistency_text
+    assert "uncertain" in consistency_text
 
 
 def test_deep_agent_blocks_direct_business_call_then_recovers_after_skill_read(

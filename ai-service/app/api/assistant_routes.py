@@ -41,6 +41,14 @@ _EVALUATION_HEADER_MAP = {
 }
 
 
+def _conversation_history_was_supplied(request: ChatRequest) -> bool:
+    """Distinguish an omitted history field from Pydantic's default ``[]``."""
+    fields = getattr(request, "model_fields_set", None)
+    if fields is None:  # Pydantic v1 compatibility
+        fields = getattr(request, "__fields_set__", set())
+    return "conversation_history" in fields
+
+
 class AssistantRunRequest(ChatRequest):
     # 购物车写操作已交给前端，这些字段保留兼容旧调用方，不再被 graph 消费。
     confirmed: bool = Field(False, description="[deprecated] 购物车操作改由前端直接处理")
@@ -151,6 +159,7 @@ async def run_assistant(request: AssistantRunRequest, http_request: Request) -> 
             skin_type=request.skin_type,
             preference_tags=request.preference_tags,
             conversation_history=request.conversation_history,
+            conversation_history_supplied=_conversation_history_was_supplied(request),
             conversation_summary=request.conversation_summary,
             trace_id=trace_id,
             image_url=image_url,
@@ -227,6 +236,7 @@ async def stream_assistant(request: AssistantRunRequest, http_request: Request):
                 skin_type=request.skin_type,
                 preference_tags=request.preference_tags,
                 conversation_history=request.conversation_history,
+                conversation_history_supplied=_conversation_history_was_supplied(request),
                 conversation_summary=request.conversation_summary,
                 trace_id=trace_id,
                 image_url=image_url,
@@ -421,6 +431,7 @@ async def run_multimodal_assistant(
             image_url=image_url,
             evaluation_context=_evaluation_context(http_request),
             conversation_history=request.conversation_history,
+            conversation_history_supplied=_conversation_history_was_supplied(request),
             conversation_summary=request.conversation_summary,
         )
     except MultimodalImageError as e:
@@ -497,6 +508,7 @@ async def stream_multimodal_assistant(
                 image_url=image_url,
                 evaluation_context=_evaluation_context(http_request),
                 conversation_history=request.conversation_history,
+                conversation_history_supplied=_conversation_history_was_supplied(request),
                 conversation_summary=request.conversation_summary,
             ):
                 if await http_request.is_disconnected():

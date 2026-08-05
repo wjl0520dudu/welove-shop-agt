@@ -9,18 +9,19 @@ description: 发现或推荐新的商城商品。用于文本找商品、按预�
 
 ## 执行流程
 
-1. 保留完整需求：将当前问题原样传给 `search_product_candidates`，不要删除品类、预算、品牌、场景、肤质、使用感、偏好或避雷条件。
-2. 选择数量：用户明确要求数量时，将其作为 `limit`；否则使用工具默认值。不要为了凑数量扩大到无关品类。
-3. 统一召回：文本、纯图片和图文任务都只调用 `search_product_candidates` 一次。图片由运行时自动传入，不要自行读取图片 URL、选择向量库或调用底层检索。
-4. 按召回结果继续：
+1. 图文预检：若本轮运行时是 `multimodal`（同时有图片和文字），先读取 [multimodal-consistency/SKILL.md](../multimodal-consistency/SKILL.md) 并严格执行其中流程。只有其结果允许继续时，才能进行本 Skill 的候选召回；若返回澄清，直接回复并停止。
+2. 保留完整需求：将当前问题原样传给 `search_product_candidates`，不要删除品类、预算、品牌、场景、肤质、使用感、偏好或避雷条件。
+3. 选择数量：用户明确要求数量时，将其作为 `limit`；否则使用工具默认值。不要为了凑数量扩大到无关品类。
+4. 统一召回：文本、纯图片和已通过预检的图文任务都只调用 `search_product_candidates` 一次。图片由运行时自动传入，不要自行读取图片 URL、选择向量库或调用底层检索。
+5. 按召回结果继续：
    - `action=candidates`：只把返回的 `candidate_set_id` 传给 `finalize_product_recommendation`。不要重新提交、改写或删减候选字段。
    - `action=clarify`：自然提出 `clarify_question`，然后停止。
    - `action=empty`：如实说明 `empty_reason`，然后停止；没有候选时不能创造替代商品。
-5. 等待终结工具完成现有单次 Candidate Judge、候选编号与事实校验、基础偏好软排序和商品卡构造。当前阶段不要在 Agent 层自行判断 exact / alternative / reject，也不要额外调用模型或脚本重复审核。
-6. 按终结结果收尾：
+6. 等待终结工具完成现有单次 Candidate Judge、候选编号与事实校验、基础偏好软排序和商品卡构造。当前阶段不要在 Agent 层自行判断 exact / alternative / reject，也不要额外调用模型或脚本重复审核。
+7. 按终结结果收尾：
    - `action=recommend`：只介绍 `product_cards` 中的商品，并使用 `ranked_products`、`match_status`、`constraint_gaps` 和已有理由解释选择。
    - `action=empty`：如实说明 `empty_reason`；不要改写 query 再搜索一次。
-7. 拿到终结结果后立即回答。不要自行增删候选、重排、补卡或创造商品。
+8. 拿到终结结果后立即回答。不要自行增删候选、重排、补卡或创造商品。
 
 ## 受控 scripts
 

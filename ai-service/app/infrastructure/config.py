@@ -155,12 +155,38 @@ class Config:
     SHOPPING_MULTIMODAL_RETRIEVAL_TIMEOUT_SECONDS = float(os.getenv(
         "SHOPPING_MULTIMODAL_RETRIEVAL_TIMEOUT_SECONDS", "12"
     ))
+    # 图文商品发现前的轻量视觉一致性检查。仅在 Router 已判定为
+    # shopping + multimodal 时调用；不影响纯文本或纯图片检索。
+    SHOPPING_MULTIMODAL_CONSISTENCY_ENABLED = os.getenv(
+        "SHOPPING_MULTIMODAL_CONSISTENCY_ENABLED", "true"
+    ).lower() in ("1", "true", "yes")
+    SHOPPING_MULTIMODAL_CONSISTENCY_MODEL = os.getenv(
+        "SHOPPING_MULTIMODAL_CONSISTENCY_MODEL", "qwen3.5-flash"
+    ).strip()
+    SHOPPING_MULTIMODAL_CONSISTENCY_TIMEOUT_SECONDS = float(os.getenv(
+        "SHOPPING_MULTIMODAL_CONSISTENCY_TIMEOUT_SECONDS", "6"
+    ))
     # 多模态 embedding / rerank 走百炼业务空间专属端点；不配置时使用 dashscope SDK 默认端点。
     DASHSCOPE_MAAS_BASE_URL = os.getenv("DASHSCOPE_MAAS_BASE_URL", "")
 
     # ── DashScope（阿里云百炼）text-embedding-v4 ──
     # 现在是主用 embedding 通道（RAG 的 dense 向量走这里），OpenAI 通道保留仅供兼容。
-    DASH_SCOPE_API_KEY = os.getenv("DASH_SCOPE_API_KEY", "")
+    # ``DASH_SCOPE_API_KEY`` belongs to the historical embedding/rerank
+    # channel.  The native MultiModalConversation call goes to the configured
+    # MAAS business-space endpoint, which uses the same credential as the
+    # OpenAI-compatible LLM channel unless a dedicated native key is supplied.
+    # Keep the two names independent: aliasing them made a stale embedding key
+    # override the working MAAS key for qwen3.5-flash.
+    DASH_SCOPE_API_KEY = (
+        os.getenv("DASH_SCOPE_API_KEY", "").strip()
+        or os.getenv("DASHSCOPE_API_KEY", "").strip()
+    )
+    DASHSCOPE_API_KEY = (
+        os.getenv("DASHSCOPE_NATIVE_API_KEY", "").strip()
+        or LLM_API_KEY
+        or os.getenv("DASHSCOPE_API_KEY", "").strip()
+        or DASH_SCOPE_API_KEY
+    )
     DASH_SCOPE_TEXT_EMBEDDING_MODEL = os.getenv("DASH_SCOPE_TEXT_EMBEDDING_MODEL", "text-embedding-v4")
     # DashScope 单次最大 batch=10，超出会 400。
     DASH_SCOPE_EMBEDDING_BATCH_SIZE = int(os.getenv("DASH_SCOPE_EMBEDDING_BATCH_SIZE", "10"))

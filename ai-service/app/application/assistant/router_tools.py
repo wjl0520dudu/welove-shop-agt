@@ -172,6 +172,18 @@ def format_business_memory_for_router(memory: Optional[Dict[str, Any]]) -> str:
         title = focused.get("title") or f"商品{focused.get('product_id', 'N/A')}"
         parts.append(f"[当前关注商品] {title}")
 
+    pending_image = memory.get("pending_multimodal_choice") or {}
+    if isinstance(pending_image, dict) and str(pending_image.get("image_url") or "").strip():
+        image_subject = str(pending_image.get("image_subject") or "图片中的商品").strip()
+        text_target = str(pending_image.get("text_target") or "文字目标").strip()
+        parts.append(
+            "[图文冲突待确认]\n"
+            f"上一轮图片主体：{image_subject}\n"
+            f"上一轮文字目标：{text_target}\n"
+            "如果用户明确说“按图片/按图中这个找”，可把这张待确认图片用于本轮商品发现；"
+            "如果用户明确说“按文字找”，或发起新话题，则不要使用这张图片。"
+        )
+
     # 知识实体：Router 靠这个判断"第二个的成分"该走 knowledge 还是 shopping。
     # 有商品且无实体 → 商品指代；有实体且无商品 → 知识实体指代；两者都有由 prompt 里的
     # "指代词性质"规则区分（商品维度词 vs 知识维度词）。

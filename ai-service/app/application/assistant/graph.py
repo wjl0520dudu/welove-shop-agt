@@ -13,7 +13,12 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
-from app.infrastructure.persistence.memory import get_business_memory, remember_product_cards, remember_user_preferences
+from app.infrastructure.persistence.memory import (
+    clear_pending_multimodal_choice,
+    get_business_memory,
+    remember_product_cards,
+    remember_user_preferences,
+)
 from app.application.assistant.schemas import IntentDecision, OrchestratorDecision
 from app.prompts.prompts import ORCHESTRATOR_PROMPT, ROUTER_PROMPT
 from app.application.assistant.state import AssistantState
@@ -929,9 +934,38 @@ class AssistantGraph:
             "confidence": normalized.confidence,
             "reason": normalized.reason,
             "image_query_mode": normalized.image_query_mode,
+            "use_pending_image": normalized.use_pending_image,
         }
         canonical_question = normalized.canonical_question or question
         image_query_mode = normalized.image_query_mode
+        pending_choice = memory.get("pending_multimodal_choice") or {}
+        pending_image_url = (
+            str(pending_choice.get("image_url") or "").strip()
+            if isinstance(pending_choice, dict)
+            else ""
+        )
+        use_pending_image = bool(
+            not image_url
+            and pending_image_url
+            and normalized.use_pending_image
+            and image_query_mode == "multimodal"
+        )
+        if use_pending_image:
+            image_url = pending_image_url
+
+        # A pending image is a one-turn clarification artifact, not a general
+        # image history.  Consume it only when Router explicitly selects the
+        # image; discard it once Router has safely understood a different
+        # non-unknown follow-up so a later new topic cannot inherit it.
+        if pending_image_url and not state.get("image_url") and (
+            use_pending_image or normalized.task_type != "unknown"
+        ):
+            try:
+                await clear_pending_multimodal_choice(
+                    state.get("conversation_id"), state.get("user_id"),
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("could not clear pending multimodal choice", exc_info=True)
         resolved_product_ids = _restrict_to_active_product_set(
             normalized.resolved_product_ids,
             memory,
@@ -977,6 +1011,11 @@ class AssistantGraph:
                 business_memory=routed_memory,
             )
         if normalized.mode == "complex":
+            complex_input_mode = (
+                "multimodal"
+                if image_url and image_query_mode == "multimodal"
+                else "text"
+            )
             return _route_result(
                 route="unknown",
                 confidence=normalized.confidence,
@@ -985,23 +1024,8 @@ class AssistantGraph:
                 llm=llm_trace,
                 mode="complex",
                 canonical_question=canonical_question,
-                input_mode=image_query_mode,
-                business_memory=routed_memory,
-            )
-        # Whether the attached image is the actual search target is a semantic
-        # decision owned by Router LLM.  If it says image_only, do not let an
-        # otherwise vague text fragment turn the downstream retrieval into a
-        # text+image search.  This is not a keyword fallback.
-        if image_url and image_query_mode == "image_only":
-            return _route_result(
-                route="shopping",
-                confidence=normalized.confidence,
-                source="llm",
-                reason=normalized.reason or "LLM identified an image-led shopping request",
-                llm=llm_trace,
-                mode="simple",
-                canonical_question=canonical_question or "根据当前图片查找相似商品",
-                input_mode="image",
+                input_mode=complex_input_mode,
+                image_url=image_url if use_pending_image else None,
                 business_memory=routed_memory,
             )
         if normalized.task_type == "unknown":
@@ -1014,9 +1038,15 @@ class AssistantGraph:
                 fallback_used=True,
                 canonical_question=canonical_question,
                 input_mode=image_query_mode,
+                image_url=image_url if use_pending_image else None,
                 route_clarification=normalized.clarification,
                 business_memory=routed_memory,
             )
+        shopping_input_mode = (
+            "multimodal"
+            if image_url and image_query_mode == "multimodal"
+            else "text"
+        )
         return _route_result(
             route=normalized.task_type,
             confidence=normalized.confidence,
@@ -1025,7 +1055,8 @@ class AssistantGraph:
             llm=llm_trace,
             mode="simple",
             canonical_question=canonical_question,
-            input_mode=image_query_mode,
+            input_mode=shopping_input_mode,
+            image_url=image_url if use_pending_image else None,
             business_memory=routed_memory,
         )
 
@@ -1079,6 +1110,15 @@ class AssistantGraph:
             "run_id": run_id,
             "trace_id": trace_id,
             "conversation_history": conversation_history,
+            # ``conversation_history`` is optional for the public AI-service
+            # endpoint used in local/API-tool testing.  Preserve whether it
+            # was actually present on the request instead of confusing its
+            # Pydantic default ``[]`` with an intentional empty history.
+            "conversation_history_supplied": bool(
+                kwargs.get("conversation_history_supplied")
+                if "conversation_history_supplied" in kwargs
+                else "conversation_history" in kwargs
+            ),
             "conversation_summary": str(kwargs.get("conversation_summary") or "").strip(),
             "context_resolution": {},
             # resolve_context creates the one shared, compressed visible
@@ -1116,7 +1156,6 @@ class AssistantGraph:
 
     async def run(self, **kwargs) -> dict:
         state, run_id, trace_id = self._make_initial_state(**kwargs)
-        await self._sync_request_profile(state)
         conversation_id = state.get("conversation_id")
         run_config = build_assistant_run_config(
             conversation_id=conversation_id,
@@ -1127,6 +1166,8 @@ class AssistantGraph:
             environment=config.LANGSMITH_ENVIRONMENT,
             evaluation_context=kwargs.get("evaluation_context"),
         )
+        await self._recover_direct_request_history(state, run_config)
+        await self._sync_request_profile(state)
         await self._refresh_runtime_messages(state, run_config)
         final = await self.graph.ainvoke(state, config=run_config)
         result = final.get("result") or {}
@@ -1161,7 +1202,6 @@ class AssistantGraph:
         - subgraphs: 让子图（ShoppingAgent 内的 create_agent）事件冒泡
         """
         state, run_id, trace_id = self._make_initial_state(**kwargs)
-        await self._sync_request_profile(state)
         conversation_id = state.get("conversation_id")
         run_config = build_assistant_run_config(
             conversation_id=conversation_id,
@@ -1172,6 +1212,8 @@ class AssistantGraph:
             environment=config.LANGSMITH_ENVIRONMENT,
             evaluation_context=kwargs.get("evaluation_context"),
         )
+        await self._recover_direct_request_history(state, run_config)
+        await self._sync_request_profile(state)
         await self._refresh_runtime_messages(state, run_config)
 
         # start 事件：告诉前端 trace_id / run_id
@@ -1259,6 +1301,59 @@ class AssistantGraph:
             {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *messages]},
         )
 
+    async def _recover_direct_request_history(
+        self,
+        state: AssistantState,
+        run_config: RunnableConfig,
+    ) -> None:
+        """Recover visible same-thread history only for direct API callers.
+
+        chat-service is the production owner of persisted visible history and
+        sends it on every request.  API tools commonly call AI Service with
+        only ``conversation_id`` though; after the runtime-refresh fix those
+        requests accidentally erased their own useful Checkpointer messages.
+
+        Use Checkpointer solely as a compatibility fallback when the field was
+        *omitted*.  An explicitly supplied empty list remains an intentional
+        fresh-context request.  Parent graph messages contain only the visible
+        user/assistant turns written by top-level nodes; tool-loop messages
+        remain inside child agents and are never replayed here.
+        """
+        if state.get("conversation_history_supplied") or not state.get("conversation_id"):
+            return
+        try:
+            snapshot = await self.graph.aget_state(run_config)
+        except Exception:  # noqa: BLE001
+            logger.warning("could not read direct-request Checkpointer fallback", exc_info=True)
+            return
+
+        previous_messages = list((getattr(snapshot, "values", None) or {}).get("messages") or [])
+        recovered: list[dict[str, Any]] = []
+        for message in previous_messages:
+            message_type = getattr(message, "type", "")
+            if message_type not in {"human", "ai"}:
+                continue
+            content = getattr(message, "content", "")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            recovered.append({
+                "id": getattr(message, "id", None),
+                "role": "user" if message_type == "human" else "assistant",
+                "content": content.strip(),
+            })
+        if not recovered:
+            return
+
+        state["conversation_history"] = _normalize_conversation_history(
+            [*recovered, *(state.get("conversation_history") or [])],
+            str(state.get("question") or ""),
+            str(state.get("image_url") or "") or None,
+        )
+        logger.info(
+            "recovered %s visible Checkpointer messages for direct request conv=%s",
+            len(recovered), state.get("conversation_id"),
+        )
+
     async def _translate_update_event(self, node_name: str, node_output) -> AsyncIterator[Dict[str, Any]]:
         """把 updates 流翻译成 route / tool_call / tool_result 事件。"""
         if not isinstance(node_output, dict):
@@ -1335,6 +1430,7 @@ def _route_result(
     canonical_question: str = "",
     route_clarification: str = "",
     input_mode: str = "",
+    image_url: str | None = None,
     business_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one stable routing trace for graph state, API and offline evals."""
@@ -1363,6 +1459,8 @@ def _route_result(
         result["canonical_question"] = canonical_question
     if input_mode in {"image", "multimodal", "text"}:
         result["input_mode"] = input_mode
+    if image_url is not None:
+        result["image_url"] = image_url
     if business_memory is not None:
         result["business_memory"] = business_memory
     return result
