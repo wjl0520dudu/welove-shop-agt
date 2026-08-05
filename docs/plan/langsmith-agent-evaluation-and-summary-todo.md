@@ -34,9 +34,10 @@
 
 ## P4：对比实验与报告
 
-- [ ] 在历史 commit/独立 worktree 运行 Legacy baseline；不把旧 Agent 重新接回当前生产主链。
-- [ ] 对比 Legacy、Skills、滚动摘要、Skills + 滚动摘要四个变量组合。
-- [ ] 142 条全量运行后发布报告：指标变化、成本/延迟和失败样本归因。
+- [x] 新增四组 Variant 的配置契约、报告配置校验与 JSON/Markdown 自动汇总工具；不修改业务 Agent 主链。
+- [x] 新增 P4 操作手册，明确 `legacy`、`skills`、`summary`、`current` 四组仅切换三个现有运行时开关。
+- [ ] 先对每一组执行小样本连通性冒烟，再运行 142 条全量 LangSmith Experiment。
+- [ ] 汇总四组正式报告，审阅质量、成本、延迟、TTFT 和失败样本归因后再作优化决策。
 
 ## P5：数据驱动优化
 

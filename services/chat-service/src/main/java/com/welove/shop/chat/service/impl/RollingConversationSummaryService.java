@@ -39,14 +39,13 @@ public class RollingConversationSummaryService {
     @Value("${chat-service.context.rolling-summary.enabled:true}")
     private boolean enabled;
 
-    @Value("${chat-service.context.rolling-summary.recent-message-window:10}")
-    private int recentMessageWindow;
+    /** Equivalent to SummarizationMiddleware(trigger=("messages", 20)). */
+    @Value("${chat-service.context.rolling-summary.trigger-message-count:20}")
+    private int triggerMessageCount;
 
-    @Value("${chat-service.context.rolling-summary.turn-threshold:4}")
-    private int turnThreshold;
-
-    @Value("${chat-service.context.rolling-summary.char-threshold:4000}")
-    private int charThreshold;
+    /** Equivalent to SummarizationMiddleware(keep=("messages", 4)). */
+    @Value("${chat-service.context.rolling-summary.keep-message-count:4}")
+    private int keepMessageCount;
 
     @Value("${chat-service.context.rolling-summary.max-chars:1600}")
     private int maxSummaryChars;
@@ -59,36 +58,30 @@ public class RollingConversationSummaryService {
             return;
         }
         try {
-            Long targetMessageId = messageMapper.selectSummaryTargetMessageId(
-                    conversationId, Math.max(1, recentMessageWindow));
-            if (targetMessageId == null) {
+            ConversationContext context = contextService.getRollingSummaryContext(conversationId);
+            Long coveredMessageId = context == null ? null : context.getSummaryCoveredMessageId();
+            Long checkpointMessageId = context == null ? null : context.getSummaryCheckpointMessageId();
+
+            // Count only complete visible messages added after the prior batch
+            // checkpoint.  Keeping the newest four messages therefore does not
+            // turn the next ten-turn batch into an eight-turn batch.
+            List<Message> messagesSinceCheckpoint = messageMapper.selectVisibleMessagesAfter(
+                    conversationId, checkpointMessageId);
+            if (messagesSinceCheckpoint.size() < Math.max(2, triggerMessageCount)) {
                 return;
             }
 
-            ConversationContext context = contextService.getRollingSummaryContext(conversationId);
-            Long coveredMessageId = context == null ? null : context.getSummaryCoveredMessageId();
-            if (coveredMessageId != null && coveredMessageId >= targetMessageId) {
+            Long targetMessageId = messageMapper.selectSummaryTargetMessageId(
+                    conversationId, Math.max(0, keepMessageCount));
+            if (targetMessageId == null || (coveredMessageId != null && coveredMessageId >= targetMessageId)) {
                 return;
             }
 
             List<Message> newlyEligible = messageMapper.selectMessagesForRollingSummary(
                     conversationId, coveredMessageId, targetMessageId);
-            if (newlyEligible.isEmpty()) {
-                return;
-            }
-
-            int textLength = newlyEligible.stream()
-                    .map(Message::getContent)
-                    .filter(java.util.Objects::nonNull)
-                    .mapToInt(String::length)
-                    .sum();
-            // A turn means one user message plus one assistant message.  We
-            // wait until there is meaningful new material unless the text is
-            // already long, avoiding an LLM call after every short turn.
-            if (newlyEligible.size() < Math.max(1, turnThreshold) * 2
-                    && textLength < Math.max(1, charThreshold)) {
-                return;
-            }
+            if (newlyEligible.isEmpty()) return;
+            Long currentCheckpointId = messagesSinceCheckpoint.get(messagesSinceCheckpoint.size() - 1).getId();
+            if (currentCheckpointId == null) return;
 
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("previous_summary", context == null ? "" : safe(context.getSummary()));
@@ -104,13 +97,13 @@ public class RollingConversationSummaryService {
             }
 
             boolean updated = contextService.updateRollingSummary(
-                    conversationId, summary, targetMessageId);
-            log.info("rolling summary {} conv={} coveredMessageId={} newMessages={} chars={}",
+                    conversationId, summary, targetMessageId, currentCheckpointId);
+            log.info("rolling summary {} conv={} coveredMessageId={} checkpointMessageId={} summarizedMessages={} triggerMessages={} keepMessages={}",
                     updated ? "updated" : "skipped", conversationId, targetMessageId,
-                    newlyEligible.size(), textLength);
+                    currentCheckpointId, newlyEligible.size(), triggerMessageCount, keepMessageCount);
         } catch (Exception e) {
-            // Summary is an optimization.  The next request still carries the
-            // recent verbatim window, and a later completed turn retries this.
+            // Summary is an optimization. The next request carries the whole
+            // not-yet-covered raw suffix, and a later completed turn retries.
             log.warn("rolling summary update failed conv={}: {}", conversationId, e.getMessage());
         }
     }

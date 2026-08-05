@@ -42,6 +42,19 @@ public interface MessageMapper extends BaseMapper<Message> {
             @Param("afterMessageId") Long afterMessageId,
             @Param("throughMessageId") Long throughMessageId);
 
+    /** Visible messages after a persisted summary coverage point, ordered by time. */
+    @Select("""
+        SELECT * FROM chat_svc.message
+        WHERE conversation_id = #{conversationId}
+          AND id > COALESCE(#{afterMessageId}, 0)
+          AND role IN ('user', 'assistant')
+          AND (status IS NULL OR status = 'done')
+        ORDER BY id ASC
+        """)
+    List<Message> selectVisibleMessagesAfter(
+            @Param("conversationId") Long conversationId,
+            @Param("afterMessageId") Long afterMessageId);
+
     /**
      * 去重查询:同一 conversation 下,近 N 秒内 status='truncated' 且内容前缀匹配的截断消息。
      * 用于双保险(前端 POST + 后端 doOnCancel)时避免同一条截断被写入两次。

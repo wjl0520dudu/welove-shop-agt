@@ -41,20 +41,22 @@ public interface ConversationContextMapper extends BaseMapper<ConversationContex
     ConversationContext selectByConversationId(@Param("conversationId") Long conversationId);
 
     /**
-     * Persists a newer summary only.  The covered message ID is a lightweight
-     * watermark: it prevents two asynchronous jobs from repeatedly summarizing
-     * the same visible prefix.
+     * Persists a newer summary only.  The covered ID is the last message in
+     * the summary; the checkpoint ID is the end of the 20-message batch that
+     * caused this update.  They differ when recent raw messages are retained.
      */
     @Update("""
             UPDATE conversation_context
             SET summary = #{summary},
                 summary_covered_message_id = #{coveredMessageId},
+                summary_checkpoint_message_id = #{checkpointMessageId},
                 update_time = CURRENT_TIMESTAMP
             WHERE conversation_id = #{conversationId}
               AND (summary_covered_message_id IS NULL
-                   OR summary_covered_message_id <= #{coveredMessageId})
+                   OR summary_covered_message_id < #{coveredMessageId})
             """)
     int updateRollingSummary(@Param("conversationId") Long conversationId,
                              @Param("summary") String summary,
-                             @Param("coveredMessageId") Long coveredMessageId);
+                             @Param("coveredMessageId") Long coveredMessageId,
+                             @Param("checkpointMessageId") Long checkpointMessageId);
 }

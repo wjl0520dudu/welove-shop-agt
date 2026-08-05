@@ -9,6 +9,7 @@ public interface ConversationContextService {
     void updateConversationContext(Long conversationId, Long userId, Message newMessage);
     void invalidateConversationContext(Long conversationId);
     ConversationContext getRollingSummaryContext(Long conversationId);
-    boolean updateRollingSummary(Long conversationId, String summary, Long coveredMessageId);
+    boolean updateRollingSummary(Long conversationId, String summary, Long coveredMessageId,
+                                 Long checkpointMessageId);
     void cleanupExpiredContexts(int days);
 }

@@ -21,6 +21,7 @@ from app.application.assistant.conversation_summary import build_rolling_summary
 from app.application.assistant.graph import AssistantGraph
 from app.infrastructure.errors import ErrorCode
 from app.infrastructure.llm.llm import get_llm
+from app.infrastructure.observability.langsmith import build_assistant_run_config
 from app.infrastructure.retrieval.multimodal_embeddings import MultimodalImageError, _normalize_image_url
 
 
@@ -51,17 +52,29 @@ class AssistantRunRequest(ChatRequest):
 
 
 @router.post("/conversation-summary", response_model=RollingSummaryResponse)
-async def create_conversation_summary(request: RollingSummaryRequest) -> RollingSummaryResponse:
+async def create_conversation_summary(
+    request: RollingSummaryRequest, http_request: Request,
+) -> RollingSummaryResponse:
     """Internal best-effort endpoint used by chat-service after a turn is saved."""
     llm = get_llm()
     if llm is None:
         raise HTTPException(status_code=503, detail="LLM is not configured")
     try:
+        trace_id = getattr(http_request.state, "trace_id", None) or str(uuid4())
+        run_config = build_assistant_run_config(
+            conversation_id=None,
+            user_id=None,
+            trace_id=trace_id,
+            stream=False,
+            has_image=False,
+            evaluation_context=_evaluation_context(http_request),
+        )
         summary = await build_rolling_summary(
             llm,
             previous_summary=request.previous_summary,
             messages=request.messages,
             max_chars=request.max_chars,
+            run_config=run_config,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("rolling summary generation failed")

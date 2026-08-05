@@ -76,11 +76,14 @@ public class ConversationContextServiceImpl implements ConversationContextServic
     }
 
     @Override
-    public boolean updateRollingSummary(Long conversationId, String summary, Long coveredMessageId) {
-        if (conversationId == null || coveredMessageId == null || summary == null || summary.isBlank()) {
+    public boolean updateRollingSummary(Long conversationId, String summary, Long coveredMessageId,
+                                        Long checkpointMessageId) {
+        if (conversationId == null || coveredMessageId == null || checkpointMessageId == null
+                || summary == null || summary.isBlank()) {
             return false;
         }
-        return ctxMapper.updateRollingSummary(conversationId, summary, coveredMessageId) > 0;
+        return ctxMapper.updateRollingSummary(
+                conversationId, summary, coveredMessageId, checkpointMessageId) > 0;
     }
 
     @Override

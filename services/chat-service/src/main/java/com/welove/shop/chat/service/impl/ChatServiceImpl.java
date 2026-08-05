@@ -60,6 +60,7 @@ public class ChatServiceImpl implements ChatService {
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
     private final StorageService storageService;
+    @Value("${chat-service.context.rolling-summary.enabled:true}") private boolean rollingSummaryEnabled;
     @Value("${chat-service.context.dedup-window-seconds:30}") private long dedupWindow;
     @Value("${chat-service.sse.timeout:300000}") private long sseTimeout;
     @Value("${chat-service.upload.image.max-bytes:10485760}") private long imageMaxBytes;
@@ -80,7 +81,13 @@ public class ChatServiceImpl implements ChatService {
                 .orderByDesc(Conversation::getIsPinned).orderByDesc(Conversation::getCreateTime));
     }
     @Override public List<Message> getMessages(Long conversationId) {
-        return ctxService.getConversationContext(conversationId, 0);
+        // The page history is the full persisted transcript, never the small
+        // model-context window.  Context compression must not change what a
+        // user can scroll back to in H5.
+        return msgMapper.selectList(new LambdaQueryWrapper<Message>()
+                .eq(Message::getConversationId, conversationId)
+                .orderByAsc(Message::getCreateTime)
+                .orderByAsc(Message::getId));
     }
     @Override @Transactional public void deleteConversation(Long conversationId) {
         msgMapper.delete(new LambdaQueryWrapper<Message>().eq(Message::getConversationId, conversationId));
@@ -759,13 +766,24 @@ public class ChatServiceImpl implements ChatService {
     }
 
     /**
-     * Provide AI with the same persisted message window used by conversation
-     * replay. Product cards and image URLs are turn artifacts, so a follow-up
-     * such as "这两款对比" can bind to the exact preceding response instead of
-     * a mutable global last_product_cards cache.
+     * Build the one raw suffix that accompanies the persisted summary.
+     *
+     * <p>When summary is enabled and available, this returns every visible
+     * message after its coverage point.  Normally that is the configured
+     * four-message keep window; while an async summary is pending or failed it
+     * may be longer.  That fallback is deliberate: no visible message may be
+     * removed from the model context before a summary has actually persisted.</p>
      */
     private List<Map<String, Object>> buildConversationHistory(Long conversationId) {
-        List<Message> messages = ctxService.getConversationContext(conversationId, 0);
+        var summaryContext = rollingSummaryEnabled
+                ? ctxService.getRollingSummaryContext(conversationId)
+                : null;
+        Long coveredMessageId = summaryContext != null
+                && summaryContext.getSummary() != null
+                && !summaryContext.getSummary().isBlank()
+                ? summaryContext.getSummaryCoveredMessageId()
+                : null;
+        List<Message> messages = msgMapper.selectVisibleMessagesAfter(conversationId, coveredMessageId);
         List<Map<String, Object>> history = new java.util.ArrayList<>();
         for (Message message : messages) {
             Map<String, Object> item = new java.util.LinkedHashMap<>();
@@ -787,6 +805,7 @@ public class ChatServiceImpl implements ChatService {
      * method never treats Redis as the source of summary truth.
      */
     private String buildConversationSummary(Long conversationId) {
+        if (!rollingSummaryEnabled) return "";
         var context = ctxService.getRollingSummaryContext(conversationId);
         return context == null || context.getSummary() == null ? "" : context.getSummary();
     }

@@ -28,19 +28,33 @@ class Config:
         os.getenv("ROUTER_ORCHESTRATOR_HINT_CONFIDENCE", "0.90")
     )
 
-    # One persisted rolling summary is shared by Router and Chitchat. The
-    # actual trigger/write happens in chat-service because it owns chat_svc;
-    # ai-service uses this switch to decide whether an incoming summary may be
-    # injected into the shared visible message list.
-    ROUTER_ROLLING_SUMMARY_ENABLED = os.getenv(
-        "ROUTER_ROLLING_SUMMARY_ENABLED", "true"
+    # One persisted conversation summary is shared by Router and Chitchat.
+    # chat-service owns the visible transcript and durable summary; ai-service
+    # only injects the persisted result into the one shared messages list.
+    # The ROUTER_* fallbacks retain compatibility with previous evaluation
+    # profiles while CONVERSATION_* is the production-facing contract.
+    CONVERSATION_SUMMARY_ENABLED = os.getenv(
+        "CONVERSATION_SUMMARY_ENABLED",
+        os.getenv("ROUTER_ROLLING_SUMMARY_ENABLED", "true"),
     ).lower() in ("1", "true", "yes")
-    ROUTER_SUMMARY_TURN_THRESHOLD = int(os.getenv("ROUTER_SUMMARY_TURN_THRESHOLD", "4"))
-    ROUTER_SUMMARY_CHAR_THRESHOLD = int(os.getenv("ROUTER_SUMMARY_CHAR_THRESHOLD", "4000"))
+    CONVERSATION_SUMMARY_TRIGGER_MESSAGES = int(
+        os.getenv("CONVERSATION_SUMMARY_TRIGGER_MESSAGES", "20")
+    )
+    CONVERSATION_SUMMARY_KEEP_MESSAGES = int(
+        os.getenv("CONVERSATION_SUMMARY_KEEP_MESSAGES", "4")
+    )
+    CONVERSATION_SUMMARY_MAX_CHARS = int(
+        os.getenv("CONVERSATION_SUMMARY_MAX_CHARS", os.getenv("ROUTER_SUMMARY_MAX_CHARS", "1600"))
+    )
+
+    # Legacy names are only kept for existing P4 / direct-AI evaluation
+    # scripts. They are not the trigger policy used by chat-service anymore.
+    ROUTER_ROLLING_SUMMARY_ENABLED = CONVERSATION_SUMMARY_ENABLED
+    ROUTER_SUMMARY_CHAR_THRESHOLD = int(os.getenv("ROUTER_SUMMARY_CHAR_THRESHOLD", "8000"))
     ROUTER_CONTEXT_RECENT_MESSAGE_WINDOW = int(
         os.getenv("ROUTER_CONTEXT_RECENT_MESSAGE_WINDOW", "10")
     )
-    ROUTER_SUMMARY_MAX_CHARS = int(os.getenv("ROUTER_SUMMARY_MAX_CHARS", "1600"))
+    ROUTER_SUMMARY_MAX_CHARS = CONVERSATION_SUMMARY_MAX_CHARS
 
     # 1c. Preference-aware soft reranking. These are bounded adjustments applied
     # after relevance retrieval; current-turn hard constraints remain authoritative.

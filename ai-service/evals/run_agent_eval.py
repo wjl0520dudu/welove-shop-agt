@@ -654,7 +654,6 @@ def _build_metadata() -> dict[str, Any]:
         },
         "conversation_context": {
             "rolling_summary_enabled": config.ROUTER_ROLLING_SUMMARY_ENABLED,
-            "summary_turn_threshold": config.ROUTER_SUMMARY_TURN_THRESHOLD,
             "summary_char_threshold": config.ROUTER_SUMMARY_CHAR_THRESHOLD,
             "recent_message_window": config.ROUTER_CONTEXT_RECENT_MESSAGE_WINDOW,
             "summary_max_chars": config.ROUTER_SUMMARY_MAX_CHARS,

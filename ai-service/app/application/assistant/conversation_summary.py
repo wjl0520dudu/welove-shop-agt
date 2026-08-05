@@ -95,6 +95,7 @@ async def build_rolling_summary(
     previous_summary: str,
     messages: Iterable[Mapping[str, Any] | Any],
     max_chars: int,
+    run_config: Mapping[str, Any] | None = None,
 ) -> str:
     """Merge a persisted prefix summary with newly eligible visible messages."""
     visible = normalize_visible_summary_messages(messages)
@@ -115,6 +116,10 @@ async def build_rolling_summary(
                 f"输入：{payload}"
             )),
         ],
-        config={"run_name": "assistant.rolling-summary", "tags": ["system:rolling-summary"]},
+        config={
+            **dict(run_config or {}),
+            "run_name": "assistant.rolling-summary",
+            "tags": [*list((run_config or {}).get("tags") or []), "system:rolling-summary"],
+        },
     )
     return _bound_summary(_as_text(response), max_chars)

@@ -108,6 +108,7 @@ def summarize_trace_token_usage(
     start_time: datetime,
     max_attempts: int = 4,
     retry_wait_seconds: float = 2.0,
+    operation: str = "run",
 ) -> dict[str, dict[str, Any]]:
     """Collect real LLM leaf-run token usage for one offline experiment batch.
 
@@ -157,7 +158,7 @@ def summarize_trace_token_usage(
                 if (
                     case_id not in matched
                     or str(metadata.get("evaluation_run_id") or "") != evaluation_run_id
-                    or str(metadata.get("evaluation_operation") or "") != "run"
+                    or str(metadata.get("evaluation_operation") or "") != operation
                 ):
                     continue
                 input_tokens, output_tokens, total_tokens = _run_token_counts(run)

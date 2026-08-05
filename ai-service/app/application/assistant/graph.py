@@ -155,7 +155,7 @@ class AssistantGraph:
             business_memory={**persisted, **dict(state.get("business_memory") or {})},
             conversation_summary=(
                 state.get("conversation_summary") or ""
-                if config.ROUTER_ROLLING_SUMMARY_ENABLED else ""
+                if config.CONVERSATION_SUMMARY_ENABLED else ""
             ),
         )
         return resolved

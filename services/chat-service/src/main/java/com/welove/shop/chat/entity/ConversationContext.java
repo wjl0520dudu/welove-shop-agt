@@ -19,6 +19,8 @@ public class ConversationContext implements Serializable {
     private String summary;
     /** Last visible message already represented by {@link #summary}. */
     private Long summaryCoveredMessageId;
+    /** Last visible message that completed a configured summary batch. */
+    private Long summaryCheckpointMessageId;
     private String embedding;
     private String userPreferences;
     private String mentionedProducts;

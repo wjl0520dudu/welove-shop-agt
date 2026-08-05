@@ -119,15 +119,15 @@ chat-service:
   context:
     # 短期记忆 Redis TTL(秒), 超过此时间的对话上下文从 DB 重建
     redis-ttl-seconds: 1800
-    # 长期记忆滑动窗口(最近 N 条消息)
-    window-size: ${ROUTER_CONTEXT_RECENT_MESSAGE_WINDOW:10}
+    # H5 历史不使用此窗口；它只供旧的 Redis 对话上下文兼容路径使用。
+    window-size: ${CONVERSATION_SUMMARY_KEEP_MESSAGES:4}
     rolling-summary:
       # Summary runs after an assistant reply, never inside the SSE response.
-      enabled: ${ROUTER_ROLLING_SUMMARY_ENABLED:true}
-      recent-message-window: ${ROUTER_CONTEXT_RECENT_MESSAGE_WINDOW:10}
-      turn-threshold: ${ROUTER_SUMMARY_TURN_THRESHOLD:4}
-      char-threshold: ${ROUTER_SUMMARY_CHAR_THRESHOLD:4000}
-      max-chars: ${ROUTER_SUMMARY_MAX_CHARS:1600}
+      # This mirrors SummarizationMiddleware(trigger=("messages", 20), keep=("messages", 4)).
+      enabled: ${CONVERSATION_SUMMARY_ENABLED:${ROUTER_ROLLING_SUMMARY_ENABLED:true}}
+      trigger-message-count: ${CONVERSATION_SUMMARY_TRIGGER_MESSAGES:20}
+      keep-message-count: ${CONVERSATION_SUMMARY_KEEP_MESSAGES:4}
+      max-chars: ${CONVERSATION_SUMMARY_MAX_CHARS:${ROUTER_SUMMARY_MAX_CHARS:1600}}
     # 去重窗口:同一会话 + 相同内容 在 N 秒内仅处理一次
     dedup-window-seconds: 30
   sse:
