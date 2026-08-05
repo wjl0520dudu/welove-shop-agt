@@ -50,6 +50,34 @@ def test_router_uses_llm_for_simple_shopping_and_rewrites_question():
     asyncio.run(run())
 
 
+def test_router_prompt_defines_selection_vs_knowledge_boundary_without_keyword_routing():
+    async def run():
+        router = FakeStructuredRouter(IntentDecision(
+            mode="simple",
+            task_type="shopping",
+            confidence=0.95,
+            reason="用户要挑选商品",
+            canonical_question="敏感肌面霜怎么选？",
+        ))
+        graph = _graph_with_router(router)
+        result = await graph._route({
+            "question": "敏感肌面霜怎么选？",
+            "messages": [],
+            "business_memory": {},
+        })
+
+        prompt_text = "\n".join(
+            str(getattr(message, "content", "")) for message in router.messages
+        )
+        assert result["route"] == "shopping"
+        assert router.calls == 1
+        assert "先按用户要完成的动作判断" in prompt_text
+        assert "不要按问题里出现的品类、肤质、成分或功效词判断" in prompt_text
+        assert "敏感肌面霜怎么选？" in prompt_text
+
+    asyncio.run(run())
+
+
 def test_router_marks_compound_request_complex_without_generating_dag():
     async def run():
         router = FakeStructuredRouter(IntentDecision(
