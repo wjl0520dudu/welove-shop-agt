@@ -22,7 +22,7 @@ public interface ChatService {
     org.springframework.web.servlet.mvc.method.annotation.SseEmitter sendStreamMessage(
             Long userId, Long conversationId, String content, String imageUrl, String username,
             String jwtToken, String gender, String skinType, java.util.List<String> preferenceTags,
-            boolean retry);
+            boolean retry, String clientRequestId);
     /**
      * 多模态图文流式发送消息(SSE)。
      * <p>与 {@link #sendStreamMessage} 的区别:
@@ -36,7 +36,7 @@ public interface ChatService {
     org.springframework.web.servlet.mvc.method.annotation.SseEmitter sendMultimodalStreamMessage(
             Long userId, Long conversationId, String content, String imageUrl,
             String username, String jwtToken, String gender, String skinType,
-            java.util.List<String> preferenceTags, boolean retry);
+            java.util.List<String> preferenceTags, boolean retry, String clientRequestId);
     /**
      * 聊天图片上传:走 common-storage 的 StorageService,存到 OSS 后返回 {objectKey, url}。
      * <p>校验:MIME 必须是 image/*,大小 &le; 上限(默认 10MB,可通过配置调整)。</p>
@@ -58,5 +58,5 @@ public interface ChatService {
                                     List<Map<String, Object>> productCards,
                                     Map<String, Object> confirmCard,
                                     Map<String, Object> cartSelection,
-                                    String taskType, Long clientTs);
+                                    String taskType, Long clientTs, String clientRequestId);
 }

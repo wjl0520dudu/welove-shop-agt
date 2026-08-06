@@ -130,6 +130,10 @@ chat-service:
       max-chars: ${CONVERSATION_SUMMARY_MAX_CHARS:${ROUTER_SUMMARY_MAX_CHARS:1600}}
     # 去重窗口:同一会话 + 相同内容 在 N 秒内仅处理一次
     dedup-window-seconds: 30
+  concurrency:
+    # One visible AI turn per conversation.  The lease is slightly longer
+    # than the SSE timeout; normal terminal callbacks release it immediately.
+    turn-lock-lease-millis: ${CHAT_TURN_LOCK_LEASE_MILLIS:330000}
   sse:
     # SseEmitter 超时(毫秒)
     timeout: 300000

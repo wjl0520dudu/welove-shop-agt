@@ -19,6 +19,8 @@ public class Message implements Serializable {
     @Serial private static final long serialVersionUID = 1L;
     @TableId(type = IdType.AUTO) private Long id;
     private Long conversationId;
+    /** Request-scoped turn identifier shared by the corresponding user and assistant messages. */
+    private String turnId;
     private String role;
     private String content;
     private String messageType;

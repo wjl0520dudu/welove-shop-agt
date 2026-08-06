@@ -426,6 +426,7 @@ export default {
       }
 
       const assistant = this.makeMessage({ role: 'assistant', content: '', pending: true, streaming: true })
+      assistant.clientRequestId = this.createClientRequestId()
       this.messages.push(assistant)
       // Vue3: push 进响应式数组后，须取回数组内的响应式代理再改，
       // 否则改的是裸对象引用，不会触发重渲染（流式 token 收到了但聊天框不刷新）。
@@ -434,10 +435,12 @@ export default {
       this.setStreaming(true)
       this.scrollToBottom()
 
-      await this.runStream(conv.id, content, reactiveAssistant, true, false, hasImage ? imageUrl : '')
+      await this.runStream(conv.id, content, reactiveAssistant, true, false, hasImage ? imageUrl : '', assistant.clientRequestId)
     },
-    async runStream(conversationId, content, assistant, allowAuthRetry, retry = false, imageUrl = '') {
+    async runStream(conversationId, content, assistant, allowAuthRetry, retry = false, imageUrl = '', clientRequestId = '') {
       this._streamingConvId = conversationId
+      const turnId = clientRequestId || assistant.clientRequestId || this.createClientRequestId()
+      assistant.clientRequestId = turnId
       if (!supportsEventStream()) {
         if (imageUrl) {
           assistant.pending = false
@@ -451,7 +454,7 @@ export default {
         return
       }
 
-      const payload = this.buildPayload(conversationId, content, retry, imageUrl)
+      const payload = this.buildPayload(conversationId, content, retry, imageUrl, turnId)
       let gotText = false
       let streamError = null
       const callbacks = {
@@ -538,6 +541,10 @@ export default {
             assistant.errored = true
           }
           streamError = error || { message: '回复失败' }
+          const code = streamError && streamError.code
+          if (code === 'CHAT_CONVERSATION_BUSY' || code === 'CHAT_REQUEST_IN_PROGRESS') {
+            uni.showToast({ title: streamError.message || '当前会话正在回复，请稍后再试', icon: 'none' })
+          }
           this.syncCurrentStreaming()
         }
       }
@@ -585,7 +592,7 @@ export default {
         if ((err && (err.status === 401 || err.status === 403)) && allowAuthRetry && !gotText) {
           const refreshed = await refreshAccessToken().catch(() => false)
           if (refreshed) {
-            return this.runStream(conversationId, content, assistant, false, false, imageUrl)
+            return this.runStream(conversationId, content, assistant, false, retry, imageUrl, turnId)
           }
           this.syncCurrentStreaming()
           toLogin('/pages/chat/chat')
@@ -675,6 +682,7 @@ export default {
         confirmCard: assistant.confirmCard || null,
         cartSelection: assistant.cartSelection || null,
         taskType: assistant.taskType || '',
+        clientRequestId: assistant.clientRequestId || '',
         clientTs: Date.now()
       }
       stopStream(payload)
@@ -722,7 +730,8 @@ export default {
       this.setStreaming(true)
       this.scrollToBottom()
       try {
-        await this.runStream(conversationId, userContent, target, true, true)
+        target.clientRequestId = this.createClientRequestId()
+        await this.runStream(conversationId, userContent, target, true, true, '', target.clientRequestId)
         console.log('[retry] runStream resolved')
       } catch (e) {
         console.error('[retry] runStream rejected', e)
@@ -845,7 +854,7 @@ export default {
         learnedQuestions: this.learnedRecommended
       })
     },
-    buildPayload(conversationId, content, retry = false, imageUrl = '') {
+    buildPayload(conversationId, content, retry = false, imageUrl = '', clientRequestId = '') {
       const u = userStore.state.user || {}
       const payload = {
         userId: Number(u.id) || undefined,
@@ -856,7 +865,8 @@ export default {
         gender: u.gender,
         skinType: u.skinType,
         preferenceTags: this.normalizeTags(u.preferenceTags),
-        retry
+        retry,
+        clientRequestId
       }
       // 有图时加 imageUrl,后端 MultimodalStreamChatRequest DTO 会解析。
       // 纯文本请求不带此字段,兼容旧 StreamChatRequest。
@@ -867,6 +877,12 @@ export default {
       if (!tags) return []
       if (Array.isArray(tags)) return tags.filter(Boolean)
       return String(tags).split(/[,，、\s]+/).filter(Boolean)
+    },
+    createClientRequestId() {
+      if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID()
+      }
+      return `turn-${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`
     },
     titleFrom(content) {
       const text = String(content).trim()

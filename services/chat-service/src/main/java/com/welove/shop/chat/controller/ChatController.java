@@ -51,7 +51,8 @@ public class ChatController {
                 req.getGender(),
                 req.getSkinType(),
                 req.getPreferenceTags(),
-                req.isRetry()
+                req.isRetry(),
+                req.getClientRequestId()
         );
     }
 
@@ -77,7 +78,8 @@ public class ChatController {
                 req.getGender(),
                 req.getSkinType(),
                 req.getPreferenceTags(),
-                req.isRetry()
+                req.isRetry(),
+                req.getClientRequestId()
         );
     }
 
@@ -119,7 +121,8 @@ public class ChatController {
                 req.getConfirmCard(),
                 req.getCartSelection(),
                 req.getTaskType(),
-                req.getClientTs()
+                req.getClientTs(),
+                req.getClientRequestId()
         );
         return Result.ok(messageId);
     }

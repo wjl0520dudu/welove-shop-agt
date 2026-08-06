@@ -19,6 +19,8 @@ public class StreamChatRequest implements Serializable {
     private String gender;
     private String skinType;
     private List<String> preferenceTags;
+    /** Stable UUID for one user submit. Network retries must reuse it. */
+    private String clientRequestId;
     /** 是否为「重新生成」请求,后端据此跳过 dedup (避免 retry 触发相同的截断) */
     private boolean retry;
 }
