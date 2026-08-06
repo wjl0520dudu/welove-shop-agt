@@ -357,6 +357,12 @@ class AssistantGraph:
             str(task["id"]): index + 1
             for index, task in enumerate(tasks)
         }
+        # Keep per-task timing separate from the final DAG duration.  The
+        # first generated token exposes Agent/provider latency; the first
+        # visible token also includes ordered-publication waiting by design.
+        task_started_at: dict[str, float] = {}
+        first_agent_token_at: dict[str, float] = {}
+        first_visible_token_at: dict[str, float] = {}
         # Domain tasks in the same DAG level still execute concurrently, but
         # user-visible results must follow the Planner's semantic order.  A
         # later task may finish first; keep it buffered until every preceding
@@ -371,6 +377,14 @@ class AssistantGraph:
         def emit_visible_token(sequence: int, task_id: str, content: str) -> None:
             if not content:
                 return
+            first_visible_token_at.setdefault(task_id, time.perf_counter())
+            task_result = result_by_id.get(task_id)
+            started_at = task_started_at.get(task_id)
+            if task_result is not None and started_at is not None:
+                task_result["first_visible_token_ms"] = max(
+                    0,
+                    int((first_visible_token_at[task_id] - started_at) * 1000),
+                )
             if sequence not in displayed_sequences:
                 displayed_sequences.add(sequence)
                 if sequence > 1:
@@ -389,6 +403,7 @@ class AssistantGraph:
                 text = str(content or "")
                 if not text:
                     return
+                first_agent_token_at.setdefault(task_id, time.perf_counter())
                 if sequence == next_stream_sequence:
                     emit_visible_token(sequence, task_id, text)
                 else:
@@ -432,6 +447,7 @@ class AssistantGraph:
         for level_index, task_ids in enumerate(levels):
             async def run_level_task(task_id: str):
                 try:
+                    task_started_at[task_id] = time.perf_counter()
                     return task_id, await self._execute_subtask(
                         parent_state=state,
                         task=task_by_id[task_id],
@@ -474,6 +490,18 @@ class AssistantGraph:
                     )
                 else:
                     result_by_id[task_id] = result
+                started_at = task_started_at.get(task_id)
+                agent_token_at = first_agent_token_at.get(task_id)
+                visible_token_at = first_visible_token_at.get(task_id)
+                if started_at is not None:
+                    result_by_id[task_id]["first_agent_token_ms"] = (
+                        max(0, int((agent_token_at - started_at) * 1000))
+                        if agent_token_at is not None else None
+                    )
+                    result_by_id[task_id]["first_visible_token_ms"] = (
+                        max(0, int((visible_token_at - started_at) * 1000))
+                        if visible_token_at is not None else None
+                    )
                 completed_sequence = sequence_by_id[task_id]
                 stream_buffer[completed_sequence] = result_by_id[task_id]
                 publish_ready_results()
@@ -652,14 +680,23 @@ class AssistantGraph:
                     timeout=max(0.01, config.ORCHESTRATOR_TASK_TIMEOUT_SECONDS),
                 )
         except asyncio.TimeoutError:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            logger.warning(
+                "orchestrator task timeout task_id=%s route=%s timeout_s=%s duration_ms=%s",
+                task.get("id"),
+                route,
+                config.ORCHESTRATOR_TASK_TIMEOUT_SECONDS,
+                duration_ms,
+            )
             return self._failed_task_result(
                 task,
                 level_index=level_index,
                 status="timeout",
                 error_code=ErrorCode.ORCHESTRATOR_TASK_TIMEOUT,
                 message=f"子任务执行超过 {config.ORCHESTRATOR_TASK_TIMEOUT_SECONDS:g} 秒",
-                duration_ms=int((time.perf_counter() - started) * 1000),
+                duration_ms=duration_ms,
                 dependency_ids=[str(result.get("id")) for result in dependencies],
+                timeout_seconds=config.ORCHESTRATOR_TASK_TIMEOUT_SECONDS,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("orchestrator: 子任务执行失败 task_id=%s", task.get("id"))
@@ -708,6 +745,7 @@ class AssistantGraph:
             "error": has_error,
             "error_code": result.get("error_code"),
             "message": result.get("message"),
+            "timeout_seconds": result.get("timeout_seconds"),
         }
         evidence = [
             TaskEvidence(kind="product", ref_id=str(card.get("product_id") or card.get("id") or ""), facts=card).model_dump()
@@ -747,6 +785,10 @@ class AssistantGraph:
             "sources": result.get("sources") or [],
             "error_code": result.get("error_code"),
             "message": result.get("message"),
+            "duration_ms": result.get("duration_ms"),
+            "first_agent_token_ms": result.get("first_agent_token_ms"),
+            "first_visible_token_ms": result.get("first_visible_token_ms"),
+            "timeout_seconds": result.get("timeout_seconds"),
         }
         try:
             get_stream_writer()({"type": "subtask_result", "data": payload})
@@ -817,6 +859,7 @@ class AssistantGraph:
         status: str = "failed",
         duration_ms: int = 0,
         dependency_ids: list[str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         answer = (
             "这一部分依赖的前置任务没有成功，暂时无法继续。"
@@ -843,6 +886,7 @@ class AssistantGraph:
             "error": True,
             "error_code": error_code,
             "message": message,
+            "timeout_seconds": timeout_seconds,
         }
 
     async def _route(
@@ -1405,6 +1449,9 @@ class AssistantGraph:
                         "route_source": result.get("route_source"),
                         "fallback_used": bool(result.get("route_fallback_used")),
                         "duration_ms": result.get("duration_ms"),
+                        "first_agent_token_ms": result.get("first_agent_token_ms"),
+                        "first_visible_token_ms": result.get("first_visible_token_ms"),
+                        "timeout_seconds": result.get("timeout_seconds"),
                         "error_code": result.get("error_code"),
                     },
                 }

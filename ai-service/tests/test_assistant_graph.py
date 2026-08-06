@@ -294,6 +294,9 @@ def test_complex_stream_emits_completed_subtasks_before_final():
         assert [event["data"]["task_id"] for event in completed] == ["t1", "t2"]
         assert [event["data"]["sequence"] for event in completed] == [1, 2]
         assert all(event["data"]["answer"] == "" for event in completed)
+        assert all(isinstance(event["data"]["duration_ms"], int) for event in completed)
+        assert all(isinstance(event["data"]["first_agent_token_ms"], int) for event in completed)
+        assert all(isinstance(event["data"]["first_visible_token_ms"], int) for event in completed)
         assert event_types.index("subtask_result") < event_types.index("final")
         assert event_types.count("final") == 1
         assert event_types.count("done") == 1

@@ -18,7 +18,10 @@ class Config:
     ORCHESTRATOR_MAX_TASKS = int(os.getenv("ORCHESTRATOR_MAX_TASKS", "5"))
     ORCHESTRATOR_MAX_DEPTH = int(os.getenv("ORCHESTRATOR_MAX_DEPTH", "4"))
     ORCHESTRATOR_MAX_CONCURRENCY = int(os.getenv("ORCHESTRATOR_MAX_CONCURRENCY", "3"))
-    ORCHESTRATOR_TASK_TIMEOUT_SECONDS = float(os.getenv("ORCHESTRATOR_TASK_TIMEOUT_SECONDS", "30"))
+    # A Shopping DeepAgent normally needs several bounded steps (read skill,
+    # select a business tool, retrieve, then render).  Thirty seconds cuts off
+    # otherwise healthy concurrent tasks near their normal tail latency.
+    ORCHESTRATOR_TASK_TIMEOUT_SECONDS = float(os.getenv("ORCHESTRATOR_TASK_TIMEOUT_SECONDS", "60"))
 
     # 1b. Low-cost hybrid router. Rules only claim high-certainty cases; unresolved
     # requests use one structured LLM call and low-confidence results ask for clarification.
