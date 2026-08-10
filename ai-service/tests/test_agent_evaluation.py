@@ -1,6 +1,10 @@
+import json
+from pathlib import Path
+
 from evals.agent_contract import validate_agent_contract
+from evals.dataset_contract import GOLDEN_CASE_COUNT, SCENARIO_COUNTS, validate_golden_dataset
 from evals.agent_metrics import calculate_agent_metrics, compare_reports
-from evals.run_agent_eval import DEFAULT_DATASET, evaluate, load_jsonl
+from evals.run_agent_eval import DEFAULT_DATASET, _summarize_judge, evaluate, load_jsonl
 from evals.retrieval_metrics import retrieval_metrics_at_k
 
 
@@ -10,16 +14,16 @@ def _case(**expected):
 
 def test_contract_accepts_complete_multi_agent_result():
     case = _case(
-        routes=["orchestrator"], task_types=["orchestrator"],
+        routes=["complex"], task_types=["complex"],
         subtask_routes=["shopping", "knowledge"], required_tools=["search_*"],
         require_product_cards=True, product_categories=["防晒"], require_sse=True,
         max_latency_ms=1000,
     )
     observation = {
         "latency_ms": 800,
-        "sse_events": ["start", "final", "done"],
+        "sse_events": ["start", "token", "final", "done"],
         "response": {
-            "route": "orchestrator", "task_type": "orchestrator", "answer": "已完成推荐和说明。",
+            "route": "complex", "task_type": "complex", "answer": "已完成推荐和说明。",
             "product_cards": [{"product_id": 1, "title": "清爽防晒", "sub_category": "防晒"}],
             "sub_results": [
                 {"route": "shopping", "status": "success", "answer": "已推荐商品", "tool_calls": [{"tool_name": "search_products", "input_params": {}}]},
@@ -40,10 +44,36 @@ def test_contract_reports_route_and_sse_failures():
     assert {"route", "product_cards", "sse_final_done"}.issubset(result["failure_reasons"])
 
 
+def test_stream_sampling_requires_visible_token_in_order():
+    case = _case(routes=["shopping"])
+    base = {"response": {"route": "shopping", "answer": "ok"}, "sse_checked": True}
+    assert validate_agent_contract(case, {**base, "sse_events": ["start", "token", "final", "done"]})["passed"] is True
+    sampled = validate_agent_contract(case, {**base, "sse_events": ["start", "final", "done"]})
+    assert "sse_final_done" in sampled["failure_reasons"]
+
+
 def test_contract_accepts_legacy_product_search_capability_alias():
     result = validate_agent_contract(
         _case(required_tools=["search_products"]),
         {"response": {"answer": "已推荐", "tool_calls": [{"tool_name": "recommend_products"}]}},
+    )
+    assert result["passed"] is True
+
+
+def test_contract_accepts_current_skill_tools_for_legacy_capability_expectations():
+    result = validate_agent_contract(
+        _case(routes=["orchestrator"], task_types=["orchestrator"], required_tools=["recommend_products"]),
+        {
+            "response": {
+                "route": "complex",
+                "task_type": "complex",
+                "answer": "已完成推荐",
+                "tool_calls": [
+                    {"tool_name": "search_product_candidates", "input_params": {}},
+                    {"tool_name": "finalize_product_recommendation", "input_params": {}},
+                ],
+            },
+        },
     )
     assert result["passed"] is True
 
@@ -64,12 +94,51 @@ def test_metrics_treat_judge_as_task_success_gate_and_compare_baseline():
     assert comparison["new_failures"] == ["b"]
 
 
+def test_judge_metric_pass_rate_excludes_skipped_metrics_from_numerator_and_denominator():
+    rows = [
+        {
+            "judge": {
+                "enabled": True,
+                "passed": True,
+                "score": 1.0,
+                "metrics": {"tool_correctness": {"score": 1.0, "passed": True}},
+            }
+        },
+        {
+            "judge": {
+                "enabled": True,
+                "passed": True,
+                "score": 1.0,
+                "metrics": {
+                    "tool_correctness": {
+                        "score": None,
+                        "passed": True,
+                        "reason": "skipped: required_tools is not specified for this case",
+                    }
+                },
+            }
+        },
+    ]
+
+    tool_summary = _summarize_judge(rows)["metric_breakdown"]["tool_correctness"]
+
+    assert tool_summary["pass_rate"] == 1.0
+    assert tool_summary["sample_count"] == 1
+    assert tool_summary["skipped_count"] == 1
+
+
 def test_golden_dataset_is_stratified_and_evaluate_is_dependency_free():
     cases = load_jsonl(DEFAULT_DATASET)
-    # V2 数据集共 142 条 case，覆盖 5 大场景
-    assert len(cases) >= 130, f"Golden dataset shrunk unexpectedly: {len(cases)} cases"
+    assert len(cases) == GOLDEN_CASE_COUNT
+    assert validate_golden_dataset(cases) == []
     scenarios = {case["scenario"] for case in cases}
     assert {"shopping", "knowledge", "multimodal_shopping", "multi_agent", "chitchat"}.issubset(scenarios)
+    assert {scenario: sum(case["scenario"] == scenario for case in cases) for scenario in scenarios} == SCENARIO_COUNTS
+
+    manifest_path = Path(DEFAULT_DATASET).with_name("agent_golden_cases.manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["case_count"] == GOLDEN_CASE_COUNT
+    assert manifest["scenarios"] == SCENARIO_COUNTS
 
     case = _case(routes=["shopping"], task_types=["shopping"])
     report = evaluate([case], {"case-1": {"id": "case-1", "latency_ms": 12, "response": {"route": "shopping", "task_type": "shopping", "answer": "可以"}}})

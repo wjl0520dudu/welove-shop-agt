@@ -20,23 +20,23 @@ public interface ChatService {
     Message sendMessage(Long userId, Long conversationId, String content, String jwtToken);
     /** 流式发送消息(SSE) —— 返回 SseEmitter,Controller 层用。 */
     org.springframework.web.servlet.mvc.method.annotation.SseEmitter sendStreamMessage(
-            Long userId, Long conversationId, String content, String username,
+            Long userId, Long conversationId, String content, String imageUrl, String username,
             String jwtToken, String gender, String skinType, java.util.List<String> preferenceTags,
-            boolean retry);
+            boolean retry, String clientRequestId);
     /**
      * 多模态图文流式发送消息(SSE)。
      * <p>与 {@link #sendStreamMessage} 的区别:
      * <ul>
      *   <li>额外接收 {@code imageUrl}(先走 /chat/upload/image 拿到的 OSS URL)</li>
      *   <li>{@code content} 允许为空("纯图搜索"场景)</li>
-     *   <li>转发到 ai-service /assistant/multimodal/stream 而非 /assistant/stream</li>
+     *   <li>与文本请求共用 ai-service /assistant/stream，是否带图由 imageUrl 决定</li>
      *   <li>user 消息落库时 message_type=multimodal_image 且写入 image_url</li>
      * </ul></p>
      */
     org.springframework.web.servlet.mvc.method.annotation.SseEmitter sendMultimodalStreamMessage(
             Long userId, Long conversationId, String content, String imageUrl,
             String username, String jwtToken, String gender, String skinType,
-            java.util.List<String> preferenceTags, boolean retry);
+            java.util.List<String> preferenceTags, boolean retry, String clientRequestId);
     /**
      * 聊天图片上传:走 common-storage 的 StorageService,存到 OSS 后返回 {objectKey, url}。
      * <p>校验:MIME 必须是 image/*,大小 &le; 上限(默认 10MB,可通过配置调整)。</p>
@@ -58,5 +58,5 @@ public interface ChatService {
                                     List<Map<String, Object>> productCards,
                                     Map<String, Object> confirmCard,
                                     Map<String, Object> cartSelection,
-                                    String taskType, Long clientTs);
+                                    String taskType, Long clientTs, String clientRequestId);
 }

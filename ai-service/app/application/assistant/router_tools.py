@@ -1,6 +1,6 @@
 """Router 辅助工具集。
 
-**当前 Router 使用高确定性规则 + Structured LLM + 低置信度兜底。**
+**当前 Router 使用 Structured LLM 主理解，规则仅在模型不可用时兜底。**
 Router 本身不挂工具；这个模块保留编排拆分和上下文格式化 helper：
 
 - `detect_compound_intent`：文本层面的复合意图检测（纯规则，不调 LLM）。
@@ -139,8 +139,8 @@ def format_business_memory_for_router(memory: Optional[Dict[str, Any]]) -> str:
     Router 分类时把这段文本塞进 messages 前面（作为 SystemMessage 或注释），
     让 Router 能看到"上轮推荐了什么"，正确处理"第二个""刚才那个"类问题。
 
-    只保留 Router 需要的关键字段，避免 prompt 过长：
-    - 最多 5 个 last_product_cards（超过截断，仅保留 title + price）
+    保留 Router 需要的关键字段：
+    - 完整 last_product_cards 顺序（仅保留可绑定 ID、title、price）
     - last_focused_product 完整字段
     - user_preferences 精简字段
 
@@ -157,21 +157,32 @@ def format_business_memory_for_router(memory: Optional[Dict[str, Any]]) -> str:
 
     last_cards = memory.get("last_product_cards") or []
     if last_cards:
-        # 只保留前 5 个，且只留必要字段，避免 token 爆炸
+        # 保留完整顺序，让 Router 可以理解“第六款”“最后一款”等引用。
         card_lines: list[str] = []
-        for i, card in enumerate(last_cards[:5], 1):
-            title = card.get("title") or f"商品{card.get('product_id', 'N/A')}"
+        for i, card in enumerate(last_cards, 1):
+            product_id = card.get("product_id", card.get("id"))
+            title = card.get("title") or f"商品{product_id or 'N/A'}"
             price = card.get("price")
             price_str = f"¥{price}" if price is not None else "价格未知"
-            card_lines.append(f"  {i}. {title}（{price_str}）")
-        if len(last_cards) > 5:
-            card_lines.append(f"  … 另有 {len(last_cards) - 5} 个未列出")
+            card_lines.append(f"  {i}. [product_id={product_id}] {title}（{price_str}）")
         parts.append("[上轮推荐商品]\n" + "\n".join(card_lines))
 
     focused = memory.get("last_focused_product")
     if focused:
         title = focused.get("title") or f"商品{focused.get('product_id', 'N/A')}"
         parts.append(f"[当前关注商品] {title}")
+
+    pending_image = memory.get("pending_multimodal_choice") or {}
+    if isinstance(pending_image, dict) and str(pending_image.get("image_url") or "").strip():
+        image_subject = str(pending_image.get("image_subject") or "图片中的商品").strip()
+        text_target = str(pending_image.get("text_target") or "文字目标").strip()
+        parts.append(
+            "[图文冲突待确认]\n"
+            f"上一轮图片主体：{image_subject}\n"
+            f"上一轮文字目标：{text_target}\n"
+            "如果用户明确说“按图片/按图中这个找”，可把这张待确认图片用于本轮商品发现；"
+            "如果用户明确说“按文字找”，或发起新话题，则不要使用这张图片。"
+        )
 
     # 知识实体：Router 靠这个判断"第二个的成分"该走 knowledge 还是 shopping。
     # 有商品且无实体 → 商品指代；有实体且无商品 → 知识实体指代；两者都有由 prompt 里的

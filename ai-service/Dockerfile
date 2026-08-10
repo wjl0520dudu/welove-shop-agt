@@ -17,6 +17,10 @@ RUN pip install --upgrade pip \
 
 COPY main.py ./
 COPY app ./app
+# DeepAgent loads domain workflows from the read-only virtual /skills tree at
+# runtime.  Keeping Skills outside the image silently works in local source
+# runs but makes both ShoppingAgent and KnowledgeAgent fail in production.
+COPY skills ./skills
 
 EXPOSE 8000
 

@@ -6,20 +6,19 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # LangSmith 追踪初始化。必须在 import LangChain / langgraph 之前，让它们
-# 加载时能读到 LANGCHAIN_* 环境变量并自动挂钩。
-# 我们把 config 里的 LANGSMITH_* 映射到 LangChain 期望的 LANGCHAIN_* 前缀名。
+# 加载时能读到 LANGSMITH_* 环境变量并自动挂钩。
+# LangChain 1.x / LangGraph 1.x 使用 LANGSMITH_*；不再同时写入旧的
+# LANGCHAIN_* 前缀，避免两套配置发生覆盖或被误判为重复追踪。
 import os
 from app.infrastructure.config import config as _cfg
 if _cfg.LANGSMITH_TRACING and _cfg.LANGSMITH_API_KEY:
-    os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
-    os.environ.setdefault("LANGCHAIN_ENDPOINT", _cfg.LANGSMITH_ENDPOINT)
-    os.environ.setdefault("LANGCHAIN_API_KEY", _cfg.LANGSMITH_API_KEY)
-    os.environ.setdefault("LANGCHAIN_PROJECT", _cfg.LANGSMITH_PROJECT)
-    # 新版环境变量名也一起设，前后兼容
     os.environ.setdefault("LANGSMITH_TRACING", "true")
     os.environ.setdefault("LANGSMITH_ENDPOINT", _cfg.LANGSMITH_ENDPOINT)
     os.environ.setdefault("LANGSMITH_API_KEY", _cfg.LANGSMITH_API_KEY)
     os.environ.setdefault("LANGSMITH_PROJECT", _cfg.LANGSMITH_PROJECT)
+    os.environ.setdefault("LANGSMITH_ENVIRONMENT", _cfg.LANGSMITH_ENVIRONMENT)
+    os.environ.setdefault("LANGSMITH_HIDE_INPUTS", str(_cfg.LANGSMITH_HIDE_INPUTS).lower())
+    os.environ.setdefault("LANGSMITH_HIDE_OUTPUTS", str(_cfg.LANGSMITH_HIDE_OUTPUTS).lower())
 
 # 结构化日志必须尽早配置，让 lifespan 和后续 import 阶段的日志都用统一格式
 from app.api.logging_config import setup_logging

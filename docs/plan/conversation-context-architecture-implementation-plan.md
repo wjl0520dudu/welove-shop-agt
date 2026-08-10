@@ -58,3 +58,24 @@
 - Python 相关模块 `py_compile`；
 - `git diff --check`；
 - `mvn -pl services/chat-service -am compile -DskipTests`。
+
+## 统一滚动摘要实现（2026-08）
+
+当前上下文主链已收敛为：
+
+```text
+chat_svc.message（完整、权威原文，供 H5 全量回放）
+  → conversation_context.summary（已压缩且已覆盖的早期消息）
+  + 摘要覆盖点之后的未压缩可见消息
+  → resolve_context 组装唯一 messages
+  → Router / ChitchatAgent 共用
+```
+
+- `chat-service` 在助手消息落库后异步执行摘要更新；当前 SSE 回复不等待该 LLM 调用。
+- `conversation_context` 仍保持每会话一行；V7 的 `summary_covered_message_id` 记录摘要实际覆盖到的消息；V8 的 `summary_checkpoint_message_id` 记录上次完成批次时的最新消息。二者分开，才能保留最近原文而不缩短下一批次的触发周期。
+- 摘要仅接收用户/助手的可见文本、图片标记与展示商品卡关键字段；不输入 Tool、DAG、Judge、Prompt 或运行时状态。
+- `resolve_context` 将“持久化摘要 SystemMessage + 摘要后原文”作为同一份 LangChain messages 注入 Router 与 Chitchat；Shopping / Knowledge 继续只获取 Router 已消解的当前任务和绑定实体。
+- ChitchatAgent 不再独立使用 `SummarizationMiddleware`，避免与持久化摘要产生两份不同的会话事实。
+- 摘要策略复用 LangChain `SummarizationMiddleware` 的语义，但不把 Router 改成 Agent：`CONVERSATION_SUMMARY_TRIGGER_MESSAGES=20`，`CONVERSATION_SUMMARY_KEEP_MESSAGES=4`，`CONVERSATION_SUMMARY_MAX_CHARS=1600`。触发和持久化由 chat-service 完成；AI Service 只负责生成摘要与注入。
+
+默认策略为：每累计 20 条新增用户/助手可见消息（约 10 轮）异步更新一次摘要，摘要后保留最近 4 条可见原文（2 轮）。摘要未生成、生成失败或尚未落库时，`buildConversationHistory` 会保留全部尚未覆盖原文，绝不因压缩而丢失上下文。H5 的 `/chat/messages` 始终查询完整 `chat_svc.message`，不受模型上下文窗口影响。

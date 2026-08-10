@@ -1,0 +1,15 @@
+{"id":"boundary-shopping-001","query":"敏感肌面霜怎么选？","expected_route":"shopping"}
+{"id":"boundary-shopping-002","query":"油皮适合哪种防晒，预算 300 元？","expected_route":"shopping"}
+{"id":"boundary-shopping-003","query":"给我推荐适合痘肌的精华","expected_route":"shopping"}
+{"id":"boundary-shopping-004","query":"送妈妈护肤品买什么好？","expected_route":"shopping"}
+{"id":"boundary-shopping-005","query":"通勤耳机怎么选？","expected_route":"shopping"}
+{"id":"boundary-shopping-006","query":"适合跑步的跑鞋有哪些？","expected_route":"shopping"}
+{"id":"boundary-shopping-007","query":"给我挑一款清爽不黏的面霜","expected_route":"shopping"}
+{"id":"boundary-shopping-008","query":"想买一支含烟酰胺、适合油皮的精华","expected_route":"shopping"}
+{"id":"boundary-knowledge-001","query":"神经酰胺对敏感肌有什么作用？","expected_route":"knowledge"}
+{"id":"boundary-knowledge-002","query":"果酸和视黄醇能一起用吗？","expected_route":"knowledge"}
+{"id":"boundary-knowledge-003","query":"开放式耳机和入耳式耳机有什么区别？","expected_route":"knowledge"}
+{"id":"boundary-knowledge-004","query":"防晒多久补涂一次？","expected_route":"knowledge"}
+{"id":"boundary-knowledge-005","query":"烟酰胺应该怎么使用？","expected_route":"knowledge"}
+{"id":"boundary-knowledge-006","query":"水杨酸有什么风险？","expected_route":"knowledge"}
+{"id":"boundary-knowledge-007","query":"油皮为什么容易出油？","expected_route":"knowledge"}

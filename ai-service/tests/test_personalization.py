@@ -185,7 +185,7 @@ def test_preference_eval_metrics_reward_better_ordering():
 
 def test_request_profile_is_synced_without_user_service_roundtrip(monkeypatch):
     remember = AsyncMock()
-    monkeypatch.setattr("assistant.graph.remember_user_preferences", remember)
+    monkeypatch.setattr("app.application.assistant.graph.remember_user_preferences", remember)
     asyncio.run(AssistantGraph._sync_request_profile({
         "conversation_id": "c1",
         "user_id": 7,

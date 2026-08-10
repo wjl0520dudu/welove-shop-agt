@@ -25,7 +25,7 @@ import java.util.Map;
  * <ul>
  *   <li>仅暴露在公开白名单 {@code /auth/test-login},无需登录</li>
  *   <li>Redis 频控:同 IP 1 分钟最多 5 次,全局 1 分钟最多 100 次</li>
- *   <li>只读 5 个固定共享测试账号,不创建新用户(避免滥用)</li>
+ *   <li>每次创建独立的 is_test 体验账号，避免不同体验者共享用户数据</li>
  *   <li>响应结构和正常 /auth/login 一致,前端无感</li>
  * </ul>
  * <p>

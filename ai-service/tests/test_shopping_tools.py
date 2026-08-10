@@ -138,9 +138,9 @@ class TestSearchProductsByName:
         from app.domain.shopping.tools.shopping_tools import search_products_by_name
 
         async def run():
-            with patch("tools.shopping_tools.get_session_factory", return_value=mock_sf):
-                with patch("tools.shopping_tools.remember_product_cards", new_callable=AsyncMock):
-                    with patch("tools.shopping_tools.remember_focused_product", new_callable=AsyncMock):
+            with patch("app.domain.shopping.tools.shopping_tools.get_session_factory", return_value=mock_sf):
+                with patch("app.domain.shopping.tools.shopping_tools.remember_product_cards", new_callable=AsyncMock):
+                    with patch("app.domain.shopping.tools.shopping_tools.remember_focused_product", new_callable=AsyncMock):
                         runtime = _make_runtime()
                         result = await search_products_by_name.ainvoke({
                             "query": "粉底液",
@@ -162,7 +162,7 @@ class TestSearchProductsByName:
         from app.domain.shopping.tools.shopping_tools import search_products_by_name
 
         async def run():
-            with patch("tools.shopping_tools.get_session_factory", return_value=mock_sf):
+            with patch("app.domain.shopping.tools.shopping_tools.get_session_factory", return_value=mock_sf):
                 runtime = _make_runtime()
                 result = await search_products_by_name.ainvoke({
                     "query": "不存在的商品",
@@ -217,7 +217,7 @@ class TestListProductSkus:
         from app.domain.shopping.tools.shopping_tools import list_product_skus
 
         async def run():
-            with patch("tools.shopping_tools.get_session_factory", return_value=mock_sf):
+            with patch("app.domain.shopping.tools.shopping_tools.get_session_factory", return_value=mock_sf):
                 result = await list_product_skus.ainvoke({"product_id": 1})
             return result
 
@@ -234,7 +234,7 @@ class TestListProductSkus:
         from app.domain.shopping.tools.shopping_tools import list_product_skus
 
         async def run():
-            with patch("tools.shopping_tools.get_session_factory", return_value=mock_sf):
+            with patch("app.domain.shopping.tools.shopping_tools.get_session_factory", return_value=mock_sf):
                 result = await list_product_skus.ainvoke({"product_id": 99})
             return result
 

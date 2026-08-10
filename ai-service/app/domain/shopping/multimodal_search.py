@@ -9,10 +9,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence
 
-from app.infrastructure.retrieval.embeddings import get_embeddings
 from app.infrastructure.retrieval.multimodal_embeddings import (
     embed_fusion,
     embed_image,
@@ -24,6 +25,16 @@ from app.infrastructure.vectorstores.product.vector_store_v2 import get_product_
 from app.infrastructure.vectorstores.product.vector_store_three_path import get_product_milvus_store_three_path
 
 logger = logging.getLogger("ai-service.shopping.multimodal_search")
+
+# DashScope's image embedding and VL rerank SDK APIs are synchronous.  They
+# must never run on FastAPI/LangGraph's event loop: a slow upstream response
+# otherwise freezes unrelated requests (including /health/live).  A small,
+# shared executor also prevents repeatedly timed-out external calls from
+# creating an unbounded number of worker threads.
+_MULTIMODAL_RETRIEVAL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="shopping-multimodal",
+)
 
 
 def extract_explicit_product_filters(query_text: str) -> Dict[str, Any]:
@@ -178,8 +189,7 @@ def _recall_paths(
         text = query_text.strip()
 
         def dense_path():
-            query_vec = get_embeddings().embed_query(text)
-            return store.text_dense_search_by_vector(query_vec, filters=filters, top_k=recall_top_k)
+            return store.dense_search(text, filters=filters, top_k=recall_top_k)
 
         groups.append(_safe_path("text_dense", dense_path))
         groups.append(_safe_path("bm25", lambda: store.bm25_search(text, filters=filters, top_k=recall_top_k)))
@@ -207,21 +217,22 @@ def _recall_paths(
     return groups
 
 
-async def search_multimodal_v1(
+def recall_three_path_candidates(
     query_text: str,
-    query_image_url: str,
+    query_image_url: str | None = None,
+    *,
     top_k: int = 10,
     filters: Optional[Dict[str, Any]] = None,
+    store=None,
+    candidate_top_k: int | None = None,
 ) -> List[Dict[str, Any]]:
-    """接口①：三路融合 + qwen3-vl-rerank。"""
+    """Recall available production paths and fuse them with RRF.
+
+    Text only uses dense plus BM25, image only uses the image vector, and a
+    text/image request uses all three paths.  Reranking stays with the caller:
+    text requests use qwen3-rerank and image requests use qwen3-vl-rerank.
+    """
     top_k = max(int(top_k or 10), 1)
-    # 生产开关仅影响最终选择的三路 v1；v2-v5 仍使用实验 collection，
-    # 因为它们依赖生产 schema 刻意不保存的 multimodal_vector。
-    store = (
-        get_product_milvus_store_three_path()
-        if config.SHOPPING_MULTIMODAL_USE_THREE_PATH_COLLECTION
-        else get_product_milvus_store_v2()
-    )
     groups = _recall_paths(
         query_text=query_text,
         query_image_url=query_image_url,
@@ -231,7 +242,61 @@ async def search_multimodal_v1(
         store=store,
     )
     fused = rrf_fusion(groups, k=60)
-    candidates = fused[: top_k * 2]
+    return fused[:max(int(candidate_top_k or top_k), 1)]
+
+
+async def search_multimodal_v1(
+    query_text: str,
+    query_image_url: str,
+    top_k: int = 10,
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """三路融合 + qwen3-vl-rerank, isolated from the async event loop."""
+    timeout = max(0.1, float(config.SHOPPING_MULTIMODAL_RETRIEVAL_TIMEOUT_SECONDS))
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(
+        _MULTIMODAL_RETRIEVAL_EXECUTOR,
+        _search_multimodal_v1_sync,
+        query_text,
+        query_image_url,
+        top_k,
+        filters,
+    )
+    try:
+        return await asyncio.wait_for(future, timeout=timeout)
+    except TimeoutError:
+        # The SDK call may finish later in its bounded worker, but this request
+        # is released now and the event loop stays able to serve health/SSE.
+        logger.warning(
+            "multimodal retrieval timed out after %.1fs; returning control to caller",
+            timeout,
+        )
+        raise
+
+
+def _search_multimodal_v1_sync(
+    query_text: str,
+    query_image_url: str,
+    top_k: int,
+    filters: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Blocking portion of :func:`search_multimodal_v1`, run only in the pool."""
+    top_k = max(int(top_k or 10), 1)
+    # 生产开关仅影响最终选择的三路 v1；v2-v5 仍使用实验 collection，
+    # 因为它们依赖生产 schema 刻意不保存的 multimodal_vector。
+    store = (
+        get_product_milvus_store_three_path()
+        if config.SHOPPING_MULTIMODAL_USE_THREE_PATH_COLLECTION
+        else get_product_milvus_store_v2()
+    )
+    candidates = recall_three_path_candidates(
+        query_text=query_text,
+        query_image_url=query_image_url,
+        top_k=top_k,
+        filters=filters,
+        store=store,
+        candidate_top_k=top_k * 2,
+    )
     return multimodal_rerank(
         query_text=query_text,
         query_image_url=query_image_url,

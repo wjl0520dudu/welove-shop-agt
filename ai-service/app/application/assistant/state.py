@@ -7,8 +7,11 @@ from langgraph.graph import add_messages
 
 
 class AssistantState(TypedDict):
-    """Supervisor 共享状态。messages 通过 add_messages reducer 自动累积，
-    checkpointer 负责跨轮持久化，所有子节点共享同一份对话记忆。
+    """Supervisor 共享状态。
+
+    ``messages`` is the clean visible conversation used during one graph run.
+    chat-service is the cross-turn source of truth and refreshes this field on
+    every request; the checkpointer only persists runtime state for that run.
     """
     # ── 核心累积字段 ──
     messages: Annotated[list[AnyMessage], add_messages]
@@ -31,7 +34,21 @@ class AssistantState(TypedDict):
     # supplied by chat-service on every turn.  They are not LangGraph messages:
     # ContextResolver consumes the structured cards/image metadata first.
     conversation_history: NotRequired[list[dict[str, Any]]]
+    # Whether the request explicitly supplied ``conversation_history``.  The
+    # distinction matters for direct AI-service callers: an omitted field may
+    # safely fall back to the same-thread visible Checkpointer history, while
+    # an explicit empty list means the caller intentionally starts fresh.
+    conversation_history_supplied: NotRequired[bool]
+    # Persisted compressed prefix supplied by chat-service.  ContextResolver
+    # injects it once into ``messages`` so Router and Chitchat share exactly
+    # the same summary + recent original messages.
+    conversation_summary: NotRequired[str]
     context_resolution: NotRequired[dict[str, Any]]
+    canonical_question: NotRequired[str]
+    # Router-owned image retrieval semantics.  This is deliberately separate
+    # from the presence of text: a phrase such as “帮我找这个” can be a pure
+    # image search rather than a text/image retrieval constraint.
+    input_mode: NotRequired[str]
 
     # ── 路由节点产出 ──
     route: NotRequired[str]
@@ -57,6 +74,13 @@ class AssistantState(TypedDict):
     retrieved_contexts: NotRequired[list[str]]
     tool_calls: NotRequired[list[dict[str, Any]]]
     suggested_questions: NotRequired[list[str]]
+    capability: NotRequired[str]
+    dispatch_source: NotRequired[str]
+    model_call_count: NotRequired[int]
+    shopping_runtime: NotRequired[str]
+    knowledge_runtime: NotRequired[str]
+    skill_reads: NotRequired[list[str]]
+    script_calls: NotRequired[list[dict[str, Any]]]
 
     # ── 编排元数据 ──
     run_id: NotRequired[str]
@@ -73,11 +97,13 @@ class AssistantState(TypedDict):
     orchestrator_reason: NotRequired[str]
     sub_questions: NotRequired[list[dict[str, Any]]]
     active_subtask: NotRequired[dict[str, Any]]
-    subtask_heading: NotRequired[str]
     current_subquestion_index: NotRequired[int]
     sub_results: NotRequired[list[dict[str, Any]]]
     task_levels: NotRequired[list[list[str]]]
     dependency_context: NotRequired[list[dict[str, Any]]]
+    # In-process callback used only while a complex DAG task is executing.
+    # It is never persisted or exposed through the public response contract.
+    subtask_token_sink: NotRequired[Any]
     orchestrator_plan_error: NotRequired[str]
 
 
@@ -95,17 +121,17 @@ class ShoppingAgentState(AgentState):
     user_id: NotRequired[int | str]
     jwt_token: NotRequired[str]
     business_memory: NotRequired[dict[str, Any]]
+    # Router-owned binding and image scope.  Shopping tools may consume these
+    # values but must not infer a new binding from raw history.
+    selected_product_ids: NotRequired[list[int]]
+    image_url: NotRequired[str]
+    input_mode: NotRequired[str]
 
 
 class KnowledgeAgentState(AgentState):
-    """KnowledgeAgent 内部 state：继承 AgentState（含 messages），额外携带
-    conversation_id / user_id 给 ToolRuntime 里的工具读取。
+    """KnowledgeAgent 内部 state：仅携带当前问题的会话隔离信息。
 
-    KnowledgeAgent 也挂了 resolve_reference（跨 shopping/knowledge 的指代消解），
-    resolve_reference 要从 runtime.state 拿 conversation_id 去读 Store 里的
-    last_knowledge_entities / last_product_cards。
-
-    KnowledgeAgent 不调 Java 后端，所以不需要 jwt_token。
+    跨轮实体消解由主路由完成；KnowledgeAgent 不读取历史业务记忆。
     """
     conversation_id: NotRequired[str]
     user_id: NotRequired[int | str]

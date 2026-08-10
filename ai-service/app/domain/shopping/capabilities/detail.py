@@ -6,19 +6,12 @@ resolve_single_product(query, product_id, context)
   ↓ 未找到 → clarify
 load_product_detail(pid)             (复用 tools.shopping_tools 内部逻辑)
   ↓
-extract_focus(query)                  # price/stock/sku/overview/suitability/ingredients
-  ↓
-build_facts(product, focus)
+build_complete_facts(product)
   ↓
 DetailToolResult
 ```
 
-## focus 分派
-- price     → 返回 base_price + SKU 价位区间
-- stock/sku → 返回 SKU 列表（含 stock）
-- overview  → 返回 description + tags
-- suitability → 返回 tags 中"适合"相关的关键词 + rating
-- ingredients → 用旧 LLM 特征抽取 core_ingredients / concentration
+旧回滚 Tool 返回完整商品事实，不再通过关键词 focus 限制详情问法。
 """
 
 from __future__ import annotations
@@ -26,34 +19,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from app.infrastructure.persistence.memory import remember_focused_product
 from app.domain.shopping.cards import build_product_card_from_detail
 from app.domain.shopping.schemas import DetailToolResult, ShoppingContext
-from app.application.assistant.reference_tools import (
-    _resolve_implicit,
-    _resolve_ordinal,
-    _resolve_pronominal,
-)
-from app.domain.shopping.tools.shopping_tools import _extract_product_features
 
 logger = logging.getLogger("ai-service.shopping.detail")
-
-
-_FOCUS_KEYWORDS: Dict[str, List[str]] = {
-    "price": ["多少钱", "价格", "什么价"],
-    "stock": ["有货", "库存", "缺货", "现货"],
-    "sku": ["规格", "色号", "尺寸", "型号", "版本"],
-    "suitability": ["适合我", "适合什么肤质", "肤质合适"],
-    "ingredients": ["成分", "含有什么", "什么成分"],
-    # overview 兜底
-}
-
-
-def _extract_focus(query: str) -> str:
-    for focus, keywords in _FOCUS_KEYWORDS.items():
-        if any(k in query for k in keywords):
-            return focus
-    return "overview"
 
 
 def _resolve_product_id(
@@ -61,50 +30,24 @@ def _resolve_product_id(
     product_id: Optional[int],
     ctx: ShoppingContext,
 ) -> Optional[int]:
-    """从四种来源定位 product_id：
-    1. 显式 product_id 参数
-    2. query 中的指代（第二个/刚才那个/它）
-    3. last_focused_product 兜底
-    4. last_product_cards 只有一张卡 → 就是它（用户"有其他色号吗"）
-    """
-    if product_id:
-        return int(product_id)
+    """Return a Router-bound product id and never parse history locally."""
+    del query  # Router already resolves cross-turn references before this tool.
+    bound_ids: list[int] = []
+    for value in ctx.selected_product_ids:
+        try:
+            bound_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if bound_id > 0 and bound_id not in bound_ids:
+            bound_ids.append(bound_id)
 
-    if ctx.last_product_cards:
-        # 序号
-        r = _resolve_ordinal(query, ctx.last_product_cards)
-        if r and r.get("matched_product"):
-            pid = r["matched_product"].get("product_id")
-            if pid:
-                return int(pid)
-
-        # 代词
-        r = _resolve_pronominal(query, ctx.last_focused_product, ctx.last_product_cards)
-        if r and r.get("matched_product"):
-            pid = r["matched_product"].get("product_id")
-            if pid:
-                return int(pid)
-
-    # 隐式："多少钱/有货吗" 指向 last_focused_product
-    r = _resolve_implicit(query, ctx.last_focused_product)
-    if r and r.get("matched_product"):
-        pid = r["matched_product"].get("product_id")
-        if pid:
-            return int(pid)
-
-    # 单一 focused_product 兜底
-    if ctx.last_focused_product:
-        pid = ctx.last_focused_product.get("product_id")
-        if pid:
-            return int(pid)
-
-    # 上一轮只有 1 张卡：追问必然指向它
-    if len(ctx.last_product_cards) == 1:
-        pid = ctx.last_product_cards[0].get("product_id")
-        if pid:
-            return int(pid)
-
-    return None
+    if product_id is not None:
+        try:
+            requested = int(product_id)
+        except (TypeError, ValueError):
+            return None
+        return requested if requested in bound_ids else None
+    return bound_ids[0] if len(bound_ids) == 1 else None
 
 
 async def _load_product_detail_raw(product_id: int) -> Dict[str, Any]:
@@ -118,7 +61,9 @@ async def _load_product_detail_raw(product_id: int) -> Dict[str, Any]:
       PG 里没这个商品的 SKU 就返回空列表 —— 上层根据 facts["skus"] 是否为空决定
       是否报"暂无 SKU"。
     """
-    from app.infrastructure.vectorstores.product.vector_store import get_product_milvus_store
+    from app.infrastructure.vectorstores.product.active_store import (
+        get_active_product_store as get_product_milvus_store,
+    )
 
     # ── 1. 从 Milvus 拿主档 ──
     try:
@@ -191,55 +136,26 @@ async def _load_product_detail_raw(product_id: int) -> Dict[str, Any]:
     return data
 
 
-def _build_facts(product: Dict[str, Any], focus: str) -> Dict[str, Any]:
-    """按 focus 组装 facts 字段。"""
+def _build_complete_facts(product: Dict[str, Any]) -> Dict[str, Any]:
+    """Return all trusted fields so the Agent can answer open detail questions."""
     skus: List[Dict[str, Any]] = product.get("skus") or []
-    if focus == "price":
-        prices = [s["price"] for s in skus if s.get("price") is not None]
-        return {
-            "price": product.get("price"),
-            "base_price": product.get("base_price"),
-            "sku_price_range": (min(prices), max(prices)) if prices else None,
-            "sku_count": len(skus),
-        }
-    if focus in ("stock", "sku"):
-        total_stock = sum(int(s.get("stock") or 0) for s in skus)
-        return {
-            "skus": skus,
-            "sku_count": len(skus),
-            "total_stock": total_stock,
-            "in_stock": total_stock > 0,
-        }
-    if focus == "suitability":
-        tags = product.get("tags") or ""
-        return {
-            "tags": tags,
-            "rating": product.get("rating"),
-            "sales_count": product.get("sales_count"),
-            "sub_category": product.get("sub_category"),
-        }
-    # overview 兜底
+    prices = [sku["price"] for sku in skus if sku.get("price") is not None]
+    total_stock = sum(int(sku.get("stock") or 0) for sku in skus)
     return {
+        "price": product.get("price"),
+        "base_price": product.get("base_price"),
+        "sku_price_range": (min(prices), max(prices)) if prices else None,
+        "skus": skus,
+        "sku_count": len(skus),
+        "total_stock": total_stock,
+        "in_stock": total_stock > 0 if skus else None,
         "description": product.get("description") or "",
         "tags": product.get("tags") or "",
         "rating": product.get("rating"),
         "sales_count": product.get("sales_count"),
         "brand": product.get("brand"),
-    }
-
-
-async def _build_facts_ingredients(product: Dict[str, Any]) -> Dict[str, Any]:
-    """成分类问法：走一次 LLM 特征抽取。"""
-    features_map = await _extract_product_features([product])
-    pid = int(product.get("product_id") or product.get("id", 0))
-    features = features_map.get(pid)
-    if features is None:
-        return {"core_ingredients": [], "concentration": "", "cautions": []}
-    return {
-        "core_ingredients": features.core_ingredients,
-        "concentration": features.concentration,
-        "cautions": features.cautions,
-        "suitable_skin": features.suitable_skin,
+        "category": product.get("category"),
+        "sub_category": product.get("sub_category"),
     }
 
 
@@ -253,6 +169,7 @@ class DetailCapability:
         trace: List[Dict[str, Any]] = []
 
         pid = _resolve_product_id(query, product_id, context)
+        del query  # The Agent understands the open detail question.
         trace.append({"step": "resolve_product", "output": {"product_id": pid}})
         if pid is None:
             return DetailToolResult(
@@ -265,7 +182,7 @@ class DetailCapability:
             )
 
         product = await _load_product_detail_raw(pid)
-        if not product:
+        if not product or (product.get("status") is not None and int(product.get("status") or 0) != 1):
             return DetailToolResult(
                 action="empty",
                 empty_reason=f"商品 {pid} 不存在或已下架。",
@@ -273,21 +190,17 @@ class DetailCapability:
             )
         trace.append({"step": "load_detail", "output": {"product_id": pid}})
 
-        focus = _extract_focus(query)
-        trace.append({"step": "extract_focus", "output": focus})
+        facts = _build_complete_facts(product)
 
-        if focus == "ingredients":
-            facts = await _build_facts_ingredients(product)
-        else:
-            facts = _build_facts(product, focus)
-
+        # Product focus is intentionally not persisted here.  Cross-turn
+        # product references are resolved once by the Router from the rendered
+        # card set, rather than reconstructed by a lower Shopping capability.
         card = build_product_card_from_detail(product)
-        await remember_focused_product(context.conversation_id, context.user_id, card)
 
         return DetailToolResult(
             action="detail",
             product=product,
-            focus=focus,  # type: ignore[arg-type]
+            focus=None,
             facts=facts,
             product_cards=[card],
             trace=trace,

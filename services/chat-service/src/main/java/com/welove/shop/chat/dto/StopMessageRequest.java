@@ -25,6 +25,8 @@ public class StopMessageRequest implements Serializable {
     private Map<String, Object> confirmCard;
     private Map<String, Object> cartSelection;
     private String taskType;
+    /** Matches StreamChatRequest.clientRequestId so an interrupted turn updates its own assistant message. */
+    private String clientRequestId;
     /** 客户端发起 stop 的 unix 毫秒时间戳,用于和后端 doOnCancel 落库做时序对照。 */
     private Long clientTs;
 }

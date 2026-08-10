@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from app.infrastructure.retrieval.embeddings import _build_search_text_v2
 from app.infrastructure.retrieval.multimodal_embeddings import DashScopeMultimodalEmbeddings
-from app.domain.shopping.multimodal_search import rrf_fusion, weighted_rerank
+from app.domain.shopping.multimodal_search import recall_three_path_candidates, rrf_fusion, weighted_rerank
 from app.infrastructure.vectorstores.product.vector_store_v2 import INSERT_FIELDS_V2, OUTPUT_FIELDS_V2, _build_fields_v2
 
 
@@ -91,6 +91,27 @@ class TestFusionRanking:
         assert ranked[0]["weighted_score"] == 0.3
         assert "weighted_ranker" in ranked[0]["recall_sources"]
 
+    def test_three_path_recall_selects_only_text_fields_without_image(self):
+        store = MagicMock()
+        store.dense_search.return_value = [
+            {"product_id": 1, "score": 0.9, "recall_sources": ["text_dense"]},
+        ]
+        store.bm25_search.return_value = [
+            {"product_id": 1, "score": 10.0, "recall_sources": ["bm25"]},
+        ]
+
+        out = recall_three_path_candidates(
+            query_text="小棕瓶精华",
+            top_k=5,
+            store=store,
+        )
+
+        assert [item["product_id"] for item in out] == [1]
+        assert set(out[0]["recall_sources"]) == {"text_dense", "bm25"}
+        store.dense_search.assert_called_once()
+        store.bm25_search.assert_called_once()
+        assert not store.image_vector_search.called
+
 
 class TestMultimodalRerank:
     def test_rerank_exception_falls_back_to_original_order(self):
@@ -104,7 +125,7 @@ class TestMultimodalRerank:
             {"product_id": 2, "title": "B", "image_url": "http://example.com/b.jpg"},
         ]
 
-        with patch("rag.multimodal_embeddings.TextReRank.call", side_effect=RuntimeError("boom")):
+        with patch("app.infrastructure.retrieval.multimodal_embeddings.TextReRank.call", side_effect=RuntimeError("boom")):
             out = client.multimodal_rerank("query", "http://example.com/q.jpg", docs, top_n=1)
 
         assert out == [docs[0]]
@@ -122,7 +143,7 @@ class TestMultimodalRerank:
             {"product_id": 2, "title": "B", "recall_sources": ["image"]},
         ]
 
-        with patch("rag.multimodal_embeddings.TextReRank.call", return_value=resp):
+        with patch("app.infrastructure.retrieval.multimodal_embeddings.TextReRank.call", return_value=resp):
             out = client.multimodal_rerank("query", None, docs, top_n=2)
 
         assert [item["product_id"] for item in out] == [2, 1]
@@ -134,7 +155,7 @@ class TestMultimodalRerank:
         """服务性错误（网络异常、超时等）→ 降级零向量，不抛异常。"""
         client = DashScopeMultimodalEmbeddings(api_key="test-key", image_dim=3, base_url="")
 
-        with patch("rag.multimodal_embeddings.MultiModalEmbedding.call", side_effect=RuntimeError("boom")):
+        with patch("app.infrastructure.retrieval.multimodal_embeddings.MultiModalEmbedding.call", side_effect=RuntimeError("boom")):
             assert client.embed_image("http://example.com/a.jpg") == [0.0, 0.0, 0.0]
 
     def test_image_embedding_image_error_raises(self):
@@ -149,7 +170,7 @@ class TestMultimodalRerank:
         fake_resp.code = "InvalidParameter"
         fake_resp.message = "Image URL or Base64 is invalid"
 
-        with patch("rag.multimodal_embeddings.MultiModalEmbedding.call", return_value=fake_resp):
+        with patch("app.infrastructure.retrieval.multimodal_embeddings.MultiModalEmbedding.call", return_value=fake_resp):
             import pytest
             with pytest.raises(MultimodalImageError) as exc:
                 client.embed_image("http://example.com/broken.jpg")
@@ -169,7 +190,7 @@ class TestMultimodalRerank:
         fake_resp.code = "InvalidURL"
         fake_resp.message = "invalid image url"
 
-        with patch("rag.multimodal_embeddings.MultiModalEmbedding.call", return_value=fake_resp):
+        with patch("app.infrastructure.retrieval.multimodal_embeddings.MultiModalEmbedding.call", return_value=fake_resp):
             import pytest
             with pytest.raises(MultimodalImageError):
                 client.embed_fusion("text", "http://example.com/broken.jpg")

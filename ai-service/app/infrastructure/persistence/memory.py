@@ -192,6 +192,43 @@ async def clear_pending_shopping_need(
         await _set_conversation(conversation_id, memory)
 
 
+# ---- pending_multimodal_choice（图文冲突后的图片选择）----------------------
+
+async def remember_pending_multimodal_choice(
+    conversation_id: Optional[str],
+    user_id: Optional[int | str],
+    pending: Dict[str, Any],
+) -> None:
+    """Persist the one image a conflict clarification is waiting to resolve.
+
+    This is deliberately conversation-scoped and short-lived.  It is neither
+    a user preference nor a general image history: Router may reuse it only
+    when the very next follow-up explicitly selects the image interpretation.
+    """
+    del user_id  # Conversation scope is intentional; keep the public API uniform.
+    image_url = str((pending or {}).get("image_url") or "").strip()
+    if not image_url:
+        return
+    memory = await _get_conversation(conversation_id)
+    memory["pending_multimodal_choice"] = {
+        "image_url": image_url,
+        "image_subject": str((pending or {}).get("image_subject") or "").strip(),
+        "text_target": str((pending or {}).get("text_target") or "").strip(),
+    }
+    await _set_conversation(conversation_id, memory)
+
+
+async def clear_pending_multimodal_choice(
+    conversation_id: Optional[str],
+    user_id: Optional[int | str],
+) -> None:
+    """Discard a consumed or abandoned conflict-clarification image."""
+    del user_id
+    memory = await _get_conversation(conversation_id)
+    if memory.pop("pending_multimodal_choice", None) is not None:
+        await _set_conversation(conversation_id, memory)
+
+
 async def remember_user_preferences(
     conversation_id: Optional[str],
     user_id: Optional[int | str],

@@ -12,7 +12,17 @@ from fnmatch import fnmatchcase
 from typing import Any
 
 
-_TOOL_ALIASES = {"search_products": {"recommend_products"}}
+_TOOL_ALIASES = {
+    # Golden Dataset 用面向能力的高层名字；当前 Skills runtime 会把推荐
+    # 展开成候选召回 + 最终整理两个真实工具。两者都属于 recommend 能力。
+    "recommend_products": {"search_product_candidates", "finalize_product_recommendation"},
+    "search_products": {"recommend_products", "search_product_candidates", "finalize_product_recommendation"},
+    "search_multimodal_v1": {"search_product_candidates"},
+}
+_ROUTE_ALIASES = {
+    "orchestrator": {"complex"},
+    "complex": {"orchestrator"},
+}
 
 
 def validate_agent_contract(case: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
@@ -33,12 +43,20 @@ def validate_agent_contract(case: dict[str, Any], observation: dict[str, Any]) -
     expected_routes = _as_strings(expected.get("routes") or expected.get("route"))
     actual_route = str(response.get("route") or response.get("task_type") or "unknown")
     if expected_routes:
-        check("route", actual_route in expected_routes, f"expected={expected_routes}, actual={actual_route}")
+        check(
+            "route",
+            any(actual_route == expected or actual_route in _ROUTE_ALIASES.get(expected, set()) for expected in expected_routes),
+            f"expected={expected_routes}, actual={actual_route}",
+        )
 
     expected_types = _as_strings(expected.get("task_types") or expected.get("task_type"))
     actual_type = str(response.get("task_type") or "unknown")
     if expected_types:
-        check("task_type", actual_type in expected_types, f"expected={expected_types}, actual={actual_type}")
+        check(
+            "task_type",
+            any(actual_type == expected or actual_type in _ROUTE_ALIASES.get(expected, set()) for expected in expected_types),
+            f"expected={expected_types}, actual={actual_type}",
+        )
 
     expected_error_codes = _as_strings(expected.get("error_codes"))
     if expected_error_codes:
@@ -111,9 +129,13 @@ def validate_agent_contract(case: dict[str, Any], observation: dict[str, Any]) -
         check("latency", actual_latency is not None and float(actual_latency) <= float(max_latency_ms),
               f"limit={max_latency_ms}, actual={actual_latency}")
 
-    if expected.get("require_sse"):
-        events = {str(event).lower() for event in observation.get("sse_events") or []}
-        check("sse_final_done", {"final", "done"}.issubset(events), f"events={sorted(events)}")
+    # ``require_sse`` is a Golden Case contract. ``sse_checked`` is set by the
+    # offline evaluator's --include-stream sampling mode. Both use the same
+    # strict sequence validation, so the Experiment and local report cannot
+    # disagree about a streaming regression.
+    if expected.get("require_sse") or observation.get("sse_checked"):
+        events = [str(event).lower() for event in observation.get("sse_events") or []]
+        check("sse_final_done", _valid_sse_sequence(events), f"events={events}")
 
     failures = [item for item in checks if not item["passed"]]
     return {
@@ -184,3 +206,22 @@ def _as_strings(value: Any) -> list[str]:
 
 def _tool_matches(expected_pattern: str, actual_name: str) -> bool:
     return fnmatchcase(actual_name, expected_pattern) or actual_name in _TOOL_ALIASES.get(expected_pattern, set())
+
+
+def _valid_sse_sequence(events: list[str]) -> bool:
+    """Validate the visible terminal SSE lifecycle without internal events.
+
+    The assistant can emit route/tool/subtask events between these markers.
+    A successful visible answer must start, produce at least one token, then
+    finish and terminate in that order. Error-only streams are intentionally
+    not considered successful SSE output.
+    """
+
+    try:
+        start = events.index("start")
+        token = events.index("token")
+        final = events.index("final")
+        done = events.index("done")
+    except ValueError:
+        return False
+    return start < token < final < done

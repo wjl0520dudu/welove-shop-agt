@@ -7,7 +7,7 @@ Milvus/reranker 全 mock，pgvector 只在测降级路径时用。
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.domain.shopping.retrieval import (
     ShoppingRetriever,
@@ -19,6 +19,7 @@ from app.domain.shopping.retrieval import (
     build_retrieval_plan,
 )
 from app.domain.shopping.schemas import ShoppingNeed, ShoppingRetrievalPlan
+from app.infrastructure.config import config
 
 
 # ---- build_retrieval_plan ------------------------------------------------
@@ -34,17 +35,14 @@ class TestBuildRetrievalPlan:
     def test_filters_only_include_given_fields(self):
         need = ShoppingNeed(category="防晒", budget_max=200)
         plan = build_retrieval_plan(need)
-        assert plan.filters["category"] == "防晒"
         assert plan.filters["status"] == 1
-        assert plan.filters["budget_max"] == 200
-        assert "budget_min" not in plan.filters
-        assert "brand" not in plan.filters
+        assert set(plan.filters) == {"status"}
 
-    def test_only_category_is_relaxed(self):
+    def test_user_constraints_are_left_for_candidate_judge(self):
         need = ShoppingNeed(category="防晒", budget_max=200)
         plan = build_retrieval_plan(need)
-        assert plan.relaxed_filters == [{"status": 1, "budget_max": 200}]
-        assert plan.hard_filters["budget_max"] == 200
+        assert plan.relaxed_filters == []
+        assert plan.hard_filters == {"status": 1}
 
     def test_no_relaxed_pass_for_unknown_category(self):
         plan = build_retrieval_plan(ShoppingNeed(category="提神饮品", budget_max=200))
@@ -52,13 +50,13 @@ class TestBuildRetrievalPlan:
 
     def test_alias_category_is_normalized_before_filtering(self):
         plan = build_retrieval_plan(ShoppingNeed(category="抗初老精华"))
-        assert plan.filters["category"] == "精华"
-        assert plan.hard_filters["category"] == "精华"
+        assert plan.filters == {"status": 1}
+        assert plan.hard_filters == {"status": 1}
 
     def test_unknown_category_remains_semantic_only(self):
         plan = build_retrieval_plan(ShoppingNeed(category="提神饮品"))
-        assert "category" not in plan.filters
-        assert "category" not in plan.hard_filters
+        assert plan.filters == {"status": 1}
+        assert plan.hard_filters == {"status": 1}
 
     def test_use_rerank_true_in_phase_1b(self):
         """Phase 1b 默认走 rerank 两阶段。"""
@@ -112,14 +110,15 @@ class TestPlanToMilvusFilters:
         need = ShoppingNeed(category="防晒", brand="X", budget_max=200)
         plan = ShoppingRetrievalPlan()
         f = _plan_to_milvus_filters(plan, need)
-        assert f == {"category": "防晒", "brand": "X", "budget_max": 200}
+        assert f == {}
 
     def test_plan_filters_override_need(self):
         need = ShoppingNeed(category="防晒")
         plan = ShoppingRetrievalPlan(filters={"category": "面霜"})
         f = _plan_to_milvus_filters(plan, need)
-        # plan 已经有 category，从 need 就不再覆盖
-        assert f["category"] == "面霜"
+        # Natural-language category filters are intentionally ignored by the
+        # datastore adapter; only system-owned availability is filterable.
+        assert f == {}
 
 
 class TestRelaxedToMilvusFilters:
@@ -268,8 +267,33 @@ class TestShoppingRetriever:
         # search 被调用时 mode=dense
         assert milvus.search.call_args.kwargs["mode"] == "dense"
 
-    def test_category_fallback_when_filter_returns_zero(self):
-        """category filter 命中 0 条时，去掉 category 再来一次（"护肤品"这类泛化词兜底）。"""
+    def test_three_path_hybrid_uses_text_dense_and_bm25_before_rerank(self):
+        store = MagicMock()
+        store.is_three_path_collection = True
+        store.dense_search.return_value = [
+            {"product_id": 1, "title": "A", "score": 0.9, "recall_sources": ["text_dense"]},
+            {"product_id": 2, "title": "B", "score": 0.8, "recall_sources": ["text_dense"]},
+        ]
+        store.bm25_search.return_value = [
+            {"product_id": 2, "title": "B", "score": 9.0, "recall_sources": ["bm25"]},
+            {"product_id": 1, "title": "A", "score": 8.0, "recall_sources": ["bm25"]},
+        ]
+        rerank = self._rerank_mock([(1, 0.9), (0, 0.8)])
+        retriever = ShoppingRetriever(milvus_store=store, reranker=rerank)
+
+        with patch.object(config, "SHOPPING_MULTIMODAL_USE_THREE_PATH_COLLECTION", True):
+            out, trace = asyncio.run(retriever.retrieve(
+                ShoppingRetrievalPlan(top_k=2, initial_top_k=2, use_rerank=True),
+                ShoppingNeed(category="防晒"),
+            ))
+
+        assert [item["product_id"] for item in out] == [2, 1]
+        assert set(out[0]["recall_sources"]) >= {"text_dense", "bm25", "rerank"}
+        store.dense_search.assert_called_once()
+        store.bm25_search.assert_called_once()
+        assert any(item["source"] == "milvus_three_path_hybrid" for item in trace)
+
+    def test_category_fallback_is_removed(self):
         milvus = MagicMock()
         # 第一次带 category="护肤品" filter 返回空
         # 第二次无 category filter 返回 3 条
@@ -289,12 +313,6 @@ class TestShoppingRetriever:
         need = ShoppingNeed(category="护肤品", budget_max=300)
         out, trace = asyncio.run(retriever.retrieve(plan, need))
 
-        # 第二次 search 应该不带 category
-        second_call_filters = milvus.search.call_args_list[1].kwargs["filters"]
-        assert "category" not in second_call_filters
-        assert "budget_max" in second_call_filters   # 保留其他 filter
-
-        # trace 应该有 fallback 标记
-        assert any("no_cat" in t.get("source", "") for t in trace)
-        # 输出有结果
-        assert len(out) == 3
+        assert len(milvus.search.call_args_list) == 1
+        assert milvus.search.call_args.kwargs["filters"] == {}
+        assert out == []

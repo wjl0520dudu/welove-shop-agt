@@ -54,9 +54,7 @@ public class ConversationContextServiceImpl implements ConversationContextServic
 
     @Override
     public void updateConversationContext(Long conversationId, Long userId, Message newMessage) {
-        String key = REDIS_PREFIX + conversationId;
-        redisTemplate.delete(key);
-        // 感知:触发长期记忆保存(简化版,不计算重要性)
+        invalidateConversationContext(conversationId);
         ConversationContext ctx = new ConversationContext();
         ctx.setConversationId(conversationId);
         ctx.setUserId(userId);
@@ -64,7 +62,28 @@ public class ConversationContextServiceImpl implements ConversationContextServic
         ctx.setImportanceScore(0.5);
         ctx.setUpdateTime(LocalDateTime.now());
         ctx.setCreateTime(LocalDateTime.now());
-        ctxMapper.insert(ctx);
+        ctxMapper.upsertActivity(ctx);
+    }
+
+    @Override
+    public void invalidateConversationContext(Long conversationId) {
+        redisTemplate.delete(REDIS_PREFIX + conversationId);
+    }
+
+    @Override
+    public ConversationContext getRollingSummaryContext(Long conversationId) {
+        return ctxMapper.selectByConversationId(conversationId);
+    }
+
+    @Override
+    public boolean updateRollingSummary(Long conversationId, String summary, Long coveredMessageId,
+                                        Long checkpointMessageId) {
+        if (conversationId == null || coveredMessageId == null || checkpointMessageId == null
+                || summary == null || summary.isBlank()) {
+            return false;
+        }
+        return ctxMapper.updateRollingSummary(
+                conversationId, summary, coveredMessageId, checkpointMessageId) > 0;
     }
 
     @Override

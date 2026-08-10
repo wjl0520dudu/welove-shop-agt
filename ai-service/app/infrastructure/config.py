@@ -18,7 +18,10 @@ class Config:
     ORCHESTRATOR_MAX_TASKS = int(os.getenv("ORCHESTRATOR_MAX_TASKS", "5"))
     ORCHESTRATOR_MAX_DEPTH = int(os.getenv("ORCHESTRATOR_MAX_DEPTH", "4"))
     ORCHESTRATOR_MAX_CONCURRENCY = int(os.getenv("ORCHESTRATOR_MAX_CONCURRENCY", "3"))
-    ORCHESTRATOR_TASK_TIMEOUT_SECONDS = float(os.getenv("ORCHESTRATOR_TASK_TIMEOUT_SECONDS", "30"))
+    # A Shopping DeepAgent normally needs several bounded steps (read skill,
+    # select a business tool, retrieve, then render).  Thirty seconds cuts off
+    # otherwise healthy concurrent tasks near their normal tail latency.
+    ORCHESTRATOR_TASK_TIMEOUT_SECONDS = float(os.getenv("ORCHESTRATOR_TASK_TIMEOUT_SECONDS", "60"))
 
     # 1b. Low-cost hybrid router. Rules only claim high-certainty cases; unresolved
     # requests use one structured LLM call and low-confidence results ask for clarification.
@@ -27,6 +30,34 @@ class Config:
     ROUTER_ORCHESTRATOR_HINT_CONFIDENCE = float(
         os.getenv("ROUTER_ORCHESTRATOR_HINT_CONFIDENCE", "0.90")
     )
+
+    # One persisted conversation summary is shared by Router and Chitchat.
+    # chat-service owns the visible transcript and durable summary; ai-service
+    # only injects the persisted result into the one shared messages list.
+    # The ROUTER_* fallbacks retain compatibility with previous evaluation
+    # profiles while CONVERSATION_* is the production-facing contract.
+    CONVERSATION_SUMMARY_ENABLED = os.getenv(
+        "CONVERSATION_SUMMARY_ENABLED",
+        os.getenv("ROUTER_ROLLING_SUMMARY_ENABLED", "true"),
+    ).lower() in ("1", "true", "yes")
+    CONVERSATION_SUMMARY_TRIGGER_MESSAGES = int(
+        os.getenv("CONVERSATION_SUMMARY_TRIGGER_MESSAGES", "20")
+    )
+    CONVERSATION_SUMMARY_KEEP_MESSAGES = int(
+        os.getenv("CONVERSATION_SUMMARY_KEEP_MESSAGES", "4")
+    )
+    CONVERSATION_SUMMARY_MAX_CHARS = int(
+        os.getenv("CONVERSATION_SUMMARY_MAX_CHARS", os.getenv("ROUTER_SUMMARY_MAX_CHARS", "1600"))
+    )
+
+    # Legacy names are only kept for existing P4 / direct-AI evaluation
+    # scripts. They are not the trigger policy used by chat-service anymore.
+    ROUTER_ROLLING_SUMMARY_ENABLED = CONVERSATION_SUMMARY_ENABLED
+    ROUTER_SUMMARY_CHAR_THRESHOLD = int(os.getenv("ROUTER_SUMMARY_CHAR_THRESHOLD", "8000"))
+    ROUTER_CONTEXT_RECENT_MESSAGE_WINDOW = int(
+        os.getenv("ROUTER_CONTEXT_RECENT_MESSAGE_WINDOW", "10")
+    )
+    ROUTER_SUMMARY_MAX_CHARS = CONVERSATION_SUMMARY_MAX_CHARS
 
     # 1c. Preference-aware soft reranking. These are bounded adjustments applied
     # after relevance retrieval; current-turn hard constraints remain authoritative.
@@ -96,12 +127,69 @@ class Config:
     SHOPPING_LLM_JUDGE_ENABLED = os.getenv("SHOPPING_LLM_JUDGE_ENABLED", "true").lower() in ("1", "true", "yes")
     SHOPPING_LLM_JUDGE_MAX_CANDIDATES = int(os.getenv("SHOPPING_LLM_JUDGE_MAX_CANDIDATES", "10"))
     SHOPPING_LLM_JUDGE_MIN_SCORE = float(os.getenv("SHOPPING_LLM_JUDGE_MIN_SCORE", "0.55"))
+    # ShoppingAgent Deep Agents + Skills dual-track switch.  The Skill-driven
+    # runtime is the default; set false for an explicit manual rollback.
+    SHOPPING_DEEP_AGENT_ENABLED = os.getenv(
+        "SHOPPING_DEEP_AGENT_ENABLED", "true"
+    ).lower() in ("1", "true", "yes")
+    # Virtual path inside the read-only ai-service filesystem backend.
+    SHOPPING_SKILLS_ROOT = os.getenv(
+        "SHOPPING_SKILLS_ROOT", "/skills/shopping-agent/"
+    )
+    # KnowledgeAgent Deep Agents + Skills runtime. The old LangChain agent is
+    # retained only for an explicit manual rollback.
+    KNOWLEDGE_DEEP_AGENT_ENABLED = os.getenv(
+        "KNOWLEDGE_DEEP_AGENT_ENABLED", "true"
+    ).lower() in ("1", "true", "yes")
+    KNOWLEDGE_SKILLS_ROOT = os.getenv(
+        "KNOWLEDGE_SKILLS_ROOT", "/skills/knowledge-agent/"
+    )
+    # Reviewed Skill scripts execute through a fixed whitelist runner. Generic
+    # shell/Deep Agents execute remains hidden from ShoppingAgent.
+    SHOPPING_SKILL_SCRIPT_MODE = os.getenv(
+        "SHOPPING_SKILL_SCRIPT_MODE", "controlled"
+    ).strip().lower()
+    SHOPPING_SKILL_SCRIPT_TIMEOUT_SECONDS = float(os.getenv(
+        "SHOPPING_SKILL_SCRIPT_TIMEOUT_SECONDS", "2"
+    ))
+    # DashScope's multimodal SDK is synchronous.  The shopping retrieval
+    # wrapper runs it in a bounded worker and uses this as the total request
+    # budget, so a stalled third-party call cannot block FastAPI's event loop.
+    SHOPPING_MULTIMODAL_RETRIEVAL_TIMEOUT_SECONDS = float(os.getenv(
+        "SHOPPING_MULTIMODAL_RETRIEVAL_TIMEOUT_SECONDS", "12"
+    ))
+    # 图文商品发现前的轻量视觉一致性检查。仅在 Router 已判定为
+    # shopping + multimodal 时调用；不影响纯文本或纯图片检索。
+    SHOPPING_MULTIMODAL_CONSISTENCY_ENABLED = os.getenv(
+        "SHOPPING_MULTIMODAL_CONSISTENCY_ENABLED", "true"
+    ).lower() in ("1", "true", "yes")
+    SHOPPING_MULTIMODAL_CONSISTENCY_MODEL = os.getenv(
+        "SHOPPING_MULTIMODAL_CONSISTENCY_MODEL", "qwen3.5-flash"
+    ).strip()
+    SHOPPING_MULTIMODAL_CONSISTENCY_TIMEOUT_SECONDS = float(os.getenv(
+        "SHOPPING_MULTIMODAL_CONSISTENCY_TIMEOUT_SECONDS", "6"
+    ))
     # 多模态 embedding / rerank 走百炼业务空间专属端点；不配置时使用 dashscope SDK 默认端点。
     DASHSCOPE_MAAS_BASE_URL = os.getenv("DASHSCOPE_MAAS_BASE_URL", "")
 
     # ── DashScope（阿里云百炼）text-embedding-v4 ──
     # 现在是主用 embedding 通道（RAG 的 dense 向量走这里），OpenAI 通道保留仅供兼容。
-    DASH_SCOPE_API_KEY = os.getenv("DASH_SCOPE_API_KEY", "")
+    # ``DASH_SCOPE_API_KEY`` belongs to the historical embedding/rerank
+    # channel.  The native MultiModalConversation call goes to the configured
+    # MAAS business-space endpoint, which uses the same credential as the
+    # OpenAI-compatible LLM channel unless a dedicated native key is supplied.
+    # Keep the two names independent: aliasing them made a stale embedding key
+    # override the working MAAS key for qwen3.5-flash.
+    DASH_SCOPE_API_KEY = (
+        os.getenv("DASH_SCOPE_API_KEY", "").strip()
+        or os.getenv("DASHSCOPE_API_KEY", "").strip()
+    )
+    DASHSCOPE_API_KEY = (
+        os.getenv("DASHSCOPE_NATIVE_API_KEY", "").strip()
+        or LLM_API_KEY
+        or os.getenv("DASHSCOPE_API_KEY", "").strip()
+        or DASH_SCOPE_API_KEY
+    )
     DASH_SCOPE_TEXT_EMBEDDING_MODEL = os.getenv("DASH_SCOPE_TEXT_EMBEDDING_MODEL", "text-embedding-v4")
     # DashScope 单次最大 batch=10，超出会 400。
     DASH_SCOPE_EMBEDDING_BATCH_SIZE = int(os.getenv("DASH_SCOPE_EMBEDDING_BATCH_SIZE", "10"))
@@ -173,6 +261,17 @@ class Config:
     LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
     LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY", "")
     LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "welove-shop-ai")
+    LANGSMITH_ENVIRONMENT = os.getenv("LANGSMITH_ENVIRONMENT", "development")
+    # P2 的离线 Golden Dataset 名称。它与在线请求 Trace 项目可以相同，
+    # 但数据集本身始终由本地 JSONL 幂等同步，不能在 LangSmith UI 手改。
+    LANGSMITH_EVAL_DATASET = os.getenv(
+        "LANGSMITH_EVAL_DATASET", "welove-shop-agent-golden-v1"
+    )
+    # LangSmith receives runnable inputs/outputs by default.  Keep the
+    # production-safe default masked; a local developer can explicitly opt in
+    # while diagnosing prompts and tool payloads.
+    LANGSMITH_HIDE_INPUTS = os.getenv("LANGSMITH_HIDE_INPUTS", "true").lower() in ("1", "true", "yes")
+    LANGSMITH_HIDE_OUTPUTS = os.getenv("LANGSMITH_HIDE_OUTPUTS", "true").lower() in ("1", "true", "yes")
 
     # 8. CORS 允许来源。逗号分隔多个源；"*" 表示允许所有（仅开发/内网）。
     # 生产环境建议明确列出前端域名（如 https://shop.welove.com,http://localhost:5173），

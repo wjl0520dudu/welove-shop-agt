@@ -200,6 +200,8 @@ web/package-lock.json
 /docs/plan/agent-eval-comparison-v2.2-v2.4.md
 /ai-service/.pytest_cache/
 /ai-service/.pytest_temp/
+# LangGraph Studio / langgraph dev local in-memory persistence.
+/ai-service/.langgraph_api/
 
 # -------- CI/CD / test artifacts (exported data, snapshots, local DB) --------
 /ai-service/tests/.local.sql

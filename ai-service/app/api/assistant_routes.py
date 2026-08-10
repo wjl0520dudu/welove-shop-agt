@@ -11,10 +11,17 @@ from fastapi.responses import StreamingResponse
 from pydantic import Field
 
 from app.api.response_adapter import build_error_response, normalize_ai_response
-from app.api.schemas import AIResponse, ChatRequest
+from app.api.schemas import (
+    AIResponse,
+    ChatRequest,
+    RollingSummaryRequest,
+    RollingSummaryResponse,
+)
+from app.application.assistant.conversation_summary import build_rolling_summary
 from app.application.assistant.graph import AssistantGraph
 from app.infrastructure.errors import ErrorCode
 from app.infrastructure.llm.llm import get_llm
+from app.infrastructure.observability.langsmith import build_assistant_run_config
 from app.infrastructure.retrieval.multimodal_embeddings import MultimodalImageError, _normalize_image_url
 
 
@@ -24,6 +31,22 @@ logger = logging.getLogger("ai-service.assistant")
 # 多模态接口 HEAD 预检超时（秒）。图片放在自己 CDN 上，正常 100-300ms 内响应。
 # 超过 3 秒当作不可达处理，避免拖慢用户请求。
 _IMAGE_HEAD_TIMEOUT = 3.0
+
+_EVALUATION_HEADER_MAP = {
+    "run_id": "X-Evaluation-Run-Id",
+    "case_id": "X-Evaluation-Case-Id",
+    "dataset": "X-Evaluation-Dataset",
+    "variant": "X-Evaluation-Variant",
+    "operation": "X-Evaluation-Operation",
+}
+
+
+def _conversation_history_was_supplied(request: ChatRequest) -> bool:
+    """Distinguish an omitted history field from Pydantic's default ``[]``."""
+    fields = getattr(request, "model_fields_set", None)
+    if fields is None:  # Pydantic v1 compatibility
+        fields = getattr(request, "__fields_set__", set())
+    return "conversation_history" in fields
 
 
 class AssistantRunRequest(ChatRequest):
@@ -36,6 +59,39 @@ class AssistantRunRequest(ChatRequest):
     quantity: int = Field(1, ge=1, description="[deprecated] 不再由 Agent 处理")
 
 
+@router.post("/conversation-summary", response_model=RollingSummaryResponse)
+async def create_conversation_summary(
+    request: RollingSummaryRequest, http_request: Request,
+) -> RollingSummaryResponse:
+    """Internal best-effort endpoint used by chat-service after a turn is saved."""
+    llm = get_llm()
+    if llm is None:
+        raise HTTPException(status_code=503, detail="LLM is not configured")
+    try:
+        trace_id = getattr(http_request.state, "trace_id", None) or str(uuid4())
+        run_config = build_assistant_run_config(
+            conversation_id=None,
+            user_id=None,
+            trace_id=trace_id,
+            stream=False,
+            has_image=False,
+            evaluation_context=_evaluation_context(http_request),
+        )
+        summary = await build_rolling_summary(
+            llm,
+            previous_summary=request.previous_summary,
+            messages=request.messages,
+            max_chars=request.max_chars,
+            run_config=run_config,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("rolling summary generation failed")
+        raise HTTPException(status_code=502, detail="rolling summary generation failed") from exc
+    if not summary:
+        raise HTTPException(status_code=502, detail="rolling summary generation returned empty text")
+    return RollingSummaryResponse(summary=summary)
+
+
 def _parse_user_id(value: Optional[str]) -> Optional[int]:
     if value in (None, ""):
         return None
@@ -45,11 +101,43 @@ def _parse_user_id(value: Optional[str]) -> Optional[int]:
         return None
 
 
+def _evaluation_context(http_request: Request) -> dict[str, str]:
+    """Read evaluator-only trace labels without changing business request data.
+
+    These labels are sent exclusively by ``evals.run_agent_eval``. They have
+    no influence on routing, tools, prompts or response content; they merely
+    make a Golden Case searchable in LangSmith. Bound every value so an
+    arbitrary client cannot attach an unbounded metadata payload.
+    """
+
+    return {
+        key: value[:128]
+        for key, header in _EVALUATION_HEADER_MAP.items()
+        if (value := str(http_request.headers.get(header) or "").strip())
+    }
+
+
+def _raise_multimodal_image_error(trace_id: str, error: MultimodalImageError) -> None:
+    logger.warning("trace=%s DashScope rejected image: %s", trace_id, error)
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error_code": ErrorCode.MULTIMODAL_IMAGE_INVALID,
+            "message": f"图片无法识别：{error.reason}",
+        },
+    )
+
+
 @router.post("/run", response_model=AIResponse)
 async def run_assistant(request: AssistantRunRequest, http_request: Request) -> AIResponse:
-    llm = get_llm()
-    # 优先复用中间件生成/透传的 traceId；没有则新建（防御性，正常不会走到）
     trace_id = getattr(http_request.state, "trace_id", None) or str(uuid4())
+    image_url = None
+    if request.image_url:
+        image_url = _validate_image_url(request.image_url)
+        await _precheck_image_reachable(image_url, trace_id)
+
+    llm = get_llm()
+    # trace_id is assigned before optional image validation so errors retain it.
     if llm is None:
         return build_error_response(
             "LLM 未配置，统一 Agent 暂不可用。",
@@ -71,8 +159,14 @@ async def run_assistant(request: AssistantRunRequest, http_request: Request) -> 
             skin_type=request.skin_type,
             preference_tags=request.preference_tags,
             conversation_history=request.conversation_history,
+            conversation_history_supplied=_conversation_history_was_supplied(request),
+            conversation_summary=request.conversation_summary,
             trace_id=trace_id,
+            image_url=image_url,
+            evaluation_context=_evaluation_context(http_request),
         )
+    except MultimodalImageError as e:
+        _raise_multimodal_image_error(trace_id, e)
     except Exception:
         logger.exception("Assistant agent run failed")
         return build_error_response(
@@ -99,7 +193,7 @@ async def stream_assistant(request: AssistantRunRequest, http_request: Request):
     """流式版本 /run，返回 SSE 事件流。
 
     事件类型：start / route / orchestrator_plan / orchestrator_subtask /
-    token / tool_call / tool_result / final / error / done。
+    subtask_result / token / tool_call / tool_result / final / error / done。
     详见 assistant/graph.py::astream。
 
     客户端断开检测：每次 yield 前用 Starlette 自带的 `request.is_disconnected()`
@@ -112,8 +206,13 @@ async def stream_assistant(request: AssistantRunRequest, http_request: Request):
         es.addEventListener('final', e => renderCards(JSON.parse(e.data).product_cards))
         es.addEventListener('done', () => es.close())
     """
-    llm = get_llm()
     trace_id = getattr(http_request.state, "trace_id", None) or str(uuid4())
+    image_url = None
+    if request.image_url:
+        image_url = _validate_image_url(request.image_url)
+        await _precheck_image_reachable(image_url, trace_id)
+
+    llm = get_llm()
 
     async def event_stream() -> AsyncIterator[bytes]:
         if llm is None:
@@ -137,7 +236,11 @@ async def stream_assistant(request: AssistantRunRequest, http_request: Request):
                 skin_type=request.skin_type,
                 preference_tags=request.preference_tags,
                 conversation_history=request.conversation_history,
+                conversation_history_supplied=_conversation_history_was_supplied(request),
+                conversation_summary=request.conversation_summary,
                 trace_id=trace_id,
+                image_url=image_url,
+                evaluation_context=_evaluation_context(http_request),
             ):
                 # 客户端断开后提前停 LLM,避免空跑 token
                 if await http_request.is_disconnected():
@@ -147,6 +250,14 @@ async def stream_assistant(request: AssistantRunRequest, http_request: Request):
                     )
                     break
                 yield _sse_frame(event["type"], event.get("data") or {}).encode("utf-8")
+        except MultimodalImageError as e:
+            logger.warning("trace=%s DashScope rejected image: %s", trace_id, e)
+            yield _sse_frame("error", {
+                "trace_id": trace_id,
+                "error_code": ErrorCode.MULTIMODAL_IMAGE_INVALID,
+                "message": f"图片无法识别：{e.reason}",
+            }).encode("utf-8")
+            yield _sse_frame("done", {}).encode("utf-8")
         except Exception as e:  # noqa: BLE001
             logger.exception("Assistant stream failed")
             yield _sse_frame("error", {
@@ -284,6 +395,10 @@ async def run_multimodal_assistant(
     - DashScope MultimodalImageError（图片格式非法、拒绝识别）
     任一失败都返回 HTTP 400 + error_code=AI_MULTIMODAL_IMAGE_INVALID
     """
+    # Compatibility alias.  The primary /run endpoint now accepts an optional
+    # image_url and owns validation, graph invocation, and error semantics.
+    return await run_assistant(request, http_request)
+
     image_url = _validate_image_url(request.image_url)
 
     llm = get_llm()
@@ -314,7 +429,10 @@ async def run_multimodal_assistant(
             preference_tags=request.preference_tags,
             trace_id=trace_id,
             image_url=image_url,
+            evaluation_context=_evaluation_context(http_request),
             conversation_history=request.conversation_history,
+            conversation_history_supplied=_conversation_history_was_supplied(request),
+            conversation_summary=request.conversation_summary,
         )
     except MultimodalImageError as e:
         # 第二道防线：HEAD 通过但 DashScope 拒识别（图片格式非法 / CDN 拒绝
@@ -354,6 +472,9 @@ async def stream_multimodal_assistant(
     - 开流后 DashScope 拒识别 → 发 error 事件（error_code=IMAGE_INVALID）
       再 done，SSE 语义完整
     """
+    # Compatibility alias.  New callers use /stream with an optional image_url.
+    return await stream_assistant(request, http_request)
+
     image_url = _validate_image_url(request.image_url)
 
     llm = get_llm()
@@ -385,7 +506,10 @@ async def stream_multimodal_assistant(
                 preference_tags=request.preference_tags,
                 trace_id=trace_id,
                 image_url=image_url,
+                evaluation_context=_evaluation_context(http_request),
                 conversation_history=request.conversation_history,
+                conversation_history_supplied=_conversation_history_was_supplied(request),
+                conversation_summary=request.conversation_summary,
             ):
                 if await http_request.is_disconnected():
                     logger.info(

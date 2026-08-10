@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from uuid import uuid4
+from collections.abc import Callable
 from typing import Any, Dict, List, Optional
 
 from cachetools import TTLCache
@@ -12,15 +13,19 @@ from langchain.agents import create_agent
 from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddleware
 from langchain.agents.middleware.tool_call_limit import ToolCallLimitMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.messages import AIMessageChunk
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from app.infrastructure.persistence.memory import get_business_memory, remember_knowledge_entities
+from app.infrastructure.persistence.memory import remember_knowledge_entities
 from app.infrastructure.llm.middleware import build_summarization_middleware
-from app.prompts.prompts import KNOWLEDGE_PROMPT
+from app.prompts.prompts import KNOWLEDGE_AGENT_PROMPT, KNOWLEDGE_PROMPT
 from app.application.assistant.state import KnowledgeAgentState
+from app.domain.knowledge.skill_observability import extract_knowledge_skill_reads
+from app.infrastructure.config import config
+from app.infrastructure.observability.langsmith import child_run_config
 from app.infrastructure.retrieval.retriever import get_retriever
-from app.application.assistant.reference_tools import resolve_reference
 
 logger = logging.getLogger("ai-service.knowledge.agent")
 
@@ -226,7 +231,7 @@ def _extract_sources(messages: list) -> list:
 
 
 def _extract_tool_calls(messages: list) -> list[dict[str, Any]]:
-    """Build a stable, bounded tool trace from Agent AI/Tool messages."""
+    """Build a stable trace containing Knowledge business tools only."""
     calls: list[dict[str, Any]] = []
     by_id: dict[str, dict[str, Any]] = {}
     for message in messages or []:
@@ -240,6 +245,8 @@ def _extract_tool_calls(messages: list) -> list[dict[str, Any]]:
                     call_id = str(getattr(raw, "id", "") or "")
                     name = str(getattr(raw, "name", "") or "")
                     args = getattr(raw, "args", {}) or {}
+                if name != "search_knowledge":
+                    continue
                 item = {
                     "tool_call_id": call_id or None,
                     "tool_name": name,
@@ -257,6 +264,8 @@ def _extract_tool_calls(messages: list) -> list[dict[str, Any]]:
         call_id = str(getattr(message, "tool_call_id", "") or "")
         item = by_id.get(call_id)
         if item is None:
+            if str(getattr(message, "name", "") or "") != "search_knowledge":
+                continue
             item = {
                 "tool_call_id": call_id or None,
                 "tool_name": str(getattr(message, "name", "") or ""),
@@ -364,7 +373,7 @@ _ENTITY_EXTRACT_PROMPT = """从用户的知识问答问题中提取关键实体�
 
 规则：
 1. 只提取本轮问题中明确提到的实体，不要从上下文推断
-2. 如果问题只是指代（"第二个""它的副作用"等），不要提取——因为这些指代会在指代消解环节处理
+2. 当前问题应已由主路由改写为完整表达；不要从历史猜测未出现在本轮的问题实体
 3. 保序去重，最多 5 个
 4. 没有实体时返回空列表
 5. 示例：
@@ -375,7 +384,11 @@ _ENTITY_EXTRACT_PROMPT = """从用户的知识问答问题中提取关键实体�
    - "你好" → []"""
 
 
-async def _extract_entities_with_llm(query: str, max_entities: int = 5) -> Optional[List[str]]:
+async def _extract_entities_with_llm(
+    query: str,
+    max_entities: int = 5,
+    run_config: RunnableConfig | None = None,
+) -> Optional[List[str]]:
     """用 LLM 抽取实体。失败返回 None 触发正则兜底。"""
     from app.infrastructure.llm.llm import get_llm
     llm = get_llm()
@@ -389,7 +402,11 @@ async def _extract_entities_with_llm(query: str, max_entities: int = 5) -> Optio
                 {"role": "system", "content": _ENTITY_EXTRACT_PROMPT},
                 {"role": "user", "content": query},
             ],
-            config={"tags": ["ai_internal"]},
+            config=child_run_config(
+                run_config,
+                run_name="knowledge-agent.entity-extraction",
+                tags=["agent:knowledge", "stage:entity-extraction"],
+            ),
         )
     except Exception:
         logger.warning("LLM entity extraction failed, fallback to regex", exc_info=True)
@@ -489,7 +506,13 @@ _GROUNDING_CHECK_PROMPT = """你是宽松但明确的答案审核员。判断【
 **保守优先**：判断困难时倾向 grounded=true，宁可放过也不误杀。"""
 
 
-async def _grounding_check(llm, question: str, answer: str, knowledge_context: str) -> tuple[bool, str]:
+async def _grounding_check(
+    llm,
+    question: str,
+    answer: str,
+    knowledge_context: str,
+    run_config: RunnableConfig | None = None,
+) -> tuple[bool, str]:
     """让 LLM 自评答案是否完全来自参考资料。
 
     Returns:
@@ -523,7 +546,11 @@ async def _grounding_check(llm, question: str, answer: str, knowledge_context: s
                 {"role": "system", "content": _GROUNDING_CHECK_PROMPT},
                 {"role": "user", "content": check_input},
             ],
-            config={"tags": ["ai_internal"]},
+            config=child_run_config(
+                run_config,
+                run_name="knowledge-agent.grounding-check",
+                tags=["agent:knowledge", "stage:grounding-check"],
+            ),
         )
         if isinstance(result, GroundingResult):
             return bool(result.grounded), result.reason
@@ -541,50 +568,44 @@ _UNGROUNDED_FALLBACK_ANSWER = (
 
 
 class KnowledgeAgent:
-    """知识问答 agent：create_agent + search_knowledge + resolve_reference。
+    """Skill-driven knowledge agent with evidence-grounded retrieval.
 
-    ## 变更（2026-07-08）
-    - 挂上 resolve_reference：支持"第二个的成分是什么"这类跨轮指代
-      （通过 last_knowledge_entities 定位到上一轮谈过的成分/产品名）
-    - 每次 run 时读 business_memory 并注入 prompt：LLM 能看到上轮实体
-    - 检索完成后把候选实体写回 Store：下一轮就能被 resolve_reference 定位
+    The main Intent Router owns cross-turn reference resolution.  This Agent
+    receives a self-contained question and does not read historical entities or
+    expose a second reference-resolution tool to its model loop.
 
     ## 独立 checkpointer
     每次调用传唯一 thread_id 避免内部 tool_call 消息污染下一次调用。
 
     ## 对话级缓存
-    同一问题（hash 去重）直接返回缓存结果，避免重复 RAG。**但要注意**：
-    命中缓存时也要更新 last_knowledge_entities，否则用户连问两次同样的问题、
-    第三次追问"第二个"时会读到过期实体列表。
+    同一问题（hash 去重）直接返回缓存结果，避免重复 RAG。
 
     实例懒构造，直到首次调用时才创建底层 agent。
     """
 
     def __init__(self, llm):
         self._llm = llm
-        self._agent = None
+        self._legacy_agent = None
 
-    def _get_agent(self):
-        if self._agent is None:
+    def _get_legacy_agent(self):
+        """Return the explicit rollback runtime used when the switch is off."""
+        if self._legacy_agent is None:
             # 工具集（简化设计）：
             # - search_knowledge：内部知识库 RAG。**内部自动兜底**：
             #   分数 < 0.5 时程序自动触发博查网络搜索，LLM 无感知。
             #   为什么不给 LLM search_web 独立工具：中等模型有"偷懒"倾向，
             #   拿到不相关的 Milvus 结果会用训练知识编答案，而不是主动改调 search_web。
             #   干脆把决策权从 LLM 手里拿走，全靠程序判断阈值。
-            # - resolve_reference：跨轮指代消解（"第二个"/"它们"）
             #
             # ToolCallLimit(search_knowledge, 2, continue)：
             #   超限后注入错误 ToolMessage，让模型用已有内容答（不硬停）
             # ModelCallLimit(5) 硬顶兜底，防弱模型死循环；recursion_limit 再兜一层
             #
-            # state_schema=KnowledgeAgentState：让 resolve_reference 能通过
-            # runtime.state 拿到 conversation_id / user_id 去读 Store。
-            self._agent = create_agent(
+            self._legacy_agent = create_agent(
                 model=self._llm,
                 checkpointer=_knowledge_checkpointer,
                 system_prompt=KNOWLEDGE_PROMPT,
-                tools=[search_knowledge, resolve_reference],
+                tools=[search_knowledge],
                 state_schema=KnowledgeAgentState,
                 middleware=[
                     build_summarization_middleware(),
@@ -596,24 +617,7 @@ class KnowledgeAgent:
                     ModelCallLimitMiddleware(run_limit=5, exit_behavior="end"),
                 ],
             )
-        return self._agent
-
-    def _build_prompt_with_memory(self, memory: Dict[str, Any]) -> Optional[str]:
-        """把知识实体记忆拼到 system_prompt 尾部，作为额外一条 SystemMessage。
-
-        没有实体时返回 None，避免注入空段落。
-        """
-        entities: List[str] = memory.get("last_knowledge_entities") or []
-        if not entities:
-            return None
-        lines = [f"  {i}. {e}" for i, e in enumerate(entities, 1)]
-        return (
-            "## 上一轮谈到的知识实体\n\n"
-            + "\n".join(lines)
-            + "\n\n如果本轮问题里含'第二个'、'它们'、'副作用/成分/怎么用'等指代，"
-              "**必须先调 resolve_reference**，让它把指代解析到具体实体，"
-              "再基于实体名做 search_knowledge。"
-        )
+        return self._legacy_agent
 
     async def run(
         self,
@@ -621,15 +625,15 @@ class KnowledgeAgent:
         messages: list,
         conversation_id: str = "",
         user_id: Optional[int | str] = None,
+        token_sink: Callable[[str], None] | None = None,
+        run_config: RunnableConfig | None = None,
     ) -> dict:
         """执行知识问答。
 
         Args:
-            messages: 来自 supervisor 共享记忆的消息列表（含对话历史 + 当前问题）。
-                      格式为 langchain_core.messages 对象列表。
-            conversation_id: 会话 ID，用于业务记忆隔离 + 对话级缓存。
-            user_id: 用户 ID（可选），传给工具用（当前 knowledge 没有用户维度工具，
-                     但保留字段让 resolve_reference 未来接实体 → user_prefs 关联时用得上）。
+            messages: 路由后当前问题的消息列表；不包含完整对话历史。
+            conversation_id: 会话 ID，用于对话级缓存和实体写回。
+            user_id: 用户 ID（可选），用于实体写回时的会话隔离。
 
         Returns:
             包含 answer、sources、confidence、task_type 等字段的字典。
@@ -653,45 +657,82 @@ class KnowledgeAgent:
                 question = content.strip()
                 break
 
-        # 读业务记忆，为本轮 prompt 注入 last_knowledge_entities
-        try:
-            memory = await get_business_memory(conversation_id, user_id)
-        except Exception:  # noqa: BLE001
-            logger.warning("knowledge: 读取 business_memory 失败，退化为无记忆模式", exc_info=True)
-            memory = {}
+        knowledge_runtime = (
+            "deep_agent" if config.KNOWLEDGE_DEEP_AGENT_ENABLED
+            else "langchain_agent"
+        )
 
-        # 把上轮实体拼进 messages（作为一条 SystemMessage 追加在原 prompt 之后）。
-        # 注意：create_agent 已经把 KNOWLEDGE_PROMPT 作为首条 SystemMessage 塞进去了，
-        # 这里再追加一条 SystemMessage 让 LLM 看到"上一轮谈过什么"。
-        memory_block = self._build_prompt_with_memory(memory)
-        if memory_block:
-            from langchain_core.messages import SystemMessage
-            messages = [SystemMessage(content=memory_block), *messages]
-
-        # 对话级缓存：同一对话 + 同一问题，直接返回缓存
-        cache_key = f"{conversation_id}:{hashlib.md5(question.encode()).hexdigest()}" if question else ""
+        # 对话级缓存：同一运行时 + 同一对话 + 同一问题，直接返回缓存。
+        # 把运行时加入 key，确保人工回滚开关切换后不会复用另一条链的观测结果。
+        cache_key = (
+            f"{knowledge_runtime}:{conversation_id}:"
+            f"{hashlib.md5(question.encode()).hexdigest()}"
+        ) if question else ""
         if cache_key and cache_key in _knowledge_cache:
             cached = _knowledge_cache[cache_key]
-            # 命中缓存也要更新实体记忆，避免过时（用户连问同样的问题两次时不会漏）
-            await self._persist_entities(conversation_id, user_id, question, cached.get("sources") or [])
+            await self._persist_entities(
+                conversation_id,
+                user_id,
+                question,
+                cached.get("sources") or [],
+                run_config=run_config,
+            )
+            if token_sink is not None:
+                for chunk in _stream_text_chunks(str(cached.get("answer") or "")):
+                    token_sink(chunk)
             return cached
 
         # 每次调用使用唯一 thread_id，确保不受内部 tool_call 消息污染。
-        # recursion_limit=20：跨轮指代 case（resolve_reference → search_knowledge → 再答）
-        # 需要 model+tool 各 3-4 次往返，加上 middleware 也算 step，12 步不够。
+        # recursion_limit=12：单个检索工具的受控 Agent loop。
         # ModelCallLimit(run_limit=5, exit_behavior="end") 兜底防真死循环。
         # 观测：正常单轮问答 5-6 步，跨轮指代 8-10 步，20 有充裕余量。
-        result = await self._get_agent().ainvoke(
-            {
-                "messages": messages,
-                "conversation_id": conversation_id,
-                "user_id": user_id,
-            },
-            config={
-                "configurable": {"thread_id": str(uuid4())},
-                "recursion_limit": 20,
-            },
+        agent_input = {
+            "messages": messages,
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+        }
+        agent_config = child_run_config(
+            run_config,
+            run_name="knowledge-agent.tool-loop",
+            tags=["runtime:" + knowledge_runtime],
+            metadata={"knowledge_runtime": knowledge_runtime},
+            # Isolate the DeepAgent checkpoint state without detaching its
+            # LangSmith callback lineage from the assistant request.
+            thread_id=str(uuid4()),
+            recursion_limit=32 if knowledge_runtime == "deep_agent" else 12,
         )
+        skill_source = "/skills/knowledge-agent/"
+        if config.KNOWLEDGE_DEEP_AGENT_ENABLED:
+            from app.domain.knowledge.deep_agent import KnowledgeDeepAgentAdapter
+
+            deep_runtime = KnowledgeDeepAgentAdapter(
+                llm=self._llm,
+                tools=[search_knowledge],
+                checkpointer=_knowledge_checkpointer,
+                skills_root=config.KNOWLEDGE_SKILLS_ROOT,
+            ).build(system_prompt=KNOWLEDGE_AGENT_PROMPT)
+            agent = deep_runtime.graph
+            skill_source = deep_runtime.skill_source
+        else:
+            agent = self._get_legacy_agent()
+
+        if token_sink is None:
+            result = await agent.ainvoke(agent_input, config=agent_config)
+        else:
+            result = {}
+            async for mode, payload in agent.astream(
+                agent_input,
+                config=agent_config,
+                stream_mode=["values", "messages"],
+            ):
+                if mode == "values" and isinstance(payload, dict):
+                    result = payload
+                elif mode == "messages":
+                    message, _metadata = payload
+                    if isinstance(message, AIMessageChunk):
+                        content = _stream_text_content(message.content)
+                        if content:
+                            token_sink(content)
 
         # answer 从最后一条 AI 消息 content 提取（纯文本，可流式）；
         # sources 从 search_knowledge 的 ToolMessage 里 JSON 解析抽取。
@@ -705,6 +746,30 @@ class KnowledgeAgent:
                     break
         sources = _extract_sources(result_messages)
         tool_calls = _extract_tool_calls(result_messages)
+        skill_reads = (
+            extract_knowledge_skill_reads(
+                result_messages,
+                skill_source=skill_source,
+            )
+            if knowledge_runtime == "deep_agent"
+            else []
+        )
+
+        if not any(call.get("status") == "completed" for call in tool_calls):
+            logger.warning("knowledge agent completed without a successful knowledge tool call")
+            return {
+                "answer": "我需要先检索可靠资料，但这次检索没有成功，请稍后再试。",
+                "sources": [],
+                "retrieved_contexts": [],
+                "tool_calls": tool_calls,
+                "confidence": 0.0,
+                "has_answer": False,
+                "task_type": "knowledge",
+                "knowledge_runtime": knowledge_runtime,
+                "skill_reads": skill_reads,
+                "error": True,
+                "error_code": "AI_RAG_TOOL_NOT_EXECUTED",
+            }
 
         # ── 生成后自评（反幻觉最后一道关）──
         # 让 LLM 自己判断答案是否完全来自参考资料。判为 false 时改写为兜底文案。
@@ -712,7 +777,11 @@ class KnowledgeAgent:
         # 自评异常时（LLM 挂 / JSON 失败）放过原答案，避免因审核环节导致用户拿不到答案。
         grounding_context = _extract_last_knowledge_context(result_messages)
         grounded, grounding_reason = await _grounding_check(
-            self._llm, question, answer, grounding_context,
+            self._llm,
+            question,
+            answer,
+            grounding_context,
+            run_config=agent_config,
         )
         if not grounded:
             logger.warning(
@@ -724,8 +793,14 @@ class KnowledgeAgent:
         else:
             logger.info("knowledge: 自评通过 reason=%s", grounding_reason)
 
-        # 抽取本轮候选实体并写回 Store，供下一轮 resolve_reference 定位
-        await self._persist_entities(conversation_id, user_id, question, sources)
+        # 抽取本轮候选实体并写回 Store，供下一轮主路由绑定。
+        await self._persist_entities(
+            conversation_id,
+            user_id,
+            question,
+            sources,
+            run_config=agent_config,
+        )
 
         output = {
             "answer": answer or "知识检索暂时不可用，请稍后再试。",
@@ -738,6 +813,8 @@ class KnowledgeAgent:
             "confidence": 0.7 if sources else 0.3,
             "has_answer": bool(sources) and grounded,
             "task_type": "knowledge",
+            "knowledge_runtime": knowledge_runtime,
+            "skill_reads": skill_reads,
         }
 
         # 存入缓存
@@ -778,15 +855,16 @@ class KnowledgeAgent:
         user_id: Optional[int | str],
         question: str,
         sources: List[Dict[str, Any]],
+        run_config: RunnableConfig | None = None,
     ) -> None:
         """从当前 question + sources 抽取候选实体，写回 Store。
 
         query 抽取优先，sources 抽取兜底（覆盖不到时补充）。
-        写入失败不阻塞主流程 —— 记忆缺失最多是下一轮 resolve_reference 失效。
+        写入失败不阻塞主流程 —— 记忆缺失最多让下一轮主路由无法绑定历史实体。
         """
         try:
             # LLM 优先，正则兜底
-            entities = await _extract_entities_with_llm(question)
+            entities = await _extract_entities_with_llm(question, run_config=run_config)
             if entities is None:
                 entities = _extract_entities_from_query(question)
             if not entities:
@@ -795,3 +873,20 @@ class KnowledgeAgent:
                 await remember_knowledge_entities(conversation_id, user_id, entities)
         except Exception:  # noqa: BLE001
             logger.warning("knowledge: 实体持久化失败", exc_info=True)
+
+
+def _stream_text_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def _stream_text_chunks(text: str) -> list[str]:
+    value = str(text or "")
+    return [value[index:index + 6] for index in range(0, len(value), 6)]

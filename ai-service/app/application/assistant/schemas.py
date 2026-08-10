@@ -4,16 +4,72 @@ from pydantic import BaseModel, Field
 
 # 主图只产 shopping|knowledge|chitchat|unknown；cart 仅为兼容旧购物车库保留。
 TaskType = Literal["shopping", "knowledge", "chitchat", "unknown", "cart"]
+RouteMode = Literal["simple", "complex"]
+ImageQueryMode = Literal["unused", "multimodal"]
 OrchestratorIntentHint = Literal["shopping", "knowledge", "chitchat", "unknown"]
 
 
 class IntentDecision(BaseModel):
+    """The single semantic decision made before planning or domain execution.
+
+    The Router owns cross-turn understanding.  It resolves the current turn,
+    determines whether it is a simple or complex request, and selects a domain
+    only for simple requests.  Domain Agents receive the canonical question
+    rather than re-reading raw chat history for reference resolution.
+    """
+    mode: RouteMode = Field(
+        "simple",
+        description=(
+            "simple=直接交给一个领域 Agent；complex=需要 Planner 拆分 DAG。"
+            "complex 时 task_type 必须为 unknown。"
+        ),
+    )
     task_type: TaskType = Field(
         ...,
-        description="意图分类: shopping=搜索/推荐/比较具体商品, knowledge=了解知识/用法/成分/适合什么(即使提到商品名), chitchat=闲聊/问候/元问题(关于对话本身), unknown=无法判断",
+        description=(
+            "simple 时的领域：shopping=搜索/推荐/比较具体商品，"
+            "knowledge=商品知识/用法/成分/原理，chitchat=普通聊天或对话回顾；"
+            "complex 或无法判断时为 unknown。"
+        ),
     )
     confidence: float = Field(0.0, ge=0.0, le=1.0, description="分类置信度")
     reason: str = Field("", description="分类理由")
+    clarification: str = Field(
+        "",
+        description=(
+            "当 task_type=unknown 且问题可以基于可信上下文澄清时，给用户的一句自然中文澄清；"
+            "只能使用上下文中真实存在的商品数量和名称，不得编造事实。"
+        ),
+    )
+    canonical_question: str = Field(
+        "",
+        description=(
+            "结合本轮上下文改写后的完整问题。必须消除诸如“第一个”“它们”之类的"
+            "跨轮指代；没有指代时保留用户原意。"
+        ),
+    )
+    resolved_product_ids: List[int] = Field(
+        default_factory=list,
+        description="Router 从会话上下文理解出的商品引用；无商品指代时为空。",
+    )
+    resolved_knowledge_entities: List[str] = Field(
+        default_factory=list,
+        description="Router 从会话上下文理解出的知识实体；无知识指代时为空。",
+    )
+    image_query_mode: ImageQueryMode = Field(
+        "unused",
+        description=(
+            "仅当前轮带参考图片时使用：multimodal=图片需要与用户文字共同参与商品发现；"
+            "unused=图片与当前任务无关或本轮没有图片。仅上传图片的纯图检索由主图输入模式直接处理。"
+        ),
+    )
+    use_pending_image: bool = Field(
+        False,
+        description=(
+            "仅当前轮没有新图片、但会话存在图文冲突待确认图片时使用。"
+            "用户明确确认“按图片/按图中这个找”才为 true；按文字找、新话题或无法确定时为 false。"
+        ),
+    )
 
 
 class OrchestratorTask(BaseModel):
@@ -23,7 +79,7 @@ class OrchestratorTask(BaseModel):
     question: str = Field(..., description="可以独立交给某个业务 Agent 处理的子问题")
     intent_hint: Optional[OrchestratorIntentHint] = Field(
         None,
-        description="可选意图提示，最终仍由 route_intent 复核",
+        description="该子任务应直接执行的领域：shopping、knowledge、chitchat 或 unknown。",
     )
     depends_on: List[str] = Field(
         default_factory=list,

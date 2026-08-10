@@ -1,231 +1,145 @@
-"""RecommendCapability 全流程单测（parse_need + merge + clarify + retrieval + rank）。
-
-不打真 LLM/PG：
-- parse_need_llm 全程 mock；
-- Retriever + Ranker 通过构造函数注入 mock/真实实例；
-- Store（remember/get pending）全 mock。
-"""
+"""Focused tests for the single-Judge recommendation pipeline."""
 
 from __future__ import annotations
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.domain.shopping.capabilities.recommend import (
-    RecommendCapability,
-    _looks_like_compare,
-    _looks_like_detail,
-    build_clarify_question,
-    get_missing_required_slots,
-    merge_shopping_need,
-)
-from app.domain.shopping.ranking import ProductRanker
-from app.domain.shopping.schemas import ShoppingContext, ShoppingNeed
+from app.domain.shopping.capabilities.recommend import RecommendCapability
+from app.domain.shopping.schemas import RankedProduct, ShoppingContext
 
 
 def _ctx(**kwargs):
-    kw = {"conversation_id": "c1", "user_id": "u1", "is_logged_in": True}
-    kw.update(kwargs)
-    return ShoppingContext(**kw)
+    values = {"conversation_id": "c1", "user_id": "u1", "is_logged_in": True}
+    values.update(kwargs)
+    return ShoppingContext(**values)
 
 
-class TestMergeShoppingNeed:
-    def test_new_overrides_scalar(self):
-        old = ShoppingNeed(category="防晒", skin_type="油皮")
-        new = ShoppingNeed(skin_type="干皮", budget_max=200)
-        merged = merge_shopping_need(old, new)
-        assert merged.category == "防晒"      # old 保留
-        assert merged.skin_type == "干皮"      # new 覆盖
-        assert merged.budget_max == 200        # new 新增
-
-    def test_list_fields_dedupe_union(self):
-        old = ShoppingNeed(preferences=["清爽", "保湿"], avoid=["油腻"])
-        new = ShoppingNeed(preferences=["清爽", "便携"], avoid=["香味重"])
-        merged = merge_shopping_need(old, new)
-        assert set(merged.preferences) == {"清爽", "保湿", "便携"}
-        assert set(merged.avoid) == {"油腻", "香味重"}
-
-    def test_missing_slots_uses_new(self):
-        old = ShoppingNeed(missing_slots=["category"])
-        new = ShoppingNeed(category="防晒", missing_slots=[])
-        merged = merge_shopping_need(old, new)
-        assert merged.missing_slots == []
+def _candidate(product_id: int = 1):
+    return {
+        "product_id": product_id,
+        "title": "示例耳机",
+        "price": 699,
+        "base_price": 699,
+        "category": "数码家电",
+        "sub_category": "真无线耳机",
+        "status": 1,
+        "score": 0.9,
+        "recall_sources": ["hybrid"],
+    }
 
 
-class TestClarifyGate:
-    def test_missing_category(self):
-        assert get_missing_required_slots(ShoppingNeed()) == ["category"]
-
-    def test_category_present_no_missing(self):
-        assert get_missing_required_slots(ShoppingNeed(category="防晒")) == []
-
-    def test_gift_question_when_scenario_gift(self):
-        need = ShoppingNeed(scenario=["礼物"], target_user="妈妈")
-        q = build_clarify_question(need, ["category"])
-        assert "妈妈" in q or "对方" in q
-
-    def test_normal_category_question(self):
-        q = build_clarify_question(ShoppingNeed(), ["category"])
-        assert "哪类商品" in q
+def _remember_cards_patch():
+    return patch(
+        "app.domain.shopping.capabilities.recommend.remember_product_cards",
+        new=AsyncMock(),
+    )
 
 
-class TestWrongCapabilityCheck:
-    def test_compare_detected(self):
-        ctx = _ctx(last_product_cards=[{"product_id": 1}, {"product_id": 2}])
-        assert _looks_like_compare("这两个对比一下", ctx) is True
+def test_empty_text_without_image_clarifies_before_retrieval():
+    retriever = MagicMock()
+    retriever.retrieve = AsyncMock()
+    result = asyncio.run(
+        RecommendCapability(retriever=retriever).run("", _ctx())
+    )
 
-    def test_no_compare_without_history(self):
-        ctx = _ctx(last_product_cards=[])
-        assert _looks_like_compare("这两个对比一下", ctx) is False
-
-    def test_detail_detected(self):
-        ctx = _ctx(last_focused_product={"product_id": 1, "title": "A"})
-        assert _looks_like_detail("这个多少钱", ctx) is True
-
-    def test_no_detail_without_history(self):
-        ctx = _ctx()
-        assert _looks_like_detail("这个多少钱", ctx) is False
+    assert result.action == "clarify"
+    assert result.clarify_question
+    retriever.retrieve.assert_not_awaited()
 
 
-class TestRecommendCapabilityRun:
-    """RecommendCapability.run 主流程（parse + retrieve + rank + cards）。"""
-
-    def _patch_llm(self, parsed_need):
-        """把 parse_need_llm 替换成同步返回给定 ShoppingNeed。"""
-        return patch(
-            "shopping.capabilities.recommend._parse_need_llm",
-            new=AsyncMock(return_value=parsed_need),
-        )
-
-    def _patch_pending(self, pending=None):
-        return (
-            patch(
-                "shopping.capabilities.recommend.get_pending_shopping_need",
-                new=AsyncMock(return_value=pending),
-            ),
-            patch(
-                "shopping.capabilities.recommend.remember_pending_shopping_need",
-                new=AsyncMock(),
-            ),
-            patch(
-                "shopping.capabilities.recommend.clear_pending_shopping_need",
-                new=AsyncMock(),
-            ),
-            patch(
-                "shopping.capabilities.recommend.remember_product_cards",
-                new=AsyncMock(),
-            ),
-        )
-
-    def test_wrong_capability_compare(self):
-        """query 明显是对比 + 有历史卡片 → 返回 WRONG_CAPABILITY。"""
-        cap = RecommendCapability()
-        ctx = _ctx(last_product_cards=[{"product_id": 1}, {"product_id": 2}])
-
-        async def run():
-            return await cap.run(query="这两个对比一下", context=ctx)
-
-        result = asyncio.run(run())
-        assert result.action == "empty"
-        assert result.empty_reason and "compare_products" in result.empty_reason
-
-    def test_wrong_capability_detail(self):
-        cap = RecommendCapability()
-        ctx = _ctx(last_focused_product={"product_id": 1, "title": "A"})
-
-        async def run():
-            return await cap.run(query="这个多少钱", context=ctx)
-
-        result = asyncio.run(run())
-        assert result.action == "empty"
-        assert "answer_product_detail" in (result.empty_reason or "")
-
-    def test_missing_category_triggers_clarify(self):
-        """parse_need 返回空 category → clarify。"""
-        parsed = ShoppingNeed(missing_slots=["category"])
-        cap = RecommendCapability()
-
-        p_pending, p_remember, p_clear, p_cards = self._patch_pending(pending=None)
-
-        async def run():
-            with self._patch_llm(parsed), p_pending, p_remember, p_clear, p_cards:
-                return await cap.run(query="推荐一下", context=_ctx())
-
-        result = asyncio.run(run())
-        assert result.action == "clarify"
-        assert result.clarify_question
-        assert "哪类商品" in result.clarify_question
-
-    def test_two_turn_merge_produces_recommend(self):
-        """第一轮 clarify 后 pending 存了 target_user=妈妈，第二轮补 category=护肤 → 合并后可走 recommend。"""
-        pending_dict = {
-            "status": "clarifying",
-            "need": ShoppingNeed(target_user="妈妈", scenario=["礼物"]).model_dump(),
-            "missing_slots": ["category"],
-            "last_clarify_question": "?",
-            "turn_count": 1,
+def test_complete_budget_query_reaches_retrieval_without_second_parse():
+    retriever = MagicMock()
+    retriever.retrieve = AsyncMock(
+        return_value=([_candidate()], [{"source": "hybrid", "status": "ok"}])
+    )
+    ranked = RankedProduct(
+        product_id=1,
+        title="示例耳机",
+        price=699,
+        base_price=699,
+        category="数码家电",
+        sub_category="真无线耳机",
+        score=0.9,
+    )
+    judged = ranked.model_copy(
+        update={
+            "match_status": "alternative",
+            "constraint_gaps": [{"name": "budget", "expected": "500", "actual": "699"}],
         }
-        parsed_current = ShoppingNeed(category="护肤品", budget_max=300)
+    )
+    judge = AsyncMock(return_value=[judged])
 
-        # Phase 1b：主链路走 Milvus，注入 milvus_store mock（不再是 pg_vector_store）
-        mock_milvus = MagicMock()
-        candidates = [
-            {"product_id": 1, "title": "面霜", "price": 250, "base_price": 250, "brand": "X",
-             "tags": "护肤 保湿", "description": "适合成熟肌肤", "category": "护肤品",
-             "sales_count": 500, "rating": 4.7, "score": 0.9, "recall_sources": []},
-            {"product_id": 2, "title": "精华", "price": 280, "base_price": 280, "brand": "Y",
-             "tags": "护肤 抗老", "description": "抗初老", "category": "护肤品",
-             "sales_count": 300, "rating": 4.6, "score": 0.85, "recall_sources": []},
-        ]
-        mock_milvus.search = MagicMock(return_value=candidates)
-        mock_milvus.hybrid_search = MagicMock(return_value=candidates)
+    async def run():
+        with _remember_cards_patch(), patch(
+            "app.domain.shopping.capabilities.recommend._judge_ranked_candidates",
+            new=judge,
+        ):
+            return await RecommendCapability(retriever=retriever).run(
+                "推荐几款 500 元以内的耳机",
+                _ctx(),
+            )
 
-        # rerank 直接把两个候选按原顺序返回（保持真实概率）
-        mock_rerank = MagicMock()
-        mock_rerank.rerank = MagicMock(return_value=[(0, 0.95), (1, 0.85)])
+    result = asyncio.run(run())
 
-        from app.domain.shopping.retrieval import ShoppingRetriever
-        cap = RecommendCapability(
-            retriever=ShoppingRetriever(milvus_store=mock_milvus, reranker=mock_rerank),
-        )
+    assert result.action == "recommend"
+    assert result.product_cards[0]["match_status"] == "alternative"
+    plan = retriever.retrieve.await_args.args[0]
+    assert plan.primary_query == "推荐几款 500 元以内的耳机"
+    assert "parse_need" not in [item["step"] for item in result.trace]
+    judge.assert_awaited_once()
 
-        p_pending, p_remember, p_clear, p_cards = self._patch_pending(pending=pending_dict)
 
-        async def run():
-            with self._patch_llm(parsed_current), p_pending, p_remember, p_clear, p_cards:
-                return await cap.run(query="护肤品，300 左右", context=_ctx(), limit=3)
+def test_retrieval_order_reaches_judge_without_legacy_reranking():
+    unrelated = _candidate(10)
+    unrelated.update({
+        "title": "笔记本电脑",
+        "sub_category": "笔记本电脑",
+    })
+    headphones = _candidate(11)
+    retriever = MagicMock()
+    retriever.retrieve = AsyncMock(
+        return_value=([unrelated, headphones], [{"source": "hybrid", "status": "ok"}])
+    )
 
-        result = asyncio.run(run())
-        assert result.action == "recommend"
-        # merge 后 need 应该同时含 target_user 和 category
-        assert result.need.target_user == "妈妈"
-        assert result.need.category == "护肤品"
-        assert result.need.budget_max == 300
-        # 应该有 cards
-        assert len(result.product_cards) >= 1
-        # trace 应含 rank 步骤
-        steps = [t["step"] for t in result.trace]
-        assert "rank" in steps
-        assert "retrieval" in steps
+    async def judge(_query, ranked, _preferences):
+        assert [item.product_id for item in ranked] == [10, 11]
+        return [ranked[1].model_copy(update={"match_status": "alternative"})]
 
-    def test_empty_candidates_returns_empty(self):
-        """检索无结果 → action=empty。"""
-        parsed = ShoppingNeed(category="不存在的品类")
-        # Phase 1b：主链路 Milvus，注入空 milvus_store（不再是 pg_vector_store）
-        mock_milvus = MagicMock()
-        mock_milvus.search = MagicMock(return_value=[])
-        mock_milvus.hybrid_search = MagicMock(return_value=[])
-        from app.domain.shopping.retrieval import ShoppingRetriever
-        cap = RecommendCapability(
-            retriever=ShoppingRetriever(milvus_store=mock_milvus, reranker=MagicMock()),
-        )
+    async def run():
+        with _remember_cards_patch(), patch(
+            "app.domain.shopping.capabilities.recommend._judge_ranked_candidates",
+            new=AsyncMock(side_effect=judge),
+        ):
+            return await RecommendCapability(retriever=retriever).run(
+                "推荐几款 500 元以内的耳机",
+                _ctx(),
+            )
 
-        p_pending, p_remember, p_clear, p_cards = self._patch_pending(pending=None)
+    result = asyncio.run(run())
 
-        async def run():
-            with self._patch_llm(parsed), p_pending, p_remember, p_clear, p_cards:
-                return await cap.run(query="推荐个不存在的品类", context=_ctx())
+    assert result.action == "recommend"
+    assert [card["product_id"] for card in result.product_cards] == [11]
+    assert result.product_cards[0]["match_status"] == "alternative"
 
-        result = asyncio.run(run())
-        assert result.action == "empty"
-        assert result.empty_reason
+
+def test_empty_retrieval_result_returns_empty_without_judge():
+    retriever = MagicMock()
+    retriever.retrieve = AsyncMock(return_value=([], []))
+    judge = AsyncMock()
+
+    async def run():
+        with patch(
+            "app.domain.shopping.capabilities.recommend._judge_ranked_candidates",
+            new=judge,
+        ):
+            return await RecommendCapability(retriever=retriever).run(
+                "推荐不存在的商品类型",
+                _ctx(),
+            )
+
+    result = asyncio.run(run())
+
+    assert result.action == "empty"
+    assert result.empty_reason
+    judge.assert_not_awaited()

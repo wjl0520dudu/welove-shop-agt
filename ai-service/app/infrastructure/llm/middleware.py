@@ -53,14 +53,17 @@ def _get_summarization_model():
 
 # ---- SummarizationMiddleware --------------------------------------------
 
-def build_summarization_middleware() -> SummarizationMiddleware:
+def build_summarization_middleware(model: Any = None) -> SummarizationMiddleware:
     """构建对话摘要中间件。
 
     trigger: tokens > 4000 或 messages > 20 → 触发摘要
     keep: 保留最近 6 条原始消息，更早的压缩为 SystemMessage 摘要
     """
     return SummarizationMiddleware(
-        model=_get_summarization_model(),
+        # An Agent may inject its own configured model (useful for tests and
+        # for keeping summary/provider configuration aligned with the caller).
+        # Existing callers keep the lazy shared model behavior.
+        model=model or _get_summarization_model(),
         trigger=[
             ("tokens", 4000),
             ("messages", 20),

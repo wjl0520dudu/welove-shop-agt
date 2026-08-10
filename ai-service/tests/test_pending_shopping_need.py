@@ -15,7 +15,7 @@ class TestGetPendingShoppingNeed:
         from app.infrastructure.persistence.memory import get_pending_shopping_need
 
         async def run():
-            with patch("agents.memory._get_conversation", new=AsyncMock(return_value={})):
+            with patch("app.infrastructure.persistence.memory._get_conversation", new=AsyncMock(return_value={})):
                 return await get_pending_shopping_need("c1", "u1")
 
         assert asyncio.run(run()) is None
@@ -27,7 +27,7 @@ class TestGetPendingShoppingNeed:
 
         async def run():
             with patch(
-                "agents.memory._get_conversation",
+                "app.infrastructure.persistence.memory._get_conversation",
                 new=AsyncMock(return_value={"pending_shopping_need": pending}),
             ):
                 return await get_pending_shopping_need("c1", "u1")
@@ -43,8 +43,8 @@ class TestGetPendingShoppingNeed:
         async def run():
             mock_get = AsyncMock(return_value={"pending_shopping_need": pending})
             mock_set = AsyncMock()
-            with patch("agents.memory._get_conversation", new=mock_get), \
-                 patch("agents.memory._set_conversation", new=mock_set):
+            with patch("app.infrastructure.persistence.memory._get_conversation", new=mock_get), \
+                 patch("app.infrastructure.persistence.memory._set_conversation", new=mock_set):
                 result = await get_pending_shopping_need("c1", "u1")
                 # 应该触发一次清除写入
                 assert mock_set.await_count == 1
@@ -62,8 +62,8 @@ class TestRememberPendingShoppingNeed:
         async def run():
             mock_get = AsyncMock(return_value={})
             mock_set = AsyncMock()
-            with patch("agents.memory._get_conversation", new=mock_get), \
-                 patch("agents.memory._set_conversation", new=mock_set):
+            with patch("app.infrastructure.persistence.memory._get_conversation", new=mock_get), \
+                 patch("app.infrastructure.persistence.memory._set_conversation", new=mock_set):
                 await remember_pending_shopping_need(
                     "c1", "u1",
                     {"status": "clarifying", "need": {"category": None}, "turn_count": 1},
@@ -80,8 +80,8 @@ class TestRememberPendingShoppingNeed:
         async def run():
             mock_get = AsyncMock(return_value={})
             mock_set = AsyncMock()
-            with patch("agents.memory._get_conversation", new=mock_get), \
-                 patch("agents.memory._set_conversation", new=mock_set):
+            with patch("app.infrastructure.persistence.memory._get_conversation", new=mock_get), \
+                 patch("app.infrastructure.persistence.memory._set_conversation", new=mock_set):
                 await remember_pending_shopping_need("c1", "u1", {})
                 assert mock_set.await_count == 0
 
@@ -98,8 +98,8 @@ class TestClearPendingShoppingNeed:
                 "last_product_cards": [{"id": 1}],
             })
             mock_set = AsyncMock()
-            with patch("agents.memory._get_conversation", new=mock_get), \
-                 patch("agents.memory._set_conversation", new=mock_set):
+            with patch("app.infrastructure.persistence.memory._get_conversation", new=mock_get), \
+                 patch("app.infrastructure.persistence.memory._set_conversation", new=mock_set):
                 await clear_pending_shopping_need("c1", "u1")
                 assert mock_set.await_count == 1
                 saved = mock_set.await_args.args[1]
@@ -115,8 +115,8 @@ class TestClearPendingShoppingNeed:
         async def run():
             mock_get = AsyncMock(return_value={"last_product_cards": []})
             mock_set = AsyncMock()
-            with patch("agents.memory._get_conversation", new=mock_get), \
-                 patch("agents.memory._set_conversation", new=mock_set):
+            with patch("app.infrastructure.persistence.memory._get_conversation", new=mock_get), \
+                 patch("app.infrastructure.persistence.memory._set_conversation", new=mock_set):
                 await clear_pending_shopping_need("c1", "u1")
                 # 没有 pending 就不写
                 assert mock_set.await_count == 0

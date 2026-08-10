@@ -112,17 +112,28 @@ ai:
 # ---------- 云存储(本服务差异化;其他默认值从 cloud-storage-shared.yml 继承) ----------
 cloud:
   storage:
-    key-prefix: weloveshop/knowledge_docs/   # 知识库文档 OSS 存储路径
+    key-prefix: weloveshop/chat/   # 聊天图片与知识库文档分目录存放
 
 # ---------- 业务开关 ----------
 chat-service:
   context:
     # 短期记忆 Redis TTL(秒), 超过此时间的对话上下文从 DB 重建
     redis-ttl-seconds: 1800
-    # 长期记忆滑动窗口(最近 N 条消息)
-    window-size: 10
+    # H5 历史不使用此窗口；它只供旧的 Redis 对话上下文兼容路径使用。
+    window-size: ${CONVERSATION_SUMMARY_KEEP_MESSAGES:4}
+    rolling-summary:
+      # Summary runs after an assistant reply, never inside the SSE response.
+      # This mirrors SummarizationMiddleware(trigger=("messages", 20), keep=("messages", 4)).
+      enabled: ${CONVERSATION_SUMMARY_ENABLED:${ROUTER_ROLLING_SUMMARY_ENABLED:true}}
+      trigger-message-count: ${CONVERSATION_SUMMARY_TRIGGER_MESSAGES:20}
+      keep-message-count: ${CONVERSATION_SUMMARY_KEEP_MESSAGES:4}
+      max-chars: ${CONVERSATION_SUMMARY_MAX_CHARS:${ROUTER_SUMMARY_MAX_CHARS:1600}}
     # 去重窗口:同一会话 + 相同内容 在 N 秒内仅处理一次
     dedup-window-seconds: 30
+  concurrency:
+    # One visible AI turn per conversation.  The lease is slightly longer
+    # than the SSE timeout; normal terminal callbacks release it immediately.
+    turn-lock-lease-millis: ${CHAT_TURN_LOCK_LEASE_MILLIS:330000}
   sse:
     # SseEmitter 超时(毫秒)
     timeout: 300000

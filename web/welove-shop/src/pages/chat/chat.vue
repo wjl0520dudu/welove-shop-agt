@@ -138,7 +138,6 @@ import { refreshAccessToken } from '../../utils/request'
 import { buildRecommendedQuestions } from '../../utils/chatRecommend'
 import {
   streamMessage,
-  streamMultimodalMessage,
   uploadChatImage,
   sendMessage,
   getMessages,
@@ -427,6 +426,7 @@ export default {
       }
 
       const assistant = this.makeMessage({ role: 'assistant', content: '', pending: true, streaming: true })
+      assistant.clientRequestId = this.createClientRequestId()
       this.messages.push(assistant)
       // Vue3: push 进响应式数组后，须取回数组内的响应式代理再改，
       // 否则改的是裸对象引用，不会触发重渲染（流式 token 收到了但聊天框不刷新）。
@@ -435,18 +435,28 @@ export default {
       this.setStreaming(true)
       this.scrollToBottom()
 
-      await this.runStream(conv.id, content, reactiveAssistant, true, false, hasImage ? imageUrl : '')
+      await this.runStream(conv.id, content, reactiveAssistant, true, false, hasImage ? imageUrl : '', assistant.clientRequestId)
     },
-    async runStream(conversationId, content, assistant, allowAuthRetry, retry = false, imageUrl = '') {
+    async runStream(conversationId, content, assistant, allowAuthRetry, retry = false, imageUrl = '', clientRequestId = '') {
       this._streamingConvId = conversationId
+      const turnId = clientRequestId || assistant.clientRequestId || this.createClientRequestId()
+      assistant.clientRequestId = turnId
       if (!supportsEventStream()) {
+        if (imageUrl) {
+          assistant.pending = false
+          assistant.streaming = false
+          assistant.errored = true
+          uni.showToast({ title: '当前环境不支持图片检索', icon: 'none' })
+          return
+        }
         const ok = await this.fallbackSend(conversationId, content, assistant)
         if (!ok) this.markErrored(assistant, conversationId)
         return
       }
 
-      const payload = this.buildPayload(conversationId, content, retry, imageUrl)
+      const payload = this.buildPayload(conversationId, content, retry, imageUrl, turnId)
       let gotText = false
+      let streamError = null
       const callbacks = {
         onText: (delta) => {
           if (!delta) return
@@ -462,16 +472,40 @@ export default {
         // The plan and subtask events are diagnostic telemetry, not chat UI.
         onOrchestratorPlan: () => {},
         onOrchestratorSubtask: () => {},
+        // 复杂任务在一个领域子任务完成时发送完整结果。这里直接追加，
+        // 不暴露内部任务名称、DAG 或 Agent 等实现细节。
+        onSubtaskResult: (payload = {}) => {
+          assistant.pending = false
+          assistant.taskType = 'complex'
+          const answer = String(payload.answer || '').trim()
+          if (answer) {
+            assistant.content += assistant.content ? `\n\n${answer}` : answer
+            gotText = true
+          }
+          const incomingCards = Array.isArray(payload.product_cards)
+            ? payload.product_cards
+            : (Array.isArray(payload.productCards) ? payload.productCards : [])
+          if (incomingCards.length) {
+            const seen = new Set()
+            assistant.productCards = [...(assistant.productCards || []), ...incomingCards].filter((card) => {
+              const key = String(card && (card.product_id || card.productId || card.id || card.title || ''))
+              if (!key || seen.has(key)) return false
+              seen.add(key)
+              return true
+            })
+          }
+          this.scrollToBottom()
+        },
         // final 兜底：若某类回复没有逐 token 流（如 unknown/error 静态回复），用 final 的完整答案补上
         onFinalText: (text, finalPayload = {}) => {
           const finalTaskType = finalPayload.task_type || finalPayload.taskType || assistant.taskType
-          const isOrchestratorFinal = finalTaskType === 'orchestrator'
+          const isComplexFinal = finalTaskType === 'complex' || finalTaskType === 'orchestrator'
           const suggested = finalPayload.suggested_questions || finalPayload.suggestedQuestions || []
           if (Array.isArray(suggested) && suggested.length) {
             this.learnedRecommended = suggested.filter(Boolean)
             this.buildRecommended()
           }
-          if (finalTaskType === 'orchestrator') {
+          if (isComplexFinal) {
             assistant.agentMeta = {
               ...(assistant.agentMeta || {}),
               orchestratorMode: finalPayload.orchestrator_mode || 'complex',
@@ -481,9 +515,9 @@ export default {
               taskLevels: finalPayload.task_levels || []
             }
           }
-          // Orchestrator 会先流出子任务标题/子答案，final.answer 才是完整聚合结果。
-          // 不能因为 gotText=true 就丢弃 final，否则前端只能看到拆解标题。
-          if (text && (isOrchestratorFinal || !gotText)) {
+          // subtask_result 已是用户已看到的完整分段。final 只用于兼容、
+          // 元数据和没有流式内容时的兜底，不能重复覆盖或显示一份总回答。
+          if (text && !gotText) {
             assistant.pending = false
             assistant.content = text
             gotText = true
@@ -497,7 +531,7 @@ export default {
             chatStore.markNewMessage(conversationId)
           }
         },
-        onError: () => {
+        onError: (error) => {
           // 注意:AbortError 路径不会走这里——chat.vue 已在 runStream 的 catch 里显式 return。
           // 走到 onError 一定是后端真正发了 error 事件(LLM 异常 / ai-service 5xx 等)。
           assistant.pending = false
@@ -506,9 +540,12 @@ export default {
             // 没有任何 token 才标 errored,提示用户「回复中断」
             assistant.errored = true
           }
+          streamError = error || { message: '回复失败' }
+          const code = streamError && streamError.code
+          if (code === 'CHAT_CONVERSATION_BUSY' || code === 'CHAT_REQUEST_IN_PROGRESS') {
+            uni.showToast({ title: streamError.message || '当前会话正在回复，请稍后再试', icon: 'none' })
+          }
           this.syncCurrentStreaming()
-          const record = chatStore.getStream(conversationId)
-          if (record && record.handle) record.handle.abort()
         }
       }
 
@@ -520,17 +557,22 @@ export default {
       })
       this.syncCurrentStreaming()
 
-      // 有图 → 走多模态流式接口(POST /chat/multimodal/stream/messages);
-      // 无图 → 走纯文本流式接口。两个端点 payload 差别就是 imageUrl 字段,
-      // buildPayload 已经在最外面拼好了。
-      const handle = imageUrl
-        ? streamMultimodalMessage(payload, callbacks)
-        : streamMessage(payload, callbacks)
+      // The main stream endpoint accepts an optional imageUrl and selects the
+      // text-only, image-only, or text-image retrieval path on the backend.
+      const handle = streamMessage(payload, callbacks)
       if (streamRecord) streamRecord.handle = handle
       this.streamHandle = handle
       try {
         await handle.promise
-        if (assistant.streaming) this.finishStream(assistant, {}, conversationId)
+        if (streamError) {
+          if (imageUrl) {
+            const message = streamError.message || streamError.content || '图片检索失败，请更换图片后重试'
+            uni.showToast({ title: String(message).slice(0, 40), icon: 'none' })
+          }
+          this.markErrored(assistant, conversationId)
+        } else if (assistant.streaming) {
+          this.finishStream(assistant, {}, conversationId)
+        }
       } catch (err) {
         if (err && err.name === 'AbortError') {
           // 用户主动中止:保留已收 token,标 stopped,主动把半成品发给后端落库。
@@ -550,15 +592,18 @@ export default {
         if ((err && (err.status === 401 || err.status === 403)) && allowAuthRetry && !gotText) {
           const refreshed = await refreshAccessToken().catch(() => false)
           if (refreshed) {
-            return this.runStream(conversationId, content, assistant, false, false, imageUrl)
+            return this.runStream(conversationId, content, assistant, false, retry, imageUrl, turnId)
           }
           this.syncCurrentStreaming()
           toLogin('/pages/chat/chat')
           return
         }
-        if (!gotText) {
+        if (!gotText && !imageUrl) {
           const ok = await this.fallbackSend(conversationId, content, assistant)
           if (ok) return
+        }
+        if (imageUrl) {
+          uni.showToast({ title: '图片检索失败，请更换图片后重试', icon: 'none' })
         }
         this.markErrored(assistant, conversationId)
       } finally {
@@ -637,6 +682,7 @@ export default {
         confirmCard: assistant.confirmCard || null,
         cartSelection: assistant.cartSelection || null,
         taskType: assistant.taskType || '',
+        clientRequestId: assistant.clientRequestId || '',
         clientTs: Date.now()
       }
       stopStream(payload)
@@ -684,7 +730,8 @@ export default {
       this.setStreaming(true)
       this.scrollToBottom()
       try {
-        await this.runStream(conversationId, userContent, target, true, true)
+        target.clientRequestId = this.createClientRequestId()
+        await this.runStream(conversationId, userContent, target, true, true, '', target.clientRequestId)
         console.log('[retry] runStream resolved')
       } catch (e) {
         console.error('[retry] runStream rejected', e)
@@ -807,7 +854,7 @@ export default {
         learnedQuestions: this.learnedRecommended
       })
     },
-    buildPayload(conversationId, content, retry = false, imageUrl = '') {
+    buildPayload(conversationId, content, retry = false, imageUrl = '', clientRequestId = '') {
       const u = userStore.state.user || {}
       const payload = {
         userId: Number(u.id) || undefined,
@@ -818,7 +865,8 @@ export default {
         gender: u.gender,
         skinType: u.skinType,
         preferenceTags: this.normalizeTags(u.preferenceTags),
-        retry
+        retry,
+        clientRequestId
       }
       // 有图时加 imageUrl,后端 MultimodalStreamChatRequest DTO 会解析。
       // 纯文本请求不带此字段,兼容旧 StreamChatRequest。
@@ -829,6 +877,12 @@ export default {
       if (!tags) return []
       if (Array.isArray(tags)) return tags.filter(Boolean)
       return String(tags).split(/[,，、\s]+/).filter(Boolean)
+    },
+    createClientRequestId() {
+      if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID()
+      }
+      return `turn-${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`
     },
     titleFrom(content) {
       const text = String(content).trim()

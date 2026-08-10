@@ -45,19 +45,21 @@ public class ChatController {
                 UserContext.requireUserId(),
                 req.getConversationId(),
                 req.getContent(),
+                req.getImageUrl(),
                 req.getUsername() != null ? req.getUsername() : "user",
                 jwtToken,
                 req.getGender(),
                 req.getSkinType(),
                 req.getPreferenceTags(),
-                req.isRetry()
+                req.isRetry(),
+                req.getClientRequestId()
         );
     }
 
     /**
      * 多模态图文流式聊天端点。请求前先调 {@link #uploadImage} 拿到 OSS URL。
      * <p>与 {@link #streamMessages} 的区别:请求体必须带 imageUrl,content 可为空
-     * (纯图搜索)。内部转发到 ai-service /assistant/multimodal/stream。</p>
+     * (纯图搜索)。该 URL 仅保留兼容，内部与主入口统一转发到 ai-service /assistant/stream。</p>
      * <p>图片校验策略:chat-service 只在 {@link #uploadImage} 上传时做 MIME/大小校验;
      * 转发时不再 HEAD 预检 —— ai-service 侧 HEAD + DashScope 兜底会拦下坏图,
      * 通过 SSE error 事件透传给前端。</p>
@@ -66,7 +68,7 @@ public class ChatController {
     public SseEmitter streamMultimodalMessages(@RequestBody MultimodalStreamChatRequest req,
                                                 HttpServletRequest httpReq) {
         String jwtToken = extractJwt(httpReq);
-        return chatService.sendMultimodalStreamMessage(
+        return chatService.sendStreamMessage(
                 UserContext.requireUserId(),
                 req.getConversationId(),
                 req.getContent(),
@@ -76,7 +78,8 @@ public class ChatController {
                 req.getGender(),
                 req.getSkinType(),
                 req.getPreferenceTags(),
-                req.isRetry()
+                req.isRetry(),
+                req.getClientRequestId()
         );
     }
 
@@ -118,7 +121,8 @@ public class ChatController {
                 req.getConfirmCard(),
                 req.getCartSelection(),
                 req.getTaskType(),
-                req.getClientTs()
+                req.getClientTs(),
+                req.getClientRequestId()
         );
         return Result.ok(messageId);
     }

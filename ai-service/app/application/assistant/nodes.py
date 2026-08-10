@@ -1,23 +1,22 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+import json
 import logging
-from uuid import uuid4
 from typing import Any, Callable, Dict, List, Optional
-from langchain.agents import create_agent
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.config import get_stream_writer
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from app.application.assistant.state import AssistantState
 from app.infrastructure.persistence.memory import get_business_memory, remember_product_cards
 from app.domain.shopping.preferences import build_preference_questions
-from app.prompts.prompts import CHITCHAT_PROMPT
+from app.prompts.prompts import CHITCHAT_PROMPT, UNKNOWN_FALLBACK_PROMPT
 from app.infrastructure.errors import ErrorCode
+from app.infrastructure.observability.langsmith import child_run_config
+from app.domain.chitchat.agent import ChitchatAgent
 from app.domain.shopping.agent import ShoppingAgent
 from app.domain.knowledge.agent import KnowledgeAgent
 
 logger = logging.getLogger("ai-service.nodes")
-
-# 闲聊 agent 专用独立 checkpointer，与主图 checkpointer 完全隔离
-_chitchat_checkpointer = InMemorySaver()
 
 
 # ---- 多模态 shopping 推荐话术 prompt --------------------------------
@@ -75,6 +74,7 @@ async def _multimodal_shopping(
     image_url: str,
     top_k: int = 5,
     business_memory: Optional[Dict[str, Any]] = None,
+    token_sink: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """有图 shopping 分支：直接调 search_multimodal_v1，然后让 LLM 写推荐话术。
 
@@ -157,8 +157,18 @@ async def _multimodal_shopping(
             ),
         )
         try:
-            resp = await llm.ainvoke(prompt)
-            answer = str(getattr(resp, "content", "") or "").strip()
+            if token_sink is None:
+                resp = await llm.ainvoke(prompt)
+                answer = str(getattr(resp, "content", "") or "").strip()
+            else:
+                chunks: list[str] = []
+                async for chunk in llm.astream(prompt):
+                    content = _stream_text_content(getattr(chunk, "content", ""))
+                    if not content:
+                        continue
+                    chunks.append(content)
+                    _emit_stream_token(token_sink, content)
+                answer = "".join(chunks).strip()
         except Exception as e:  # noqa: BLE001
             logger.warning("multimodal shopping 生成推荐话术失败：%s", e)
             answer = ""
@@ -207,11 +217,43 @@ async def _multimodal_shopping(
     }
 
 
+def _stream_text_content(content: Any) -> str:
+    """Extract user-visible text from a LangChain stream chunk."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part["text"])
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+        )
+    return ""
+
+
+def _emit_stream_token(token_sink: Callable[[str], None], content: str) -> None:
+    try:
+        token_sink(content)
+    except Exception:  # noqa: BLE001
+        logger.debug("stream token sink unavailable", exc_info=True)
+
+
+def _graph_token_sink(content: str) -> None:
+    """Publish a real model chunk from a graph node to the SSE adapter."""
+    if not content:
+        return
+    try:
+        get_stream_writer()({"type": "token", "data": {"content": content}})
+    except Exception:  # noqa: BLE001
+        # Graph.run() uses ainvoke rather than a custom stream writer.
+        logger.debug("graph token writer unavailable", exc_info=True)
+
+
 def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
-               knowledge_agent: Optional[KnowledgeAgent] = None) -> Dict[str, Callable]:
+               knowledge_agent: Optional[KnowledgeAgent] = None,
+               chitchat_agent: Optional[ChitchatAgent] = None) -> Dict[str, Callable]:
     _shopping_holder: Dict[str, Any] = {"agent": shopping_agent}
     _knowledge_holder: Dict[str, Any] = {"agent": knowledge_agent}
-    _chitchat_holder: Dict[str, Any] = {"agent": None}
+    _chitchat_holder: Dict[str, Any] = {"agent": chitchat_agent}
 
     def get_shopping():
         if _shopping_holder["agent"] is None:
@@ -223,68 +265,60 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             _knowledge_holder["agent"] = KnowledgeAgent(llm)
         return _knowledge_holder["agent"]
 
-    def _get_chitchat_agent():
+    def get_chitchat():
         if _chitchat_holder["agent"] is None:
-            from app.infrastructure.llm.middleware import build_summarization_middleware
-            # 不挂 response_format：让 answer 走纯文本 content，才能被
-            # graph.astream 的 messages 流逐 token 吐给前端（豆包式打字机）。
-            # ToolStrategy 会把答案塞进 tool_call.args，content 为空，流式被废。
-            _chitchat_holder["agent"] = create_agent(
-                model=llm,
-                checkpointer=_chitchat_checkpointer,
-                system_prompt=CHITCHAT_PROMPT,
-                middleware=[build_summarization_middleware()],
-            )
+            _chitchat_holder["agent"] = ChitchatAgent(llm)
         return _chitchat_holder["agent"]
 
-    async def shopping_node(state: AssistantState) -> dict:
-        # 多模态分支：state 里有 image_url 时走图文多模态检索，
-        # 不进 ShoppingAgent 的 LLM tool loop（文本 LLM 看不到图，让它决定
-        # 要不要调多模态工具没意义）
+    async def shopping_node(
+        state: AssistantState,
+        run_config: RunnableConfig | None = None,
+    ) -> dict:
+        # Router controls image scope.  Text, pure-image and image+text turns
+        # all enter the same ShoppingAgent; only recommend_products chooses a
+        # different *retrieval* mode internally.
         active_task = state.get("active_subtask") or {}
         image_allowed = not active_task or bool(active_task.get("use_image"))
-        image_url = (state.get("image_url") or "").strip() if image_allowed else ""
-        if image_url:
-            try:
-                persisted_memory = await get_business_memory(
-                    state.get("conversation_id"), state.get("user_id"),
-                )
-            except Exception:  # noqa: BLE001
-                persisted_memory = {}
-            injected_memory = state.get("business_memory") or {}
-            business_memory = {**persisted_memory, **injected_memory}
-            result = await _multimodal_shopping(
-                llm=llm,
-                query_text=state.get("question", ""),
-                image_url=image_url,
-                top_k=5,
-                business_memory=business_memory,
-            )
-            # Make image retrieval behave exactly like text recommendation on
-            # the next turn.  Without this, "这两款对比" falls back to stale
-            # cards produced by an earlier text-only recommendation.
-            if result.get("product_cards"):
-                try:
-                    await remember_product_cards(
-                        state.get("conversation_id"), state.get("user_id"),
-                        result["product_cards"],
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning("multimodal product cards memory write failed", exc_info=True)
-            return _merge_result(
-                result,
-                task_type="shopping",
-                extra={"messages": [AIMessage(content=result.get("answer", ""))]},
-            )
+        router_image_mode = str(state.get("input_mode") or "text").strip().lower()
+        # Router/Planner owns image scope. An attached image that Router marks
+        # unused must never quietly become ShoppingAgent multimodal input.
+        image_in_scope = router_image_mode in {"image", "multimodal"}
+        image_url = (
+            (state.get("image_url") or "").strip()
+            if image_allowed and image_in_scope
+            else ""
+        )
+        question = str(state.get("question") or "").strip()
+        if image_url and not question:
+            question = "根据当前图片查找相似商品"
+        input_mode = "image" if image_url and router_image_mode == "image" else "text"
+        if image_url and router_image_mode == "multimodal":
+            input_mode = "multimodal"
+        # Simple turns stream through the graph sink.  Complex turns receive a
+        # task-scoped sink from the DAG executor so concurrent Agents cannot
+        # interleave their tokens in the user-visible answer.
+        token_sink = state.get("subtask_token_sink") if active_task else _graph_token_sink
 
         try:
             result = await get_shopping().run(
-                question=state.get("question", ""),
-                messages=_history_messages(state),
+                question=question,
+                # The Router already resolved cross-turn context and rewrote the
+                # question.  Do not hand raw history to the domain tool loop and
+                # accidentally create a second, competing reference resolver.
+                messages=[{"role": "user", "content": state.get("question", "")}],
                 business_memory=state.get("business_memory", {}),
                 conversation_id=state.get("conversation_id"),
                 user_id=state.get("user_id"),
                 jwt_token=state.get("jwt_token"),
+                selected_product_ids=list((state.get("business_memory") or {}).get("selected_product_ids") or []),
+                image_url=image_url or None,
+                input_mode=input_mode,
+                token_sink=token_sink,
+                run_config=child_run_config(
+                    run_config,
+                    run_name="shopping-agent",
+                    tags=["agent:shopping"],
+                ),
             )
         except Exception as e:
             logger.exception("shopping node failed")
@@ -299,13 +333,37 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         return _merge_result(result, task_type="shopping",
                              extra={"messages": [AIMessage(content=result.get("answer", ""))]})
 
-    async def knowledge_node(state: AssistantState) -> dict:
+    async def knowledge_node(
+        state: AssistantState,
+        run_config: RunnableConfig | None = None,
+    ) -> dict:
         try:
-            messages = _build_agent_messages(state)
+            # KnowledgeAgent receives the canonical current question only.  Its
+            # prior entity binding is already represented in that question by
+            # the Router, so no full history or secondary context resolver is needed.
+            messages = []
+            dependency_context = state.get("dependency_context") or []
+            if dependency_context:
+                messages.append(SystemMessage(content=(
+                    "以下是本知识子任务明确依赖的上游已验证结果。"
+                    "只能使用其中的商品、来源和结论，不得补充其他历史信息：\n"
+                    + json.dumps(dependency_context, ensure_ascii=False)
+                )))
+            messages.append(HumanMessage(content=state.get("question", "")))
             result = await get_knowledge().run(
                 messages=messages,
                 conversation_id=state.get("conversation_id", ""),
                 user_id=state.get("user_id"),
+                token_sink=(
+                    state.get("subtask_token_sink")
+                    if state.get("active_subtask")
+                    else _graph_token_sink
+                ),
+                run_config=child_run_config(
+                    run_config,
+                    run_name="knowledge-agent",
+                    tags=["agent:knowledge"],
+                ),
             )
             # 无检索结果兜底：sources 为空 或 has_answer=False 时补一句引导，
             # 但 task_type 保持 knowledge —— 不要伪装成 chitchat，否则前端行为错乱。
@@ -333,7 +391,10 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
         return _merge_result(result, task_type="knowledge",
                              extra={"messages": [AIMessage(content=result.get("answer", ""))]})
 
-    async def chitchat_node(state: AssistantState) -> dict:
+    async def chitchat_node(
+        state: AssistantState,
+        run_config: RunnableConfig | None = None,
+    ) -> dict:
         if llm is None:
             return {
                 "answer": "AI 助手暂未配置，无法闲聊。",
@@ -342,30 +403,24 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
                 "error_code": ErrorCode.LLM_NOT_CONFIGURED,
             }
         try:
-            messages = _build_agent_messages(state)
-            agent = _get_chitchat_agent()
-            # recursion_limit=5：chitchat 正常 1-2 步就出结果，5 步防死循环
-            result = await agent.ainvoke(
-                {"messages": messages},
-                config={
-                    "configurable": {"thread_id": str(uuid4())},
-                    "recursion_limit": 5,
-                },
+            # The Agent owns natural expression and middleware-based context
+            # compaction.  The parent graph provides the authoritative message
+            # history, so do not duplicate it inside the system prompt.
+            result = await get_chitchat().run(
+                messages=_build_agent_messages(state),
+                system_prompt=CHITCHAT_PROMPT.format(**_build_chitchat_prompt_context(state)),
+                token_sink=(
+                    state.get("subtask_token_sink")
+                    if state.get("active_subtask")
+                    else _graph_token_sink
+                ),
+                run_config=child_run_config(
+                    run_config,
+                    run_name="chitchat-agent",
+                    tags=["agent:chitchat"],
+                ),
             )
-            # answer 直接从最后一条 AI 消息 content 提取（纯文本，可流式）。
-            # 去 ToolStrategy 后不再有 structured_response，这里就是主路径。
-            answer = ""
-            for m in reversed(result.get("messages", [])):
-                if isinstance(m, dict):
-                    if m.get("type") == "ai" and m.get("content"):
-                        answer = str(m.get("content", ""))
-                        break
-                else:
-                    if getattr(m, "type", "") == "ai":
-                        content = getattr(m, "content", "")
-                        if isinstance(content, str) and content.strip():
-                            answer = content
-                            break
+            answer = str(result.get("answer") or "").strip()
             answer = answer or "嗯嗯，我在呢~"
         except Exception as e:
             logger.exception("chitchat node failed")
@@ -383,10 +438,43 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             "messages": [AIMessage(content=answer)],
         }
 
-    async def unknown_node(state: AssistantState) -> dict:
-        msg = state.get("route_clarification") or (
-            "我可以帮你找商品、推荐，或回答商品知识问题，请告诉我你的需求。"
+    async def unknown_node(
+        state: AssistantState,
+        run_config: RunnableConfig | None = None,
+    ) -> dict:
+        fallback = state.get("route_clarification") or (
+            "我还不确定你的需求，请清楚描述想找的商品或想了解的问题。"
         )
+        if llm is None:
+            msg = fallback
+        else:
+            try:
+                prompt = UNKNOWN_FALLBACK_PROMPT.format(
+                    current_question=str(
+                        state.get("canonical_question") or state.get("question") or ""
+                    ).strip() or "（用户没有提供文字问题）",
+                    verified_clarification=str(state.get("route_clarification") or "").strip() or "（无）",
+                )
+                chunks: list[str] = []
+                token_sink = None if state.get("active_subtask") else _graph_token_sink
+                async for chunk in llm.astream(
+                    [SystemMessage(content=prompt)],
+                    config=child_run_config(
+                        run_config,
+                        run_name="fallback-agent",
+                        tags=["agent:fallback"],
+                    ),
+                ):
+                    content = _stream_text_content(getattr(chunk, "content", ""))
+                    if not content:
+                        continue
+                    chunks.append(content)
+                    if token_sink is not None:
+                        token_sink(content)
+                msg = "".join(chunks).strip() or fallback
+            except Exception:  # noqa: BLE001
+                logger.warning("unknown fallback expression failed", exc_info=True)
+                msg = fallback
         return {
             "answer": msg,
             "task_type": "unknown",
@@ -420,6 +508,13 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
             "sub_questions": state.get("sub_questions", []),
             "sub_results": state.get("sub_results", []),
             "task_levels": state.get("task_levels", []),
+            "capability": state.get("capability"),
+            "dispatch_source": state.get("dispatch_source"),
+            "model_call_count": state.get("model_call_count"),
+            "shopping_runtime": state.get("shopping_runtime"),
+            "knowledge_runtime": state.get("knowledge_runtime"),
+            "skill_reads": state.get("skill_reads", []),
+            "script_calls": state.get("script_calls", []),
             "error": bool(state.get("error", False)),
             "error_code": state.get("error_code"),
             "message": state.get("message"),
@@ -436,10 +531,11 @@ def make_nodes(llm, shopping_agent: Optional[ShoppingAgent] = None,
 
 
 def _build_agent_messages(state: AssistantState) -> list:
-    """从共享 state 构建传给子 agent 的消息列表。
+    """Build the recent message list for Chitchat only.
 
-    子 agent（knowledge/shopping/chitchat）通过 create_agent 运行，需要 {"messages": [...]} 格式。
-    这里从 state["messages"] 中提取，带上完整对话历史，实现多 agent 共享记忆。
+    Shopping and Knowledge receive their Router-normalized question through
+    dedicated paths; Chitchat keeps dialogue messages for natural conversation
+    and explicit conversation-recall requests.
     """
     messages = state.get("messages") or []
     out = []
@@ -459,12 +555,35 @@ def _build_agent_messages(state: AssistantState) -> list:
     return out
 
 
+def _build_chitchat_prompt_context(state: AssistantState) -> dict[str, str]:
+    """Return values for the explicit Chitchat prompt template.
+
+    Prompt instructions and section layout intentionally remain in
+    ``app.prompts.prompts.CHITCHAT_PROMPT``.  This helper only serializes the
+    bounded turn data that is safe for the Chitchat Agent to read.
+    """
+    preferences = dict((state.get("business_memory") or {}).get("user_preferences") or {})
+    profile = {
+        "gender": state.get("gender") or preferences.get("gender") or "",
+        "skin_type": state.get("skin_type") or preferences.get("skin_type") or "",
+        "preference_tags": state.get("preference_tags") or preferences.get("preference_tags") or [],
+    }
+    profile = {key: value for key, value in profile.items() if value not in (None, "", [])}
+
+    current_question = str(state.get("question") or "").strip()
+    return {
+        "user_profile": json.dumps(profile, ensure_ascii=False) if profile else "暂无",
+        "current_question": current_question or "暂无",
+    }
+
+
 def _merge_result(result: Dict[str, Any], *, task_type: str,
                   extra: Dict[str, Any] = None) -> dict:
     merged: Dict[str, Any] = {}
     for key in (
-        "answer", "product_cards", "sources", "tool_calls", "suggested_questions", "retrieved_contexts",
-        "capability", "dispatch_source", "hard_constraint_violation", "error", "error_code", "message",
+            "answer", "product_cards", "sources", "tool_calls", "suggested_questions", "retrieved_contexts",
+        "capability", "dispatch_source", "model_call_count", "shopping_runtime", "knowledge_runtime", "skill_reads", "script_calls",
+        "hard_constraint_violation", "error", "error_code", "message",
     ):
         if key in result:
             merged[key] = result[key]
@@ -473,6 +592,7 @@ def _merge_result(result: Dict[str, Any], *, task_type: str,
     merged.setdefault("product_cards", [])
     merged.setdefault("sources", [])
     merged.setdefault("tool_calls", [])
+    merged.setdefault("script_calls", [])
     merged.setdefault("suggested_questions", [])
     merged.setdefault("error", False)
     if extra:

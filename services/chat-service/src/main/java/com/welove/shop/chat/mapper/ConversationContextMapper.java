@@ -3,7 +3,60 @@ package com.welove.shop.chat.mapper;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import com.welove.shop.chat.entity.ConversationContext;
 import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Insert;
+import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.Update;
 
 @Mapper
 public interface ConversationContextMapper extends BaseMapper<ConversationContext> {
+
+    /**
+     * Records that a conversation received a new visible message.
+     *
+     * <p>There is one persistent context record per conversation.  The chat
+     * stream can receive consecutive turns before Redis is repopulated, so a
+     * read-then-insert sequence is not safe here. PostgreSQL performs the
+     * insert/update atomically under the conversation_id unique index.</p>
+     */
+    @Insert("""
+            INSERT INTO conversation_context
+                (conversation_id, user_id, window_size, importance_score, update_time, create_time)
+            VALUES
+                (#{context.conversationId}, #{context.userId}, #{context.windowSize},
+                 #{context.importanceScore}, #{context.updateTime}, #{context.createTime})
+            ON CONFLICT (conversation_id) WHERE conversation_id IS NOT NULL DO UPDATE
+            SET user_id = EXCLUDED.user_id,
+                window_size = EXCLUDED.window_size,
+                importance_score = EXCLUDED.importance_score,
+                update_time = EXCLUDED.update_time
+            """)
+    int upsertActivity(@Param("context") ConversationContext context);
+
+    @Select("""
+            SELECT * FROM conversation_context
+            WHERE conversation_id = #{conversationId}
+            LIMIT 1
+            """)
+    ConversationContext selectByConversationId(@Param("conversationId") Long conversationId);
+
+    /**
+     * Persists a newer summary only.  The covered ID is the last message in
+     * the summary; the checkpoint ID is the end of the 20-message batch that
+     * caused this update.  They differ when recent raw messages are retained.
+     */
+    @Update("""
+            UPDATE conversation_context
+            SET summary = #{summary},
+                summary_covered_message_id = #{coveredMessageId},
+                summary_checkpoint_message_id = #{checkpointMessageId},
+                update_time = CURRENT_TIMESTAMP
+            WHERE conversation_id = #{conversationId}
+              AND (summary_covered_message_id IS NULL
+                   OR summary_covered_message_id < #{coveredMessageId})
+            """)
+    int updateRollingSummary(@Param("conversationId") Long conversationId,
+                             @Param("summary") String summary,
+                             @Param("coveredMessageId") Long coveredMessageId,
+                             @Param("checkpointMessageId") Long checkpointMessageId);
 }

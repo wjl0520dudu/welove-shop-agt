@@ -12,6 +12,7 @@ import com.welove.shop.chat.mapper.QaLogMapper;
 import com.welove.shop.chat.service.AiService;
 import com.welove.shop.chat.service.ConversationContextService;
 import com.welove.shop.chat.service.ChatService;
+import com.welove.shop.common.core.exception.BizException;
 import com.welove.shop.common.storage.service.StorageService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -54,10 +55,13 @@ public class ChatServiceImpl implements ChatService {
     private final QaLogMapper qaLogMapper;
     private final AiService aiService;
     private final ConversationContextService ctxService;
+    private final RollingConversationSummaryService rollingSummaryService;
+    private final ConversationTurnGuard conversationTurnGuard;
     private final StringRedisTemplate redisTemplate;
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
     private final StorageService storageService;
+    @Value("${chat-service.context.rolling-summary.enabled:true}") private boolean rollingSummaryEnabled;
     @Value("${chat-service.context.dedup-window-seconds:30}") private long dedupWindow;
     @Value("${chat-service.sse.timeout:300000}") private long sseTimeout;
     @Value("${chat-service.upload.image.max-bytes:10485760}") private long imageMaxBytes;
@@ -78,7 +82,13 @@ public class ChatServiceImpl implements ChatService {
                 .orderByDesc(Conversation::getIsPinned).orderByDesc(Conversation::getCreateTime));
     }
     @Override public List<Message> getMessages(Long conversationId) {
-        return ctxService.getConversationContext(conversationId, 0);
+        // The page history is the full persisted transcript, never the small
+        // model-context window.  Context compression must not change what a
+        // user can scroll back to in H5.
+        return msgMapper.selectList(new LambdaQueryWrapper<Message>()
+                .eq(Message::getConversationId, conversationId)
+                .orderByAsc(Message::getCreateTime)
+                .orderByAsc(Message::getId));
     }
     @Override @Transactional public void deleteConversation(Long conversationId) {
         msgMapper.delete(new LambdaQueryWrapper<Message>().eq(Message::getConversationId, conversationId));
@@ -109,15 +119,36 @@ public class ChatServiceImpl implements ChatService {
         aiMsg.setMessageType("text"); aiMsg.setTaskType(String.valueOf(aiResp.getOrDefault("task_type", "")));
         aiMsg.setCreateTime(LocalDateTime.now());
         msgMapper.insert(aiMsg);
+        ctxService.invalidateConversationContext(conversationId);
+        rollingSummaryService.scheduleUpdate(conversationId);
         saveQaLog(userId, conversationId, content, aiMsg.getContent(), aiMsg.getTaskType(), duration);
         return aiMsg;
     }
 
     // ---------- SSE stream ----------
     @Override public SseEmitter sendStreamMessage(Long userId, Long conversationId, String content,
-                                                   String username, String jwtToken,
+                                                   String imageUrl, String username, String jwtToken,
                                                    String gender, String skinType, java.util.List<String> preferenceTags,
-                                                   boolean retry) {
+                                                   boolean retry, String clientRequestId) {
+        String turnId = normalizeTurnId(clientRequestId);
+        if (!conversationTurnGuard.tryAcquire(conversationId, turnId)) {
+            return rejectedTurnEmitter(conversationId, turnId);
+        }
+        if (imageUrl != null && !imageUrl.isBlank()) {
+            return startMultimodalStreamMessage(
+                    userId, conversationId, content, imageUrl, username, jwtToken,
+                    gender, skinType, preferenceTags, retry, turnId
+            );
+        }
+        return startTextStreamMessage(
+                userId, conversationId, content, username, jwtToken,
+                gender, skinType, preferenceTags, retry, turnId
+        );
+    }
+
+    private SseEmitter startTextStreamMessage(Long userId, Long conversationId, String content,
+                                               String username, String jwtToken, String gender, String skinType,
+                                               java.util.List<String> preferenceTags, boolean retry, String turnId) {
         SseEmitter emitter = new SseEmitter(sseTimeout);
         final long streamStartMs = System.currentTimeMillis();
         // 用 AtomicBoolean 标记是否已正常完成,防止多个回调同时触发写库双写。
@@ -130,6 +161,7 @@ public class ChatServiceImpl implements ChatService {
         Map<String, Object>[] cartSelection = new Map[]{null};
         String[] sources = {""};
         Map<String, Object>[] agentMeta = new Map[]{new java.util.LinkedHashMap<>()};
+        java.util.concurrent.atomic.AtomicReference<Long> assistantMessageId = new java.util.concurrent.atomic.AtomicReference<>();
 
         // ============= SseEmitter 生命周期回调 =============
         // onCompletion: 流正常关闭时调用(包括 emitter.complete() 和客户端正常断开)
@@ -145,7 +177,7 @@ public class ChatServiceImpl implements ChatService {
             // SSE 超时也当作「客户端断开」处理(可能是网络差被服务器端提前关了)
             if (finalized.compareAndSet(false, true)) {
                 log.info("SseEmitter onTimeout, persist truncated conv={}", conversationId);
-                persistTruncatedInternal(conversationId, answerBuilder.toString(),
+                persistTruncatedInternal(conversationId, assistantMessageId.get(), answerBuilder.toString(),
                         productCards[0], confirmCard[0], cartSelection[0],
                         taskType[0], STOP_USER_ABORT);
             }
@@ -157,7 +189,7 @@ public class ChatServiceImpl implements ChatService {
                 String exMsg = ex == null ? "" : ex.getMessage();
                 log.info("SseEmitter onError (client likely disconnected): {}, persist truncated conv={}",
                         exMsg == null ? "(null)" : exMsg, conversationId);
-                persistTruncatedInternal(conversationId, answerBuilder.toString(),
+                persistTruncatedInternal(conversationId, assistantMessageId.get(), answerBuilder.toString(),
                         productCards[0], confirmCard[0], cartSelection[0],
                         taskType[0], STOP_USER_ABORT);
             }
@@ -166,14 +198,21 @@ public class ChatServiceImpl implements ChatService {
 
         CompletableFuture.runAsync(() -> {
             try {
-                // retry=true 时跳过 dedup 检查 (前端点「重新生成」会用相同的 content),
-                // 同时跳过 saveUserMessage 避免历史里出现重复 user msg。
-                if (!retry && isDuplicate(conversationId, content)) { emitter.complete(); return; }
+                Message existingAssistant = findAssistantByTurnId(conversationId, turnId);
+                if (existingAssistant != null) {
+                    replayExistingTurn(emitter, existingAssistant);
+                    conversationTurnGuard.release(conversationId, turnId);
+                    return;
+                }
+                // retry=true 时不再写用户消息；每次重新生成使用新的 turnId，避免
+                // 与初始提交的幂等键混淆。
                 if (!retry) {
-                    Message userMsg = saveUserMessage(conversationId, content);
+                    Message userMsg = saveUserMessage(conversationId, content, null, turnId);
                     ctxService.updateConversationContext(conversationId, userId, userMsg);
                 }
                 if (!retry && isFirstMessage(conversationId)) aiService.generateTitle(conversationId, content);
+                Message streamingAssistant = createStreamingAssistant(conversationId, turnId);
+                assistantMessageId.set(streamingAssistant.getId());
 
                 // 拼 AI 请求体 —— 对齐 ai-service /api/assistant/stream 的 ChatRequest schema
                 Map<String, Object> aiBody = new java.util.HashMap<>();
@@ -181,6 +220,7 @@ public class ChatServiceImpl implements ChatService {
                 aiBody.put("conversation_id", conversationId.toString());
                 aiBody.put("user_id", userId.toString());
                 aiBody.put("conversation_history", buildConversationHistory(conversationId));
+                aiBody.put("conversation_summary", buildConversationSummary(conversationId));
                 aiBody.put("username", username);
                 aiBody.put("is_admin", false);
                 if (jwtToken != null) aiBody.put("jwt_token", jwtToken);
@@ -230,6 +270,9 @@ public class ChatServiceImpl implements ChatService {
                         case "orchestrator_subtask":
                             captureOrchestratorMeta(eventType, event, agentMeta[0]);
                             break;
+                        case "subtask_result":
+                            captureSubtaskResult(event, answerBuilder, productCards[0]);
+                            break;
                         case "token":
                             answerBuilder.append(event.getOrDefault("content", ""));
                             break;
@@ -240,18 +283,15 @@ public class ChatServiceImpl implements ChatService {
                             captureFinalAgentMeta(event, agentMeta[0]);
                             // ai-service 的 final data 即完整 AIResponse，字段在顶层(非嵌套 response)
                             Object finalAnswer = event.get("answer");
-                            String finalTaskType = String.valueOf(event.getOrDefault("task_type", ""));
-                            if ("orchestrator".equals(finalTaskType)
-                                    && finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
-                                // 编排模式的 token 主要是子任务流；最终聚合答案必须作为持久化权威结果。
+                            if (finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
+                                // final.answer is authoritative. Token frames are only for
+                                // progressive rendering and may include intermediate text.
                                 answerBuilder.setLength(0);
-                                answerBuilder.append(finalAnswer);
-                            } else if (answerBuilder.length() == 0 && finalAnswer != null) {
                                 answerBuilder.append(finalAnswer);
                             }
                             if (event.containsKey("task_type")) taskType[0] = String.valueOf(event.get("task_type"));
                             if (event.get("product_cards") instanceof java.util.List<?> pc) {
-                                productCards[0] = (java.util.List<Map<String, Object>>) pc;
+                                mergeProductCards(productCards[0], pc);
                             }
                             if (event.get("confirm_card") instanceof Map<?, ?> cc) {
                                 confirmCard[0] = (Map<String, Object>) cc;
@@ -273,27 +313,12 @@ public class ChatServiceImpl implements ChatService {
                     if (!finalized.compareAndSet(false, true)) return;
                     try {
                         String answer = answerBuilder.toString();
-                        // 持久化 AI 消息(含 productCards / confirmCard / cartSelection)
-                        Message aiMsg = new Message();
-                        aiMsg.setConversationId(conversationId);
-                        aiMsg.setRole("assistant");
-                        aiMsg.setContent(answer.isEmpty() ? "AI 暂时无法回复,请稍后再试" : answer);
-                        aiMsg.setMessageType("text");
-                        aiMsg.setTaskType(taskType[0].isEmpty() ? "shopping" : taskType[0]);
-                        aiMsg.setStatus(STATUS_DONE);
-                        if (!productCards[0].isEmpty()) {
-                            aiMsg.setProductCards(productCards[0]);
-                        }
-                        if (confirmCard[0] != null) {
-                            aiMsg.setConfirmCard(confirmCard[0]);
-                        }
-                        if (cartSelection[0] != null) {
-                            aiMsg.setCartSelection(cartSelection[0]);
-                        }
-                        aiMsg.setSources(sources[0].isEmpty() ? null : sources[0]);
-                        if (!agentMeta[0].isEmpty()) aiMsg.setAgentMeta(agentMeta[0]);
-                        aiMsg.setCreateTime(LocalDateTime.now());
-                        msgMapper.insert(aiMsg);
+                        Message aiMsg = completeStreamingAssistant(
+                                assistantMessageId.get(), answer, taskType[0], productCards[0],
+                                confirmCard[0], cartSelection[0], sources[0], agentMeta[0]
+                        );
+                        ctxService.invalidateConversationContext(conversationId);
+                        rollingSummaryService.scheduleUpdate(conversationId);
                         long streamDuration = System.currentTimeMillis() - streamStartMs;
                         saveQaLog(userId, conversationId, content, answer, taskType[0].isEmpty() ? "shopping" : taskType[0], streamDuration);
                         // 发送 done 事件并关闭 (set finalized 已在上面 compareAndSet 完成)
@@ -318,7 +343,7 @@ public class ChatServiceImpl implements ChatService {
                     }
                     log.error("SSE stream error (ai-service upstream)", e);
                     String answer = answerBuilder.toString();
-                    Long errId = persistTruncatedInternal(conversationId, answer,
+                    Long errId = persistTruncatedInternal(conversationId, assistantMessageId.get(), answer,
                             productCards[0], confirmCard[0], cartSelection[0],
                             taskType[0], STOP_SERVER);
                     try {
@@ -328,16 +353,17 @@ public class ChatServiceImpl implements ChatService {
                         emitter.send(SseEmitter.event().name("error").data(payload));
                     } catch (IOException ex) { }
                     emitter.complete();
-                }).subscribe();
+                }).doFinally(signal -> conversationTurnGuard.release(conversationId, turnId)).subscribe();
             } catch (Exception e) {
                 log.error("SSE setup error", e);
                 if (finalized.compareAndSet(false, true)) {
-                    persistTruncatedInternal(conversationId, "", null, null, null, "", STOP_SERVER);
+                    persistTruncatedInternal(conversationId, assistantMessageId.get(), "", null, null, null, "", STOP_SERVER);
                 }
                 try {
                     emitter.send(SseEmitter.event().name("error").data(Map.of("content", e.getMessage())));
                     emitter.complete();
                 } catch (IOException ex) { emitter.completeWithError(ex); }
+                conversationTurnGuard.release(conversationId, turnId);
             }
         });
         return emitter;
@@ -349,7 +375,7 @@ public class ChatServiceImpl implements ChatService {
      * 用 "MM-DIFF" 标记,便于对照:
      * <ul>
      *   <li>MM-DIFF-1:aiBody 多带一个 image_url</li>
-     *   <li>MM-DIFF-2:WebClient uri 走 /assistant/multimodal/stream</li>
+     *   <li>MM-DIFF-2:WebClient 与文本请求共用 /assistant/stream，携带 image_url</li>
      *   <li>MM-DIFF-3:saveUserMessage 传 imageUrl,落 message_type=multimodal_image</li>
      *   <li>MM-DIFF-4:content 允许为空(纯图搜索);dedup 用带 [MM] 前缀区分</li>
      * </ul>
@@ -360,7 +386,24 @@ public class ChatServiceImpl implements ChatService {
     @Override public SseEmitter sendMultimodalStreamMessage(Long userId, Long conversationId, String content,
                                                              String imageUrl, String username, String jwtToken,
                                                              String gender, String skinType, java.util.List<String> preferenceTags,
-                                                             boolean retry) {
+                                                             boolean retry, String clientRequestId) {
+        if (imageUrl == null || imageUrl.trim().isEmpty()) {
+            throw new IllegalArgumentException("imageUrl 不能为空(多模态流式请求)");
+        }
+        String turnId = normalizeTurnId(clientRequestId);
+        if (!conversationTurnGuard.tryAcquire(conversationId, turnId)) {
+            return rejectedTurnEmitter(conversationId, turnId);
+        }
+        return startMultimodalStreamMessage(
+                userId, conversationId, content, imageUrl, username, jwtToken,
+                gender, skinType, preferenceTags, retry, turnId
+        );
+    }
+
+    private SseEmitter startMultimodalStreamMessage(Long userId, Long conversationId, String content,
+                                                      String imageUrl, String username, String jwtToken,
+                                                      String gender, String skinType, java.util.List<String> preferenceTags,
+                                                      boolean retry, String turnId) {
         // MM-DIFF-4:content 可空,但 imageUrl 必须有 —— 控制器已经做了非空校验,这里防御性再判一次
         if (imageUrl == null || imageUrl.trim().isEmpty()) {
             throw new IllegalArgumentException("imageUrl 不能为空(多模态流式请求)");
@@ -377,12 +420,13 @@ public class ChatServiceImpl implements ChatService {
         Map<String, Object>[] cartSelection = new Map[]{null};
         String[] sources = {""};
         Map<String, Object>[] agentMeta = new Map[]{new java.util.LinkedHashMap<>()};
+        java.util.concurrent.atomic.AtomicReference<Long> assistantMessageId = new java.util.concurrent.atomic.AtomicReference<>();
 
         emitter.onCompletion(() -> log.debug("SseEmitter[MM] onCompletion conv={}", conversationId));
         emitter.onTimeout(() -> {
             if (finalized.compareAndSet(false, true)) {
                 log.info("SseEmitter[MM] onTimeout, persist truncated conv={}", conversationId);
-                persistTruncatedInternal(conversationId, answerBuilder.toString(),
+                persistTruncatedInternal(conversationId, assistantMessageId.get(), answerBuilder.toString(),
                         productCards[0], confirmCard[0], cartSelection[0],
                         taskType[0], STOP_USER_ABORT);
             }
@@ -393,7 +437,7 @@ public class ChatServiceImpl implements ChatService {
                 String exMsg = ex == null ? "" : ex.getMessage();
                 log.info("SseEmitter[MM] onError (client likely disconnected): {}, persist truncated conv={}",
                         exMsg == null ? "(null)" : exMsg, conversationId);
-                persistTruncatedInternal(conversationId, answerBuilder.toString(),
+                persistTruncatedInternal(conversationId, assistantMessageId.get(), answerBuilder.toString(),
                         productCards[0], confirmCard[0], cartSelection[0],
                         taskType[0], STOP_USER_ABORT);
             }
@@ -401,19 +445,23 @@ public class ChatServiceImpl implements ChatService {
 
         CompletableFuture.runAsync(() -> {
             try {
-                // MM-DIFF-4:dedup key 加 [MM] 前缀,避免与纯文本流冲突;纯图搜索时 safeContent 为空,
-                // isDuplicate 仍按 hashCode 去重(空字符串 hash 稳定,窗口内不会重复触发,符合预期)
-                String dedupKey = "[MM]" + safeContent + "|" + imageUrl;
-                if (!retry && isDuplicate(conversationId, dedupKey)) { emitter.complete(); return; }
+                Message existingAssistant = findAssistantByTurnId(conversationId, turnId);
+                if (existingAssistant != null) {
+                    replayExistingTurn(emitter, existingAssistant);
+                    conversationTurnGuard.release(conversationId, turnId);
+                    return;
+                }
                 // MM-DIFF-3:落 user 消息时带 imageUrl
                 if (!retry) {
-                    Message userMsg = saveUserMessage(conversationId, safeContent, imageUrl);
+                    Message userMsg = saveUserMessage(conversationId, safeContent, imageUrl, turnId);
                     ctxService.updateConversationContext(conversationId, userId, userMsg);
                 }
                 if (!retry && isFirstMessage(conversationId)) {
                     // 纯图搜索没有 content,用占位符生成标题;LLM 侧看到 [图片] 会尝试生成"图片搜索"类标题
                     aiService.generateTitle(conversationId, safeContent.isEmpty() ? "[图片]" : safeContent);
                 }
+                Message streamingAssistant = createStreamingAssistant(conversationId, turnId);
+                assistantMessageId.set(streamingAssistant.getId());
 
                 Map<String, Object> aiBody = new java.util.HashMap<>();
                 aiBody.put("question", safeContent);
@@ -421,6 +469,7 @@ public class ChatServiceImpl implements ChatService {
                 aiBody.put("conversation_id", conversationId.toString());
                 aiBody.put("user_id", userId.toString());
                 aiBody.put("conversation_history", buildConversationHistory(conversationId));
+                aiBody.put("conversation_summary", buildConversationSummary(conversationId));
                 aiBody.put("username", username);
                 aiBody.put("is_admin", false);
                 if (jwtToken != null) aiBody.put("jwt_token", jwtToken);
@@ -431,7 +480,7 @@ public class ChatServiceImpl implements ChatService {
                 org.springframework.core.ParameterizedTypeReference<org.springframework.http.codec.ServerSentEvent<String>> sseType =
                         new org.springframework.core.ParameterizedTypeReference<>() {};
                 Flux<org.springframework.http.codec.ServerSentEvent<String>> flux = webClient.post()
-                        .uri("/assistant/multimodal/stream")  // MM-DIFF-2
+                        .uri("/assistant/stream")
                         .accept(org.springframework.http.MediaType.TEXT_EVENT_STREAM)
                         .bodyValue(aiBody)
                         .retrieve().bodyToFlux(sseType);
@@ -461,6 +510,9 @@ public class ChatServiceImpl implements ChatService {
                         case "orchestrator_subtask":
                             captureOrchestratorMeta(eventType, event, agentMeta[0]);
                             break;
+                        case "subtask_result":
+                            captureSubtaskResult(event, answerBuilder, productCards[0]);
+                            break;
                         case "token":
                             answerBuilder.append(event.getOrDefault("content", ""));
                             break;
@@ -470,18 +522,15 @@ public class ChatServiceImpl implements ChatService {
                         case "final":
                             captureFinalAgentMeta(event, agentMeta[0]);
                             Object finalAnswer = event.get("answer");
-                            String finalTaskType = String.valueOf(event.getOrDefault("task_type", ""));
-                            if ("orchestrator".equals(finalTaskType)
-                                    && finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
-                                // 图文场景也可能进入编排链路，最终聚合答案不能被子任务 token 覆盖。
+                            if (finalAnswer != null && !String.valueOf(finalAnswer).isBlank()) {
+                                // Keep persisted history aligned with the final response,
+                                // never with intermediate multimodal/tool chunks.
                                 answerBuilder.setLength(0);
-                                answerBuilder.append(finalAnswer);
-                            } else if (answerBuilder.length() == 0 && finalAnswer != null) {
                                 answerBuilder.append(finalAnswer);
                             }
                             if (event.containsKey("task_type")) taskType[0] = String.valueOf(event.get("task_type"));
                             if (event.get("product_cards") instanceof java.util.List<?> pc) {
-                                productCards[0] = (java.util.List<Map<String, Object>>) pc;
+                                mergeProductCards(productCards[0], pc);
                             }
                             if (event.get("confirm_card") instanceof Map<?, ?> cc) {
                                 confirmCard[0] = (Map<String, Object>) cc;
@@ -505,21 +554,12 @@ public class ChatServiceImpl implements ChatService {
                     if (!finalized.compareAndSet(false, true)) return;
                     try {
                         String answer = answerBuilder.toString();
-                        Message aiMsg = new Message();
-                        aiMsg.setConversationId(conversationId);
-                        aiMsg.setRole("assistant");
-                        aiMsg.setContent(answer.isEmpty() ? "AI 暂时无法回复,请稍后再试" : answer);
-                        // assistant 消息本身不带图,message_type 仍是 text
-                        aiMsg.setMessageType(MSG_TYPE_TEXT);
-                        aiMsg.setTaskType(taskType[0].isEmpty() ? "shopping" : taskType[0]);
-                        aiMsg.setStatus(STATUS_DONE);
-                        if (!productCards[0].isEmpty()) aiMsg.setProductCards(productCards[0]);
-                        if (confirmCard[0] != null) aiMsg.setConfirmCard(confirmCard[0]);
-                        if (cartSelection[0] != null) aiMsg.setCartSelection(cartSelection[0]);
-                        aiMsg.setSources(sources[0].isEmpty() ? null : sources[0]);
-                        if (!agentMeta[0].isEmpty()) aiMsg.setAgentMeta(agentMeta[0]);
-                        aiMsg.setCreateTime(LocalDateTime.now());
-                        msgMapper.insert(aiMsg);
+                        Message aiMsg = completeStreamingAssistant(
+                                assistantMessageId.get(), answer, taskType[0], productCards[0],
+                                confirmCard[0], cartSelection[0], sources[0], agentMeta[0]
+                        );
+                        ctxService.invalidateConversationContext(conversationId);
+                        rollingSummaryService.scheduleUpdate(conversationId);
                         saveQaLog(userId, conversationId,
                                 safeContent.isEmpty() ? "[图片]" : safeContent,
                                 answer,
@@ -541,7 +581,7 @@ public class ChatServiceImpl implements ChatService {
                     }
                     log.error("SSE[MM] stream error (ai-service upstream)", e);
                     String answer = answerBuilder.toString();
-                    Long errId = persistTruncatedInternal(conversationId, answer,
+                    Long errId = persistTruncatedInternal(conversationId, assistantMessageId.get(), answer,
                             productCards[0], confirmCard[0], cartSelection[0],
                             taskType[0], STOP_SERVER);
                     try {
@@ -554,16 +594,17 @@ public class ChatServiceImpl implements ChatService {
                         emitter.send(SseEmitter.event().name("error").data(payload));
                     } catch (IOException ex) { }
                     emitter.complete();
-                }).subscribe();
+                }).doFinally(signal -> conversationTurnGuard.release(conversationId, turnId)).subscribe();
             } catch (Exception e) {
                 log.error("SSE[MM] setup error", e);
                 if (finalized.compareAndSet(false, true)) {
-                    persistTruncatedInternal(conversationId, "", null, null, null, "", STOP_SERVER);
+                    persistTruncatedInternal(conversationId, assistantMessageId.get(), "", null, null, null, "", STOP_SERVER);
                 }
                 try {
                     emitter.send(SseEmitter.event().name("error").data(Map.of("content", e.getMessage())));
                     emitter.complete();
                 } catch (IOException ex) { emitter.completeWithError(ex); }
+                conversationTurnGuard.release(conversationId, turnId);
             }
         });
         return emitter;
@@ -600,8 +641,19 @@ public class ChatServiceImpl implements ChatService {
             throw new IllegalArgumentException("不支持的图片类型:" + contentType + ",允许:" + normalized);
         }
         // 3) 存 OSS
-        String objectKey = storageService.put(file);
-        String url = storageService.getUrl(objectKey);
+        String objectKey;
+        String url;
+        try {
+            objectKey = storageService.put(file);
+            url = storageService.getUrl(objectKey);
+        } catch (RuntimeException ex) {
+            log.error("[uploadChatImage] object storage upload failed, mime={}, size={}",
+                    contentType, size, ex);
+            throw new BizException("图片上传失败，请检查对象存储配置、写入权限和 Bucket 地域");
+        }
+        if (url.contains("localhost") || url.contains("127.0.0.1")) {
+            throw new BizException("图片上传未启用可公开访问的对象存储，请配置 CLOUD_STORAGE_ACCESS_KEY、CLOUD_STORAGE_SECRET_KEY、CLOUD_STORAGE_BUCKET 和 CLOUD_STORAGE_DOMAIN");
+        }
         log.info("[uploadChatImage] key={} url={} size={} mime={}", objectKey, url, size, contentType);
         Map<String, Object> res = new java.util.HashMap<>();
         res.put("objectKey", objectKey);
@@ -628,8 +680,11 @@ public class ChatServiceImpl implements ChatService {
                                                                      List<Map<String, Object>> productCards,
                                                                      Map<String, Object> confirmCard,
                                                                      Map<String, Object> cartSelection,
-                                                                     String taskType, Long clientTs) {
-        return persistTruncatedInternal(conversationId, content, productCards, confirmCard, cartSelection, taskType, STOP_USER_ABORT);
+                                                                     String taskType, Long clientTs, String clientRequestId) {
+        String turnId = normalizeProvidedTurnId(clientRequestId);
+        Message assistant = turnId == null ? null : findAssistantByTurnId(conversationId, turnId);
+        return persistTruncatedInternal(conversationId, assistant == null ? null : assistant.getId(), content,
+                productCards, confirmCard, cartSelection, taskType, STOP_USER_ABORT);
     }
 
     /**
@@ -637,13 +692,36 @@ public class ChatServiceImpl implements ChatService {
      * 去重策略:同 conversation + 同 content 前缀 + 60s 内已有 truncated 记录 → 跳过。
      * 返回新插入(或去重命中已存在)的 message id;content 为空时跳过(避免空消息)。
      */
-    private Long persistTruncatedInternal(Long conversationId, String content,
+    private Long persistTruncatedInternal(Long conversationId, Long assistantMessageId, String content,
                                           List<Map<String, Object>> productCards,
                                           Map<String, Object> confirmCard,
                                           Map<String, Object> cartSelection,
                                           String taskType, String stoppedReason) {
         log.info("[truncated] enter persistTruncatedInternal conv={} reason={} contentLen={}",
                 conversationId, stoppedReason, content == null ? 0 : content.length());
+        if (assistantMessageId != null) {
+            try {
+                Message assistant = msgMapper.selectById(assistantMessageId);
+                if (assistant == null || !conversationId.equals(assistant.getConversationId())) {
+                    return null;
+                }
+                if (content != null && !content.isEmpty()) assistant.setContent(content);
+                assistant.setStatus(STATUS_TRUNCATED);
+                assistant.setStoppedReason(stoppedReason);
+                assistant.setStoppedAt(LocalDateTime.now());
+                if (productCards != null && !productCards.isEmpty()) assistant.setProductCards(productCards);
+                if (confirmCard != null) assistant.setConfirmCard(confirmCard);
+                if (cartSelection != null) assistant.setCartSelection(cartSelection);
+                if (taskType != null && !taskType.isEmpty()) assistant.setTaskType(taskType);
+                msgMapper.updateById(assistant);
+                ctxService.invalidateConversationContext(conversationId);
+                return assistant.getId();
+            } catch (Exception e) {
+                log.error("[truncated] update streaming assistant failed conv={} messageId={}",
+                        conversationId, assistantMessageId, e);
+                return null;
+            }
+        }
         if (content == null || content.isEmpty()) {
             log.info("skip persist truncated: empty content conv={}", conversationId);
             return null;
@@ -683,23 +761,26 @@ public class ChatServiceImpl implements ChatService {
     }
 
     // ---------- 私有 ----------
+    /** Legacy non-stream endpoint compatibility. SSE turns use turnId + conversation lock instead. */
     private boolean isDuplicate(Long convId, String content) {
-        String key = DEDUP_PREFIX + convId + ":" + content.hashCode();
-        Boolean ok = redisTemplate.opsForValue().setIfAbsent(key, "1", Duration.ofSeconds(dedupWindow));
-        return Boolean.FALSE.equals(ok);
+        String key = DEDUP_PREFIX + convId + ":" + (content == null ? 0 : content.hashCode());
+        Boolean accepted = redisTemplate.opsForValue().setIfAbsent(key, "1", Duration.ofSeconds(dedupWindow));
+        return Boolean.FALSE.equals(accepted);
     }
+
     private Message saveUserMessage(Long convId, String content) {
-        return saveUserMessage(convId, content, null);
+        return saveUserMessage(convId, content, null, null);
     }
     /**
      * 落库 user 消息。imageUrl 非空 → message_type=multimodal_image + image_url 写入;
      * 否则走原有 message_type=text 逻辑。允许 content 为空(纯图搜索场景),此时
      * content 落成占位符方便 UI 渲染。
      */
-    private Message saveUserMessage(Long convId, String content, String imageUrl) {
+    private Message saveUserMessage(Long convId, String content, String imageUrl, String turnId) {
         Message m = new Message();
         m.setConversationId(convId);
         m.setRole("user");
+        m.setTurnId(turnId);
         String safeContent = content != null ? content : "";
         boolean hasImage = imageUrl != null && !imageUrl.isEmpty();
         if (safeContent.isEmpty() && hasImage) {
@@ -712,6 +793,105 @@ public class ChatServiceImpl implements ChatService {
         m.setCreateTime(LocalDateTime.now());
         msgMapper.insert(m);
         return m;
+    }
+
+    private Message createStreamingAssistant(Long conversationId, String turnId) {
+        Message assistant = new Message();
+        assistant.setConversationId(conversationId);
+        assistant.setTurnId(turnId);
+        assistant.setRole("assistant");
+        assistant.setContent("");
+        assistant.setMessageType(MSG_TYPE_TEXT);
+        assistant.setStatus("streaming");
+        assistant.setCreateTime(LocalDateTime.now());
+        msgMapper.insert(assistant);
+        return assistant;
+    }
+
+    private Message completeStreamingAssistant(Long assistantMessageId, String answer, String taskType,
+                                                List<Map<String, Object>> productCards,
+                                                Map<String, Object> confirmCard,
+                                                Map<String, Object> cartSelection,
+                                                String sources, Map<String, Object> agentMeta) {
+        if (assistantMessageId == null) {
+            throw new IllegalStateException("streaming assistant message is missing");
+        }
+        Message assistant = msgMapper.selectById(assistantMessageId);
+        if (assistant == null) {
+            throw new IllegalStateException("streaming assistant message does not exist: " + assistantMessageId);
+        }
+        assistant.setContent(answer == null || answer.isEmpty() ? "AI 暂时无法回复,请稍后再试" : answer);
+        assistant.setMessageType(MSG_TYPE_TEXT);
+        assistant.setTaskType(taskType == null || taskType.isEmpty() ? "shopping" : taskType);
+        assistant.setStatus(STATUS_DONE);
+        assistant.setStoppedReason(null);
+        assistant.setStoppedAt(null);
+        if (productCards != null && !productCards.isEmpty()) assistant.setProductCards(productCards);
+        if (confirmCard != null) assistant.setConfirmCard(confirmCard);
+        if (cartSelection != null) assistant.setCartSelection(cartSelection);
+        assistant.setSources(sources == null || sources.isEmpty() ? null : sources);
+        if (agentMeta != null && !agentMeta.isEmpty()) assistant.setAgentMeta(agentMeta);
+        msgMapper.updateById(assistant);
+        return assistant;
+    }
+
+    private Message findAssistantByTurnId(Long conversationId, String turnId) {
+        if (conversationId == null || turnId == null || turnId.isBlank()) return null;
+        return msgMapper.selectOne(new LambdaQueryWrapper<Message>()
+                .eq(Message::getConversationId, conversationId)
+                .eq(Message::getTurnId, turnId)
+                .eq(Message::getRole, "assistant")
+                .last("LIMIT 1"));
+    }
+
+    private SseEmitter rejectedTurnEmitter(Long conversationId, String turnId) {
+        SseEmitter emitter = new SseEmitter(sseTimeout);
+        String code = conversationTurnGuard.isOwnedBy(conversationId, turnId)
+                ? "CHAT_REQUEST_IN_PROGRESS" : "CHAT_CONVERSATION_BUSY";
+        String message = "CHAT_REQUEST_IN_PROGRESS".equals(code)
+                ? "相同请求正在处理中，请勿重复提交"
+                : "当前会话正在回复，请等待完成后继续发送";
+        try {
+            emitter.send(SseEmitter.event().name("error").data(Map.of("code", code, "message", message)));
+        } catch (IOException ignored) {
+            // The caller has already gone away; there is no server-side turn to clean up.
+        }
+        emitter.complete();
+        return emitter;
+    }
+
+    private void replayExistingTurn(SseEmitter emitter, Message assistant) {
+        try {
+            if ("streaming".equals(assistant.getStatus())) {
+                emitter.send(SseEmitter.event().name("error").data(Map.of(
+                        "code", "CHAT_REQUEST_IN_PROGRESS", "message", "相同请求正在处理中，请勿重复提交"
+                )));
+            } else {
+                Map<String, Object> finalPayload = new java.util.LinkedHashMap<>();
+                finalPayload.put("answer", assistant.getContent());
+                finalPayload.put("task_type", assistant.getTaskType());
+                finalPayload.put("product_cards", assistant.getProductCards() == null ? List.of() : assistant.getProductCards());
+                finalPayload.put("confirm_card", assistant.getConfirmCard());
+                finalPayload.put("cart_selection", assistant.getCartSelection());
+                emitter.send(SseEmitter.event().name("final").data(objectMapper.writeValueAsString(finalPayload)));
+                emitter.send(SseEmitter.event().name("done").data(Map.of("messageId", assistant.getId())));
+            }
+        } catch (Exception e) {
+            log.warn("existing turn replay failed messageId={}: {}", assistant.getId(), e.getMessage());
+        } finally {
+            emitter.complete();
+        }
+    }
+
+    private static String normalizeTurnId(String clientRequestId) {
+        String provided = normalizeProvidedTurnId(clientRequestId);
+        return provided == null ? java.util.UUID.randomUUID().toString() : provided;
+    }
+
+    private static String normalizeProvidedTurnId(String clientRequestId) {
+        if (clientRequestId == null) return null;
+        String value = clientRequestId.trim();
+        return value.isEmpty() ? null : value.substring(0, Math.min(64, value.length()));
     }
     private boolean isFirstMessage(Long convId) {
         return msgMapper.selectCount(new LambdaQueryWrapper<Message>()
@@ -732,13 +912,24 @@ public class ChatServiceImpl implements ChatService {
     }
 
     /**
-     * Provide AI with the same persisted message window used by conversation
-     * replay. Product cards and image URLs are turn artifacts, so a follow-up
-     * such as "这两款对比" can bind to the exact preceding response instead of
-     * a mutable global last_product_cards cache.
+     * Build the one raw suffix that accompanies the persisted summary.
+     *
+     * <p>When summary is enabled and available, this returns every visible
+     * message after its coverage point.  Normally that is the configured
+     * four-message keep window; while an async summary is pending or failed it
+     * may be longer.  That fallback is deliberate: no visible message may be
+     * removed from the model context before a summary has actually persisted.</p>
      */
     private List<Map<String, Object>> buildConversationHistory(Long conversationId) {
-        List<Message> messages = ctxService.getConversationContext(conversationId, 0);
+        var summaryContext = rollingSummaryEnabled
+                ? ctxService.getRollingSummaryContext(conversationId)
+                : null;
+        Long coveredMessageId = summaryContext != null
+                && summaryContext.getSummary() != null
+                && !summaryContext.getSummary().isBlank()
+                ? summaryContext.getSummaryCoveredMessageId()
+                : null;
+        List<Message> messages = msgMapper.selectVisibleMessagesAfter(conversationId, coveredMessageId);
         List<Map<String, Object>> history = new java.util.ArrayList<>();
         for (Message message : messages) {
             Map<String, Object> item = new java.util.LinkedHashMap<>();
@@ -754,13 +945,77 @@ public class ChatServiceImpl implements ChatService {
         return history;
     }
 
+    /**
+     * The Router and ChitchatAgent receive this same persisted summary through
+     * the assistant request.  Raw messages remain in chat_svc.message; this
+     * method never treats Redis as the source of summary truth.
+     */
+    private String buildConversationSummary(Long conversationId) {
+        if (!rollingSummaryEnabled) return "";
+        var context = ctxService.getRollingSummaryContext(conversationId);
+        return context == null || context.getSummary() == null ? "" : context.getSummary();
+    }
+
     private static void captureFinalAgentMeta(Map<String, Object> event, Map<String, Object> agentMeta) {
-        if (!"orchestrator".equals(String.valueOf(event.getOrDefault("task_type", "")))) return;
+        if (!isComplexTask(String.valueOf(event.getOrDefault("task_type", "")))) return;
         agentMeta.put("orchestratorMode", event.getOrDefault("orchestrator_mode", "complex"));
         agentMeta.put("orchestratorReason", event.get("orchestrator_reason"));
         agentMeta.put("subQuestions", event.getOrDefault("sub_questions", List.of()));
         agentMeta.put("subResults", event.getOrDefault("sub_results", List.of()));
         agentMeta.put("taskLevels", event.getOrDefault("task_levels", List.of()));
+    }
+
+    /**
+     * ``orchestrator`` is the legacy internal node label.  New AI Service
+     * responses expose the Router semantic result as ``complex`` instead.
+     */
+    private static boolean isComplexTask(String taskType) {
+        return "complex".equals(taskType) || "orchestrator".equals(taskType);
+    }
+
+    /**
+     * Accumulate a completed complex-task segment for persistence.  The same
+     * event has already been forwarded to H5; this method only ensures that a
+     * normal completion or an interrupted stream can replay what the user saw.
+     */
+    @SuppressWarnings("unchecked")
+    private static void captureSubtaskResult(Map<String, Object> event,
+                                             StringBuilder answerBuilder,
+                                             java.util.List<Map<String, Object>> productCards) {
+        String answer = String.valueOf(event.getOrDefault("answer", "")).trim();
+        if (!answer.isEmpty()) {
+            if (answerBuilder.length() > 0) answerBuilder.append("\n\n");
+            answerBuilder.append(answer);
+        }
+        Object cards = event.get("product_cards");
+        if (!(cards instanceof java.util.List<?>)) cards = event.get("productCards");
+        if (cards instanceof java.util.List<?> list) {
+            mergeProductCards(productCards, list);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void mergeProductCards(java.util.List<Map<String, Object>> target,
+                                          java.util.List<?> incoming) {
+        java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+        for (Map<String, Object> card : target) {
+            seen.add(productCardKey(card));
+        }
+        for (Object item : incoming) {
+            if (!(item instanceof Map<?, ?> raw)) continue;
+            Map<String, Object> card = new java.util.LinkedHashMap<>((Map<String, Object>) raw);
+            String key = productCardKey(card);
+            if (!key.isEmpty() && !seen.add(key)) continue;
+            target.add(card);
+        }
+    }
+
+    private static String productCardKey(Map<String, Object> card) {
+        Object id = card.get("product_id");
+        if (id == null) id = card.get("productId");
+        if (id == null) id = card.get("id");
+        if (id == null) id = card.get("title");
+        return id == null ? "" : String.valueOf(id);
     }
 
     private void saveQaLog(Long userId, Long convId, String question, String answer, String taskType, long duration) {
