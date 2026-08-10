@@ -24,7 +24,7 @@
             <text class="sku-name">{{ formatProperties(sku) }}</text>
             <text class="sku-stock">库存 {{ getStock(sku) }}</text>
           </view>
-          <text class="sku-price">¥{{ formatPrice(sku.price) }}</text>
+          <text class="sku-price">{{ formatPrice(sku.price) }}</text>
         </view>
       </scroll-view>
 

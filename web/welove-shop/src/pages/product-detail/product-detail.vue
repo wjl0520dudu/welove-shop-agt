@@ -32,7 +32,7 @@
         </view>
         <text class="title">{{ product.title || product.name || '未命名商品' }}</text>
         <view class="price-row">
-          <text class="price">¥{{ currentPrice }}</text>
+          <text class="price">{{ currentPrice }}</text>
           <text class="sales">{{ product.salesCount || 0 }} 人付款</text>
         </view>
         <view class="meta-row">
@@ -54,7 +54,7 @@
         </view>
         <view v-if="skus.length" class="selected-sku">
           <text>{{ selectedSkuText }}</text>
-          <text class="selected-price">¥{{ currentPrice }}</text>
+          <text class="selected-price">{{ currentPrice }}</text>
         </view>
         <text v-else class="muted">默认规格</text>
       </view>
