@@ -17,7 +17,7 @@
         <text class="rating">{{ rating }} 分</text>
       </view>
       <view class="row">
-        <text class="price">¥{{ price }}</text>
+        <text class="price">{{ price }}</text>
         <text class="sales">{{ product.salesCount || product.sales || 0 }} 人买过</text>
       </view>
     </view>
