@@ -168,9 +168,9 @@ services:
     environment:
       SHOP_DOMAIN: ${SHOP_DOMAIN}
       ADMIN_DOMAIN: ${ADMIN_DOMAIN}
-    # Start with HTTP for the first deployment. Add :443 after Certbot/HTTPS
-    # has been configured as described in the deployment guide.
-    ports: ["80:80"]
+    # User-facing HTTPS uses the Let's Encrypt certificate in the mounted
+    # certbot directory. Admin remains HTTP until its DNS record is enabled.
+    ports: ["80:80", "443:443"]
     volumes:
       - /opt/welove-shop/nginx:/etc/nginx/templates:ro
       - /opt/welove-shop/certbot/conf:/etc/letsencrypt:ro

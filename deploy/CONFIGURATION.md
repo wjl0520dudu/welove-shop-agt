@@ -27,6 +27,37 @@ cd /opt/welove-shop
 docker compose --env-file config/production.env --env-file secrets/production.secrets.env -f docker-compose.prod.yml up -d
 ```
 
+## 用户端 HTTPS
+
+`SHOP_DOMAIN` 必须先通过 A 记录解析到生产服务器，安全组开放 TCP `80/443`。首次启动 HTTPS Nginx 前，使用 Certbot standalone 模式生成证书：
+
+```bash
+mkdir -p /opt/welove-shop/certbot/conf /opt/welove-shop/certbot/www
+docker run --rm -p 80:80 \
+  -v /opt/welove-shop/certbot/conf:/etc/letsencrypt \
+  -v /opt/welove-shop/certbot/www:/var/www/certbot \
+  certbot/certbot:latest certonly --standalone --non-interactive \
+  --agree-tos --no-eff-email --email "$CERTBOT_EMAIL" -d "$SHOP_DOMAIN"
+```
+
+证书位于 `/opt/welove-shop/certbot/conf/live/$SHOP_DOMAIN/`，由 Nginx 只读挂载。当前管理端域名仍使用 HTTP；只有在 `ADMIN_DOMAIN` 完成 DNS 解析并签发对应证书后才能启用管理端 HTTPS。
+
+证书续期使用仓库中的 `deploy/renew-certificates.sh`。部署时将脚本安装到 `/opt/welove-shop/scripts/renew-certificates.sh`，并配置每天自动检查：
+
+```bash
+mkdir -p /opt/welove-shop/scripts /opt/welove-shop/logs
+install -m 0755 deploy/renew-certificates.sh /opt/welove-shop/scripts/renew-certificates.sh
+(crontab -l 2>/dev/null; echo '17 3 * * * /opt/welove-shop/scripts/renew-certificates.sh >> /opt/welove-shop/logs/certbot-renew.log 2>&1') | crontab -
+```
+
+Certbot 每天检查但只在证书进入续期窗口时签发新证书。脚本会在续期检查后先执行 `nginx -t`，通过后再热重载 Nginx。首次配置或修改续期逻辑后必须执行模拟续期：
+
+```bash
+/opt/welove-shop/scripts/renew-certificates.sh --dry-run
+```
+
+定期检查 `/opt/welove-shop/logs/certbot-renew.log`，并在外部监控证书剩余有效期；仅配置 cron 不能覆盖服务器宕机、Docker 故障或 CA 请求失败等情况。
+
 ## 聊天图片对象存储
 
 聊天图片必须上传到 AI 服务与 DashScope 都能访问的公开 URL；容器本地磁盘地址不能用于多模态检索。在服务器的
