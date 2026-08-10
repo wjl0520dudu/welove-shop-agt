@@ -5,7 +5,6 @@ import com.welove.shop.user.entity.User;
 import com.welove.shop.user.mapper.UserMapper;
 import com.welove.shop.user.service.AuthService;
 import com.welove.shop.user.service.TestLoginService;
-import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -14,88 +13,65 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 测试登录实现。
  * <p>
- * 5 个固定测试手机号共享池(19800000001~19800000005),轮询使用。
- * 每个账号的 username = "体验用户_xxxx",头像走默认占位,无真实数据。
+ * 每次体验登录创建一个独立测试账号。账号带 {@code is_test=true} 标识，
+ * 避免不同浏览器或面试体验者共享聊天、收藏、订单等用户数据。
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class TestLoginServiceImpl implements TestLoginService {
 
-    /** 测试账号池大小;同时也是轮询模数。 */
-    private static final int POOL_SIZE = 5;
-
-    /** 测试手机号前缀:198 是中国电信 11 号段(尚未大规模商用),做体验号池不容易与真实用户冲突。 */
+    /** 测试手机号前缀，仅用于系统内体验账号标识，不走短信通道。 */
     private static final String TEST_PHONE_PREFIX = "198";
 
     private static final String TEST_PASSWORD_PLACEHOLDER = "test-login-placeholder";
 
-    /** 轮询下标,所有请求共享。 */
-    private final AtomicInteger counter = new AtomicInteger(0);
+    /** 11 位体验手机号剩余的 8 位数字空间。 */
+    private static final long TEST_PHONE_SUFFIX_BOUND = 100_000_000L;
+
+    /** 同一实例内单调分配，重启后仍会通过数据库存在性检查避开旧账号。 */
+    private final AtomicLong phoneSequence = new AtomicLong(
+            ThreadLocalRandom.current().nextLong(TEST_PHONE_SUFFIX_BOUND));
 
     private final UserMapper userMapper;
     private final AuthService authService;
     private final PasswordEncoder passwordEncoder;
 
-    /** 启动时预热:确保 5 个测试账号存在(DB 缓存预热,降低首次体验延迟)。 */
-    @PostConstruct
-    @Transactional
-    public void warmup() {
-        ensureTestAccounts();
-    }
-
     @Override
+    @Transactional
     public Map<String, Object> testLogin() {
-        // 1. 确保账号池完整(防御性:warmup 失败 / 被人手动删除的场景)
-        ensureTestAccounts();
+        User user = createFreshTestUser();
 
-        // 2. 轮询选一个账号
-        int idx = Math.floorMod(counter.incrementAndGet(), POOL_SIZE);
-        String phone = TEST_PHONE_PREFIX + String.format("%09d", idx + 1);
-
-        User user = userMapper.selectOne(
-                new LambdaQueryWrapper<User>().eq(User::getPhone, phone));
-        if (user == null) {
-            // 极端并发场景:两个请求同时触发 ensureTestAccounts,只有一个写入成功;
-            // 另一个的 select 查不到,再创建一次。
-            user = createTestUser(phone);
-        }
-        if (user.getStatus() != null && user.getStatus() == 0) {
-            // 测试账号不应该被禁用,但万一被运维手动禁用,跳过到下一个
-            log.warn("[test-login] 测试账号 {} 被禁用,跳过", phone);
-            return testLogin();   // 递归到下一个(最多 POOL_SIZE 次,实际不可能)
-        }
-
-        // 3. 更新最后登录时间
+        // 体验账号也记录最后登录时间，供后续按 is_test 标记清理。
         user.setLastLoginAt(LocalDateTime.now());
         user.setUpdateTime(LocalDateTime.now());
         userMapper.updateById(user);
 
-        log.info("[test-login] 体验用户登录: phone={}, userId={}", phone, user.getId());
+        log.info("[test-login] 创建并登录独立体验用户: phone={}, userId={}", user.getPhone(), user.getId());
 
-        // 4. 复用 AuthService 的 token 生成逻辑(已提到接口上)
+        // 复用普通登录的 token 生成逻辑，前端和下游服务无需区分。
         return authService.generateTokenResponse(user);
     }
 
     // ---------- 私有 ----------
 
-    /**
-     * 检查 5 个测试账号是否都存在;不存在则创建。
-     */
-    private void ensureTestAccounts() {
-        for (int i = 1; i <= POOL_SIZE; i++) {
-            String phone = TEST_PHONE_PREFIX + String.format("%09d", i);
+    private User createFreshTestUser() {
+        for (int attempt = 0; attempt < 32; attempt++) {
+            long suffix = Math.floorMod(phoneSequence.getAndIncrement(), TEST_PHONE_SUFFIX_BOUND);
+            String phone = TEST_PHONE_PREFIX + String.format("%08d", suffix);
             boolean exists = userMapper.selectCount(
                     new LambdaQueryWrapper<User>().eq(User::getPhone, phone)) > 0;
             if (!exists) {
-                createTestUser(phone);
+                return createTestUser(phone);
             }
         }
+        throw new IllegalStateException("无法分配独立体验账号，请稍后重试");
     }
 
     private User createTestUser(String phone) {

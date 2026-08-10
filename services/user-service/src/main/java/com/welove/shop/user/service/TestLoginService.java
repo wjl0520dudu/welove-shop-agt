@@ -13,18 +13,17 @@ import java.util.Map;
  * <p>
  * 设计:
  * <ul>
- *   <li>固定 5 个测试账号(共享池),每次请求从池里轮询一个,避免每次新建用户</li>
- *   <li>首次启动时若池为空,自动创建</li>
+ *   <li>每次体验登录创建独立测试账号,避免不同体验者共享聊天、收藏和订单数据</li>
  *   <li>更新 last_login_at 供后续清理任务使用</li>
  *   <li>频控由 Controller 层用 Redis 实现,见 TestLoginController</li>
  * </ul>
  * <p>
- * 清理任务设计见 {@code docs/plan/test-login.md} §4(本期不实现,仅文档)。
+ * 账号清理策略见 {@code docs/plan/test-login.md} §4。
  */
 public interface TestLoginService {
 
     /**
-     * 执行测试登录:从共享池取一个测试账号,更新最后登录时间,颁发 token。
+     * 执行测试登录:创建独立测试账号,记录最后登录时间并颁发 token。
      *
      * @return 与普通 login 相同的响应结构({@code token, refreshToken, user, tokenType})
      */

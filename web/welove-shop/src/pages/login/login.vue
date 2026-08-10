@@ -76,7 +76,7 @@ export default {
     },
     /**
      * 测试登录:一键跳过手机号+验证码,直接拿 token 进入系统。
-     * 服务端从 5 个共享测试账号池里轮询一个,频控由后端做(IP 1 分钟 5 次)。
+     * 服务端创建独立体验账号,频控由后端做(IP 1 分钟 5 次)。
      * 设计文档:docs/plan/test-login.md
      */
     async handleTestLogin() {
