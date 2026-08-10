@@ -25,6 +25,12 @@ from app.infrastructure.config import config
 
 
 SKILLS_ROOT = AI_SERVICE_ROOT / "skills" / "shopping-agent"
+
+
+def test_production_image_copies_deep_agent_skills():
+    dockerfile = (AI_SERVICE_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY skills ./skills" in dockerfile
 EXPECTED_SKILLS = {
     "discover-products",
     "compare-products",
