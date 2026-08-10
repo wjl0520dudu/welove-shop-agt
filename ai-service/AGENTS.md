@@ -9,7 +9,7 @@ This file extends the root `AGENTS.md` for the `ai-service` directory. When inst
 - **Assistant Graph**: request analysis, routing, complex task orchestration, subtask execution, and response synthesis.
 - **Shopping**: product recommendation, comparison, detail retrieval, user context, and multimodal search.
 - **Knowledge / RAG**: knowledge base parsing, chunking, vector retrieval, reranking, Q&A, and web search fallback.
-- **Memory**: conversational business memory, product cards, user preferences, and knowledge entities.
+- **Context**: Router/Chitchat shared visible context built from chat-service's persisted rolling summary plus recent messages; task-scoped product cards, user preferences and knowledge entities.
 - **Infrastructure**: LLM, DashScope, Milvus, pgvector, PostgreSQL, Java API, and LangGraph runtime.
 
 ## Startup
@@ -36,6 +36,40 @@ Source code lives under `app/` with a layered structure:
 - **`app/prompts/`** — Centralized prompts for chitchat, knowledge Q&A, shopping, and Assistant Agents.
 
 `evals/`, `scripts/`, and `tests/` stay at the `ai-service/` root.
+
+## Skills-Driven Domain Agents
+
+`ShoppingAgent` and `KnowledgeAgent` use `deepagents==0.7.1` by default. Their detailed workflows belong in `skills/`, not in a growing system prompt:
+
+```text
+skills/
+├─ shopping-agent/
+│  ├─ discover-products/
+│  ├─ compare-products/
+│  ├─ inspect-product/
+│  ├─ use-shopping-profile/
+│  └─ multimodal-consistency/
+└─ knowledge-agent/
+   ├─ answer-with-evidence/
+   └─ answer-safety-question/
+```
+
+- New Agent skills go under `skills/<agent-name>/<skill-name>/SKILL.md` and require YAML `name` and `description` frontmatter.
+- Keep a Skill focused on one capability. It must describe allowed inputs, ordered use of real tools, error/empty behavior, factual boundaries and final-response boundaries.
+- Existing domain tool contracts remain authoritative. Do not invent product facts, product IDs, sources or internal state inside a Skill.
+- Shopping `scripts/` are optional deterministic helpers, run only through `run_shopping_skill_script` and the fixed whitelist. Never add or expose a generic shell, `execute`, filesystem-write or subagent tool.
+- DeepAgent permissions are deliberately read-only to the agent's own Skill path. Preserve the blocked built-in surface (`execute`, writes, deletes, `task`, generic search and todos).
+- Router resolves cross-turn references and product bindings. Skills consume the resolved current task; Shopping/Knowledge must not receive or reread full conversation history.
+- If a tool, Skill path, middleware or runtime switch changes, update the matching unit tests and `.env.example` documentation.
+
+## Context, State and SSE
+
+- `chat-service` owns the full durable visible transcript in `chat_svc.message`, the rolling summary and its coverage watermark. `ai-service` does not persist summary text directly during a user turn.
+- `resolve_context` is the only shared preparation point for Router and Chitchat. It injects the persisted summary once and appends recent visible messages.
+- `AssistantState.messages` is graph working state. It is refreshed from chat-service's visible history per request and is not a substitute for database conversation truth.
+- Shopping and Knowledge should receive only the Router-resolved current question, bound entities/product IDs, allowed image scope, explicit dependency artifacts and relevant soft preferences.
+- Keep `start`, `route`, `token`, `product_cards`, `orchestrator_plan`, `subtask_result`, `final`, `error` and `done` SSE semantics stable. Do not emit Agent tool calls, Candidate Judge JSON or internal model chunks as visible user tokens.
+- Complex DAG nodes may execute concurrently, but visible token release follows Planner order. Do not add a final summary model merely to concatenate answers unless the public contract explicitly changes.
 
 ## Import Rules
 

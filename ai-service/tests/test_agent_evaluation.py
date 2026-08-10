@@ -4,7 +4,7 @@ from pathlib import Path
 from evals.agent_contract import validate_agent_contract
 from evals.dataset_contract import GOLDEN_CASE_COUNT, SCENARIO_COUNTS, validate_golden_dataset
 from evals.agent_metrics import calculate_agent_metrics, compare_reports
-from evals.run_agent_eval import DEFAULT_DATASET, evaluate, load_jsonl
+from evals.run_agent_eval import DEFAULT_DATASET, _summarize_judge, evaluate, load_jsonl
 from evals.retrieval_metrics import retrieval_metrics_at_k
 
 
@@ -92,6 +92,39 @@ def test_metrics_treat_judge_as_task_success_gate_and_compare_baseline():
     comparison = compare_reports({"metrics": metrics, "cases": rows}, {"metrics": {"contract_pass_rate": 0.5, "task_success_rate": 1.0, "pass@1": 1.0}, "cases": []})
     assert comparison["metric_deltas"]["contract_pass_rate"] == 0.5
     assert comparison["new_failures"] == ["b"]
+
+
+def test_judge_metric_pass_rate_excludes_skipped_metrics_from_numerator_and_denominator():
+    rows = [
+        {
+            "judge": {
+                "enabled": True,
+                "passed": True,
+                "score": 1.0,
+                "metrics": {"tool_correctness": {"score": 1.0, "passed": True}},
+            }
+        },
+        {
+            "judge": {
+                "enabled": True,
+                "passed": True,
+                "score": 1.0,
+                "metrics": {
+                    "tool_correctness": {
+                        "score": None,
+                        "passed": True,
+                        "reason": "skipped: required_tools is not specified for this case",
+                    }
+                },
+            }
+        },
+    ]
+
+    tool_summary = _summarize_judge(rows)["metric_breakdown"]["tool_correctness"]
+
+    assert tool_summary["pass_rate"] == 1.0
+    assert tool_summary["sample_count"] == 1
+    assert tool_summary["skipped_count"] == 1
 
 
 def test_golden_dataset_is_stratified_and_evaluate_is_dependency_free():

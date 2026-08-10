@@ -749,15 +749,13 @@ def _summarize_judge(rows: list[dict[str, Any]]) -> dict[str, Any]:
         metric_keys.update((item.get("metrics") or {}).keys())
     metric_breakdown: dict[str, dict[str, Any]] = {}
     for key in sorted(metric_keys):
-        metric_scores = [
-            float(m["score"])
+        evaluated_metrics = [
+            m
             for item in enabled
             if (m := (item.get("metrics") or {}).get(key)) and m.get("score") is not None and not m.get("error")
         ]
-        metric_passed = sum(
-            1 for item in enabled
-            if (m := (item.get("metrics") or {}).get(key)) and m.get("passed") is True
-        )
+        metric_scores = [float(metric["score"]) for metric in evaluated_metrics]
+        metric_passed = sum(metric.get("passed") is True for metric in evaluated_metrics)
         metric_errors = sum(
             1 for item in enabled
             if (m := (item.get("metrics") or {}).get(key)) and m.get("error")
@@ -766,6 +764,7 @@ def _summarize_judge(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "average_score": round(sum(metric_scores) / len(metric_scores), 4) if metric_scores else None,
             "pass_rate": round(metric_passed / len(metric_scores), 4) if metric_scores else None,
             "sample_count": len(metric_scores),
+            "skipped_count": len(enabled) - len(metric_scores) - metric_errors,
             "error_count": metric_errors,
         }
 
