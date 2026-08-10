@@ -3,6 +3,21 @@ server {
   server_name ${SHOP_DOMAIN};
   client_max_body_size 50m;
   location /.well-known/acme-challenge/ { root /var/www/certbot; }
+  location / { return 301 https://$host$request_uri; }
+}
+
+server {
+  listen 443 ssl;
+  http2 on;
+  server_name ${SHOP_DOMAIN};
+  client_max_body_size 50m;
+
+  ssl_certificate /etc/letsencrypt/live/${SHOP_DOMAIN}/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/${SHOP_DOMAIN}/privkey.pem;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  ssl_session_cache shared:SSL:10m;
+  ssl_session_timeout 1d;
+
   location / { proxy_pass http://shop-web:80; proxy_set_header Host $host; }
   location /api/ {
     proxy_pass http://gateway:8080;
