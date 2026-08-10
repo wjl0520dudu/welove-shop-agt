@@ -17,8 +17,12 @@
             mode="aspectFit"
             @tap="previewImage"
           />
+          <MarkdownContent
+            v-if="displayContent && !isUser"
+            :content="displayContent"
+          />
           <text
-            v-if="displayContent"
+            v-else-if="displayContent"
             class="text"
             :user-select="true"
             :selectable="true"
@@ -45,10 +49,11 @@
 
 <script>
 import TypingIndicator from './TypingIndicator.vue'
+import MarkdownContent from './MarkdownContent.vue'
 
 export default {
   name: 'MessageBubble',
-  components: { TypingIndicator },
+  components: { TypingIndicator, MarkdownContent },
   props: {
     message: { type: Object, required: true },
     userInitial: { type: String, default: '我' }
