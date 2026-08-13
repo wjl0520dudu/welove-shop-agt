@@ -52,11 +52,24 @@ public interface ConversationContextMapper extends BaseMapper<ConversationContex
                 summary_checkpoint_message_id = #{checkpointMessageId},
                 update_time = CURRENT_TIMESTAMP
             WHERE conversation_id = #{conversationId}
+              AND summary_revision = #{expectedSummaryRevision}
               AND (summary_covered_message_id IS NULL
                    OR summary_covered_message_id < #{coveredMessageId})
             """)
     int updateRollingSummary(@Param("conversationId") Long conversationId,
                              @Param("summary") String summary,
                              @Param("coveredMessageId") Long coveredMessageId,
-                             @Param("checkpointMessageId") Long checkpointMessageId);
+                             @Param("checkpointMessageId") Long checkpointMessageId,
+                             @Param("expectedSummaryRevision") Long expectedSummaryRevision);
+
+    @Update("""
+            UPDATE conversation_context
+            SET summary = NULL,
+                summary_covered_message_id = NULL,
+                summary_checkpoint_message_id = NULL,
+                summary_revision = summary_revision + 1,
+                update_time = CURRENT_TIMESTAMP
+            WHERE conversation_id = #{conversationId}
+            """)
+    int resetRollingSummaryForRegeneration(@Param("conversationId") Long conversationId);
 }

@@ -45,6 +45,9 @@ public class ConversationContextServiceImpl implements ConversationContextServic
         List<Message> msgs = messageMapper.selectList(
                 new LambdaQueryWrapper<Message>()
                         .eq(Message::getConversationId, conversationId)
+                        .and(wrapper -> wrapper.ne(Message::getRole, "assistant")
+                                .or()
+                                .isNull(Message::getSupersededByMessageId))
                         .orderByDesc(Message::getCreateTime)
                         .last("LIMIT " + limit));
         Collections.reverse(msgs);
@@ -77,13 +80,20 @@ public class ConversationContextServiceImpl implements ConversationContextServic
 
     @Override
     public boolean updateRollingSummary(Long conversationId, String summary, Long coveredMessageId,
-                                        Long checkpointMessageId) {
+                                        Long checkpointMessageId, Long expectedSummaryRevision) {
         if (conversationId == null || coveredMessageId == null || checkpointMessageId == null
-                || summary == null || summary.isBlank()) {
+                || expectedSummaryRevision == null || summary == null || summary.isBlank()) {
             return false;
         }
         return ctxMapper.updateRollingSummary(
-                conversationId, summary, coveredMessageId, checkpointMessageId) > 0;
+                conversationId, summary, coveredMessageId, checkpointMessageId, expectedSummaryRevision) > 0;
+    }
+
+    @Override
+    public void resetRollingSummaryForRegeneration(Long conversationId) {
+        if (conversationId == null) return;
+        ctxMapper.resetRollingSummaryForRegeneration(conversationId);
+        invalidateConversationContext(conversationId);
     }
 
     @Override

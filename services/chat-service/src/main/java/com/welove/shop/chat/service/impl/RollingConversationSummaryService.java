@@ -61,6 +61,8 @@ public class RollingConversationSummaryService {
             ConversationContext context = contextService.getRollingSummaryContext(conversationId);
             Long coveredMessageId = context == null ? null : context.getSummaryCoveredMessageId();
             Long checkpointMessageId = context == null ? null : context.getSummaryCheckpointMessageId();
+            Long summaryRevision = context == null || context.getSummaryRevision() == null
+                    ? 0L : context.getSummaryRevision();
 
             // Count only complete visible messages added after the prior batch
             // checkpoint.  Keeping the newest four messages therefore does not
@@ -97,7 +99,7 @@ public class RollingConversationSummaryService {
             }
 
             boolean updated = contextService.updateRollingSummary(
-                    conversationId, summary, targetMessageId, currentCheckpointId);
+                    conversationId, summary, targetMessageId, currentCheckpointId, summaryRevision);
             log.info("rolling summary {} conv={} coveredMessageId={} checkpointMessageId={} summarizedMessages={} triggerMessages={} keepMessages={}",
                     updated ? "updated" : "skipped", conversationId, targetMessageId,
                     currentCheckpointId, newlyEligible.size(), triggerMessageCount, keepMessageCount);

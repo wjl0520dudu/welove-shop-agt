@@ -5,6 +5,7 @@ import com.welove.shop.chat.entity.Message;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.Update;
 
 import java.util.List;
 
@@ -20,6 +21,7 @@ public interface MessageMapper extends BaseMapper<Message> {
         WHERE conversation_id = #{conversationId}
           AND role IN ('user', 'assistant')
           AND (status IS NULL OR status = 'done')
+          AND (role <> 'assistant' OR superseded_by_message_id IS NULL)
         ORDER BY id DESC
         OFFSET #{recentWindow}
         LIMIT 1
@@ -35,6 +37,7 @@ public interface MessageMapper extends BaseMapper<Message> {
           AND id <= #{throughMessageId}
           AND role IN ('user', 'assistant')
           AND (status IS NULL OR status = 'done')
+          AND (role <> 'assistant' OR superseded_by_message_id IS NULL)
         ORDER BY id ASC
         """)
     List<Message> selectMessagesForRollingSummary(
@@ -49,11 +52,24 @@ public interface MessageMapper extends BaseMapper<Message> {
           AND id > COALESCE(#{afterMessageId}, 0)
           AND role IN ('user', 'assistant')
           AND (status IS NULL OR status = 'done')
+          AND (role <> 'assistant' OR superseded_by_message_id IS NULL)
         ORDER BY id ASC
         """)
     List<Message> selectVisibleMessagesAfter(
             @Param("conversationId") Long conversationId,
             @Param("afterMessageId") Long afterMessageId);
+
+    @Update("""
+        UPDATE chat_svc.message
+        SET superseded_by_message_id = #{replacementMessageId}
+        WHERE id = #{messageId}
+          AND conversation_id = #{conversationId}
+          AND role = 'assistant'
+          AND superseded_by_message_id IS NULL
+        """)
+    int markAssistantSuperseded(@Param("conversationId") Long conversationId,
+                                @Param("messageId") Long messageId,
+                                @Param("replacementMessageId") Long replacementMessageId);
 
     /**
      * 去重查询:同一 conversation 下,近 N 秒内 status='truncated' 且内容前缀匹配的截断消息。
