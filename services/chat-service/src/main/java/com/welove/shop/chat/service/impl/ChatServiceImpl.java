@@ -87,6 +87,9 @@ public class ChatServiceImpl implements ChatService {
         // user can scroll back to in H5.
         return msgMapper.selectList(new LambdaQueryWrapper<Message>()
                 .eq(Message::getConversationId, conversationId)
+                .and(wrapper -> wrapper.ne(Message::getRole, "assistant")
+                        .or()
+                        .isNull(Message::getSupersededByMessageId))
                 .orderByAsc(Message::getCreateTime)
                 .orderByAsc(Message::getId));
     }
@@ -129,7 +132,8 @@ public class ChatServiceImpl implements ChatService {
     @Override public SseEmitter sendStreamMessage(Long userId, Long conversationId, String content,
                                                    String imageUrl, String username, String jwtToken,
                                                    String gender, String skinType, java.util.List<String> preferenceTags,
-                                                   boolean retry, String clientRequestId) {
+                                                   boolean retry, String clientRequestId,
+                                                   Long replacesAssistantMessageId) {
         String turnId = normalizeTurnId(clientRequestId);
         if (!conversationTurnGuard.tryAcquire(conversationId, turnId)) {
             return rejectedTurnEmitter(conversationId, turnId);
@@ -137,18 +141,19 @@ public class ChatServiceImpl implements ChatService {
         if (imageUrl != null && !imageUrl.isBlank()) {
             return startMultimodalStreamMessage(
                     userId, conversationId, content, imageUrl, username, jwtToken,
-                    gender, skinType, preferenceTags, retry, turnId
+                    gender, skinType, preferenceTags, retry, turnId, replacesAssistantMessageId
             );
         }
         return startTextStreamMessage(
                 userId, conversationId, content, username, jwtToken,
-                gender, skinType, preferenceTags, retry, turnId
+                gender, skinType, preferenceTags, retry, turnId, replacesAssistantMessageId
         );
     }
 
     private SseEmitter startTextStreamMessage(Long userId, Long conversationId, String content,
                                                String username, String jwtToken, String gender, String skinType,
-                                               java.util.List<String> preferenceTags, boolean retry, String turnId) {
+                                               java.util.List<String> preferenceTags, boolean retry, String turnId,
+                                               Long replacesAssistantMessageId) {
         SseEmitter emitter = new SseEmitter(sseTimeout);
         final long streamStartMs = System.currentTimeMillis();
         // 用 AtomicBoolean 标记是否已正常完成,防止多个回调同时触发写库双写。
@@ -211,8 +216,11 @@ public class ChatServiceImpl implements ChatService {
                     ctxService.updateConversationContext(conversationId, userId, userMsg);
                 }
                 if (!retry && isFirstMessage(conversationId)) aiService.generateTitle(conversationId, content);
+                validateRegenerationTarget(conversationId, retry, replacesAssistantMessageId);
                 Message streamingAssistant = createStreamingAssistant(conversationId, turnId);
                 assistantMessageId.set(streamingAssistant.getId());
+                applyRegenerationReplacement(conversationId, retry, replacesAssistantMessageId,
+                        streamingAssistant.getId());
 
                 // 拼 AI 请求体 —— 对齐 ai-service /api/assistant/stream 的 ChatRequest schema
                 Map<String, Object> aiBody = new java.util.HashMap<>();
@@ -386,7 +394,8 @@ public class ChatServiceImpl implements ChatService {
     @Override public SseEmitter sendMultimodalStreamMessage(Long userId, Long conversationId, String content,
                                                              String imageUrl, String username, String jwtToken,
                                                              String gender, String skinType, java.util.List<String> preferenceTags,
-                                                             boolean retry, String clientRequestId) {
+                                                             boolean retry, String clientRequestId,
+                                                             Long replacesAssistantMessageId) {
         if (imageUrl == null || imageUrl.trim().isEmpty()) {
             throw new IllegalArgumentException("imageUrl 不能为空(多模态流式请求)");
         }
@@ -396,14 +405,15 @@ public class ChatServiceImpl implements ChatService {
         }
         return startMultimodalStreamMessage(
                 userId, conversationId, content, imageUrl, username, jwtToken,
-                gender, skinType, preferenceTags, retry, turnId
+                gender, skinType, preferenceTags, retry, turnId, replacesAssistantMessageId
         );
     }
 
     private SseEmitter startMultimodalStreamMessage(Long userId, Long conversationId, String content,
                                                       String imageUrl, String username, String jwtToken,
                                                       String gender, String skinType, java.util.List<String> preferenceTags,
-                                                      boolean retry, String turnId) {
+                                                      boolean retry, String turnId,
+                                                      Long replacesAssistantMessageId) {
         // MM-DIFF-4:content 可空,但 imageUrl 必须有 —— 控制器已经做了非空校验,这里防御性再判一次
         if (imageUrl == null || imageUrl.trim().isEmpty()) {
             throw new IllegalArgumentException("imageUrl 不能为空(多模态流式请求)");
@@ -460,8 +470,11 @@ public class ChatServiceImpl implements ChatService {
                     // 纯图搜索没有 content,用占位符生成标题;LLM 侧看到 [图片] 会尝试生成"图片搜索"类标题
                     aiService.generateTitle(conversationId, safeContent.isEmpty() ? "[图片]" : safeContent);
                 }
+                validateRegenerationTarget(conversationId, retry, replacesAssistantMessageId);
                 Message streamingAssistant = createStreamingAssistant(conversationId, turnId);
                 assistantMessageId.set(streamingAssistant.getId());
+                applyRegenerationReplacement(conversationId, retry, replacesAssistantMessageId,
+                        streamingAssistant.getId());
 
                 Map<String, Object> aiBody = new java.util.HashMap<>();
                 aiBody.put("question", safeContent);
@@ -806,6 +819,42 @@ public class ChatServiceImpl implements ChatService {
         assistant.setCreateTime(LocalDateTime.now());
         msgMapper.insert(assistant);
         return assistant;
+    }
+
+    /**
+     * Establishes replacement only after the new assistant row exists. The
+     * next AI request is built afterwards, so it cannot see the superseded
+     * answer in either raw history or the rolling summary.
+     */
+    private void applyRegenerationReplacement(Long conversationId, boolean retry,
+                                              Long replacedAssistantMessageId,
+                                              Long replacementAssistantMessageId) {
+        if (!retry || replacedAssistantMessageId == null || replacementAssistantMessageId == null) {
+            return;
+        }
+        if (replacedAssistantMessageId.equals(replacementAssistantMessageId)) {
+            throw new IllegalArgumentException("replacement assistant message must differ from original");
+        }
+        int updated = msgMapper.markAssistantSuperseded(
+                conversationId, replacedAssistantMessageId, replacementAssistantMessageId);
+        if (updated != 1) {
+            throw new IllegalArgumentException("original assistant message is unavailable for regeneration");
+        }
+        ctxService.resetRollingSummaryForRegeneration(conversationId);
+        log.info("regeneration replacement applied conv={} oldMessageId={} newMessageId={}",
+                conversationId, replacedAssistantMessageId, replacementAssistantMessageId);
+    }
+
+    private void validateRegenerationTarget(Long conversationId, boolean retry,
+                                            Long replacedAssistantMessageId) {
+        if (!retry || replacedAssistantMessageId == null) return;
+        Message original = msgMapper.selectById(replacedAssistantMessageId);
+        if (original == null
+                || !conversationId.equals(original.getConversationId())
+                || !"assistant".equals(original.getRole())
+                || original.getSupersededByMessageId() != null) {
+            throw new IllegalArgumentException("original assistant message is unavailable for regeneration");
+        }
     }
 
     private Message completeStreamingAssistant(Long assistantMessageId, String answer, String taskType,

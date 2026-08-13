@@ -10,6 +10,7 @@ public interface ConversationContextService {
     void invalidateConversationContext(Long conversationId);
     ConversationContext getRollingSummaryContext(Long conversationId);
     boolean updateRollingSummary(Long conversationId, String summary, Long coveredMessageId,
-                                 Long checkpointMessageId);
+                                 Long checkpointMessageId, Long expectedSummaryRevision);
+    void resetRollingSummaryForRegeneration(Long conversationId);
     void cleanupExpiredContexts(int days);
 }

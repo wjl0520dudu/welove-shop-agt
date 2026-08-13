@@ -52,7 +52,8 @@ public class ChatController {
                 req.getSkinType(),
                 req.getPreferenceTags(),
                 req.isRetry(),
-                req.getClientRequestId()
+                req.getClientRequestId(),
+                req.getReplacesAssistantMessageId()
         );
     }
 
@@ -79,7 +80,8 @@ public class ChatController {
                 req.getSkinType(),
                 req.getPreferenceTags(),
                 req.isRetry(),
-                req.getClientRequestId()
+                req.getClientRequestId(),
+                req.getReplacesAssistantMessageId()
         );
     }
 

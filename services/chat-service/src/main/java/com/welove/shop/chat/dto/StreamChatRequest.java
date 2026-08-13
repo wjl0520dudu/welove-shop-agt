@@ -21,6 +21,7 @@ public class StreamChatRequest implements Serializable {
     private List<String> preferenceTags;
     /** Stable UUID for one user submit. Network retries must reuse it. */
     private String clientRequestId;
+    private Long replacesAssistantMessageId;
     /** 是否为「重新生成」请求,后端据此跳过 dedup (避免 retry 触发相同的截断) */
     private boolean retry;
 }

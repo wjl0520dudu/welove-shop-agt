@@ -21,6 +21,8 @@ public class ConversationContext implements Serializable {
     private Long summaryCoveredMessageId;
     /** Last visible message that completed a configured summary batch. */
     private Long summaryCheckpointMessageId;
+    /** Guards asynchronous summary writes after regeneration invalidates an old answer. */
+    private Long summaryRevision;
     private String embedding;
     private String userPreferences;
     private String mentionedProducts;

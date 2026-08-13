@@ -437,7 +437,7 @@ export default {
 
       await this.runStream(conv.id, content, reactiveAssistant, true, false, hasImage ? imageUrl : '', assistant.clientRequestId)
     },
-    async runStream(conversationId, content, assistant, allowAuthRetry, retry = false, imageUrl = '', clientRequestId = '') {
+    async runStream(conversationId, content, assistant, allowAuthRetry, retry = false, imageUrl = '', clientRequestId = '', replacesAssistantMessageId = null) {
       this._streamingConvId = conversationId
       const turnId = clientRequestId || assistant.clientRequestId || this.createClientRequestId()
       assistant.clientRequestId = turnId
@@ -454,7 +454,7 @@ export default {
         return
       }
 
-      const payload = this.buildPayload(conversationId, content, retry, imageUrl, turnId)
+      const payload = this.buildPayload(conversationId, content, retry, imageUrl, turnId, replacesAssistantMessageId)
       let gotText = false
       let streamError = null
       const callbacks = {
@@ -592,7 +592,7 @@ export default {
         if ((err && (err.status === 401 || err.status === 403)) && allowAuthRetry && !gotText) {
           const refreshed = await refreshAccessToken().catch(() => false)
           if (refreshed) {
-            return this.runStream(conversationId, content, assistant, false, retry, imageUrl, turnId)
+            return this.runStream(conversationId, content, assistant, false, retry, imageUrl, turnId, replacesAssistantMessageId)
           }
           this.syncCurrentStreaming()
           toLogin('/pages/chat/chat')
@@ -700,11 +700,13 @@ export default {
       const localId = message && message._localId
       const target = (localId ? this.messages.find((m) => m._localId === localId) : null) || message
       const idx = this.messages.indexOf(target)
-      let userContent = ''
+      let originalUser = null
       for (let i = idx - 1; i >= 0; i--) {
-        if (this.messages[i].role === 'user') { userContent = this.messages[i].content; break }
+        if (this.messages[i].role === 'user') { originalUser = this.messages[i]; break }
       }
-      if (!userContent) {
+      const userContent = originalUser ? String(originalUser.content || '') : ''
+      const imageUrl = originalUser ? String(originalUser.imageUrl || '') : ''
+      if (!originalUser || (!userContent && !imageUrl)) {
         console.warn('[retry] no preceding user message found, abort retry', { localId, idx, msgCount: this.messages.length })
         uni.showToast({ title: '找不到原始问题,无法重发', icon: 'none' })
         return
@@ -715,7 +717,16 @@ export default {
         uni.showToast({ title: '会话已失效,请刷新页面', icon: 'none' })
         return
       }
-      console.log('[retry] start', { localId, conversationId, userContent: userContent.slice(0, 30) })
+      const replacesAssistantMessageId = target.id
+      if (!replacesAssistantMessageId) {
+        uni.showToast({ title: '原回答尚未保存，请稍后重试', icon: 'none' })
+        return
+      }
+      // The database stores a placeholder for image-only messages. The retry
+      // request must carry the original image, not send that placeholder as a
+      // text query.
+      const retryContent = imageUrl && userContent === '[图片]' ? '' : userContent
+      console.log('[retry] start', { localId, conversationId, userContent: retryContent.slice(0, 30), hasImage: !!imageUrl })
       target.errored = false
       target.stopped = false
       target.stoppedReason = ''
@@ -731,7 +742,7 @@ export default {
       this.scrollToBottom()
       try {
         target.clientRequestId = this.createClientRequestId()
-        await this.runStream(conversationId, userContent, target, true, true, '', target.clientRequestId)
+        await this.runStream(conversationId, retryContent, target, true, true, imageUrl, target.clientRequestId, replacesAssistantMessageId)
         console.log('[retry] runStream resolved')
       } catch (e) {
         console.error('[retry] runStream rejected', e)
@@ -854,7 +865,7 @@ export default {
         learnedQuestions: this.learnedRecommended
       })
     },
-    buildPayload(conversationId, content, retry = false, imageUrl = '', clientRequestId = '') {
+    buildPayload(conversationId, content, retry = false, imageUrl = '', clientRequestId = '', replacesAssistantMessageId = null) {
       const u = userStore.state.user || {}
       const payload = {
         userId: Number(u.id) || undefined,
@@ -868,6 +879,7 @@ export default {
         retry,
         clientRequestId
       }
+      if (replacesAssistantMessageId) payload.replacesAssistantMessageId = replacesAssistantMessageId
       // 有图时加 imageUrl,后端 MultimodalStreamChatRequest DTO 会解析。
       // 纯文本请求不带此字段,兼容旧 StreamChatRequest。
       if (imageUrl) payload.imageUrl = imageUrl

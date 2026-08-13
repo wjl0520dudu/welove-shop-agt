@@ -21,6 +21,8 @@ public class Message implements Serializable {
     private Long conversationId;
     /** Request-scoped turn identifier shared by the corresponding user and assistant messages. */
     private String turnId;
+    /** New assistant message that superseded this historical response. */
+    private Long supersededByMessageId;
     private String role;
     private String content;
     private String messageType;
