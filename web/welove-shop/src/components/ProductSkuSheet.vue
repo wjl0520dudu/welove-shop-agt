@@ -1,6 +1,6 @@
 <template>
   <view v-if="visible" class="mask" @tap="$emit('close')">
-    <view class="sheet" @tap.stop>
+    <view class="sheet" :class="{ 'above-tab-bar': aboveTabBar }" @tap.stop>
       <view class="handle"></view>
       <view class="head">
         <view>
@@ -41,7 +41,9 @@ export default {
   props: {
     visible: { type: Boolean, default: false },
     skus: { type: Array, default: () => [] },
-    defaultIndex: { type: Number, default: 0 }
+    defaultIndex: { type: Number, default: 0 },
+    // Tab 页面中的 H5 TabBar 会盖在 fixed 弹层之上，调用方显式声明后预留高度。
+    aboveTabBar: { type: Boolean, default: false }
   },
   emits: ['close', 'confirm'],
   data() {
@@ -114,6 +116,10 @@ export default {
   border-radius: 28rpx 28rpx 0 0;
   background: #ffffff;
   animation: sku-sheet-in 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.sheet.above-tab-bar {
+  /* 使用运行时实际 TabBar 高度，底边与导航栏顶边精准贴合。 */
+  margin-bottom: var(--window-bottom);
 }
 @keyframes sku-mask-in {
   from { opacity: 0; }

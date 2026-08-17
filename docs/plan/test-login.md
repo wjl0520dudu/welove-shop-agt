@@ -1,6 +1,6 @@
 # 测试登录接入文档
 
-> **状态**：独立体验账号登录已落地 ✅；自动清理任务仅文档占位 ⏳
+> **状态**：独立体验账号登录、Redis 配额与演示环境开关已落地 ✅；自动清理任务仅文档占位 ⏳
 > **目的**：给"想快速体验系统的人"一个一键登录通道，跳过手机号 + 验证码流程。
 > **设计原则**：安全可控、易清理、不污染真实用户数据。
 
@@ -87,19 +87,23 @@ Content-Type: application/json
 
 | 维度 | 默认值 | 说明 |
 |---|---|---|
-| 同 IP | 5 次 / 1 分钟 | 单 IP 不能狂点 |
-| 全局 | 100 次 / 1 分钟 | 多 IP 协同攻击也封顶 |
+| 单 IP | 3 次 / 10 分钟 | 防连续点击和简单脚本 |
+| 单 IP | 10 次 / 天 | 防低频持续创建账号 |
+| 全局 | 100 次 / 小时 | 防多 IP 协同异常写入 |
+| 全局 | 500 次 / 天 | 限制演示环境单日账号增长 |
 
 ### 3.2 实现
 
 [Redis 计数器](../../services/user-service/src/main/java/com/welove/shop/user/controller/TestLoginController.java)：
 
 ```
-test-login:ip:{ip}        → INCR + EXPIRE 60s
-test-login:global         → INCR + EXPIRE 60s
+test-login:ip:10m:{ip}    → INCR + EXPIRE 10m
+test-login:ip:day:{ip}    → INCR + EXPIRE 1d
+test-login:global:hour    → INCR + EXPIRE 1h
+test-login:global:day     → INCR + EXPIRE 1d
 ```
 
-超出 → `code: 20201 TEST_LOGIN_RATE_LIMIT`。
+超出 → HTTP `429 Too Many Requests`，响应 `code: 20201 TEST_LOGIN_RATE_LIMIT`。
 
 ### 3.3 可配置
 
@@ -108,19 +112,22 @@ test-login:global         → INCR + EXPIRE 60s
 ```yaml
 user-service:
   test-login:
-    ip-rate-per-minute: 5       # 默认 5/min/IP
-    global-rate-per-minute: 100 # 默认 100/min 全局
+    enabled: true
+    ip-rate-per-10-minutes: 3
+    ip-rate-per-day: 10
+    global-rate-per-hour: 100
+    global-rate-per-day: 500
 ```
 
 ### 3.4 客户端 IP 解析
 
 ```
-X-Forwarded-For → 取第一段（防 XFF 伪造需要配合网关层做信任源限制）
+X-Forwarded-For → 取第一段（由公网 Nginx 覆盖写入）
 X-Real-IP       → 取值
 remoteAddr      → fallback
 ```
 
-⚠️ **生产环境必须配合网关层限制**：只信任自家网关 / 反代设的 XFF，否则攻击者可伪造 XFF 绕过单 IP 频控。
+⚠️ **生产环境必须保持 Nginx 覆盖客户端自带的 XFF**：外部请求不能自行决定该字段，否则攻击者可以伪造 IP 绕过单 IP 配额。
 
 ---
 

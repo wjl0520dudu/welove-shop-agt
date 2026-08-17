@@ -151,7 +151,7 @@ export default {
       try {
         if (Object.keys(payload).length) {
           const user = await updateProfile(payload)
-          userStore.state.user = user
+          userStore.setUser(user)
         }
         uni.showToast({ title: '已保存', icon: 'success' })
         setTimeout(() => this.goNext(), 500)

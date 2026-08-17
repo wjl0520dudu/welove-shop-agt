@@ -7,6 +7,22 @@
  */
 export const API_BASE_URL = ''
 
+const RUNTIME_CONFIG = typeof window !== 'undefined' ? (window.__WLS_RUNTIME_CONFIG__ || {}) : {}
+
+function readEnabled(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback
+  return ['true', '1', 'yes', 'on'].includes(String(value).trim().toLowerCase())
+}
+
+/** 演示环境默认只开放体验登录，真实短信接入后可由 runtime-config.js 覆盖。 */
+export const SMS_LOGIN_ENABLED = readEnabled(
+  RUNTIME_CONFIG.SMS_LOGIN_ENABLED,
+  readEnabled(
+    typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_SMS_LOGIN_ENABLED,
+    false
+  )
+)
+
 /**
  * 商品图片主机(单一可配置项,前端所有图片 URL 拼接的唯一出处)
  *
@@ -26,7 +42,7 @@ export const API_BASE_URL = ''
  * 这些历史数据走本变量拼接;后续所有新图片应直接由后端返回完整 URL,本变量逐步废弃。
  */
 export const IMAGE_BASE_URL =
-  window.__WLS_RUNTIME_CONFIG__?.IMAGE_BASE_URL ||
+  RUNTIME_CONFIG.IMAGE_BASE_URL ||
   // 1. uni-app 编译期注入的环境变量(推荐 — 不同构建产物走不同配置)
   (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_IMAGE_BASE_URL) ||
   // 2. 兜底默认值:开发期指向 OSS 图片主机

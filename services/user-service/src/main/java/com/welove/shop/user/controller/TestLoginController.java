@@ -1,7 +1,8 @@
 package com.welove.shop.user.controller;
 
-import com.welove.shop.common.core.exception.BizException;
 import com.welove.shop.common.core.result.Result;
+import com.welove.shop.user.exception.FeatureDisabledException;
+import com.welove.shop.user.exception.RequestRateLimitException;
 import com.welove.shop.user.exception.UserErrorCode;
 import com.welove.shop.user.service.TestLoginService;
 import jakarta.servlet.http.HttpServletRequest;
@@ -24,7 +25,7 @@ import java.util.Map;
  * 安全设计:
  * <ul>
  *   <li>仅暴露在公开白名单 {@code /auth/test-login},无需登录</li>
- *   <li>Redis 频控:同 IP 1 分钟最多 5 次,全局 1 分钟最多 100 次</li>
+ *   <li>Redis 配额:按 IP 和全局的短周期、长周期额度共同限制</li>
  *   <li>每次创建独立的 is_test 体验账号，避免不同体验者共享用户数据</li>
  *   <li>响应结构和正常 /auth/login 一致,前端无感</li>
  * </ul>
@@ -40,16 +41,27 @@ public class TestLoginController {
     private final TestLoginService testLoginService;
     private final StringRedisTemplate redisTemplate;
 
-    /** 单 IP 1 分钟内最大测试登录次数。 */
-    @Value("${user-service.test-login.ip-rate-per-minute:5}")
-    private int ipRatePerMinute;
+    @Value("${user-service.test-login.enabled:true}")
+    private boolean testLoginEnabled;
 
-    /** 全局 1 分钟内最大测试登录次数(防止多 IP 协同滥用)。 */
-    @Value("${user-service.test-login.global-rate-per-minute:100}")
-    private int globalRatePerMinute;
+    @Value("${user-service.test-login.ip-rate-per-10-minutes:3}")
+    private int ipRatePerTenMinutes;
+
+    @Value("${user-service.test-login.ip-rate-per-day:10}")
+    private int ipRatePerDay;
+
+    @Value("${user-service.test-login.global-rate-per-hour:100}")
+    private int globalRatePerHour;
+
+    @Value("${user-service.test-login.global-rate-per-day:500}")
+    private int globalRatePerDay;
 
     @PostMapping("/test-login")
     public Result<Map<String, Object>> testLogin(HttpServletRequest request) {
+        if (!testLoginEnabled) {
+            throw new FeatureDisabledException(UserErrorCode.TEST_LOGIN_DISABLED, "体验登录暂未开放");
+        }
+
         // 1. 频控检查
         String ip = resolveClientIp(request);
         checkRateLimit(ip);
@@ -62,33 +74,26 @@ public class TestLoginController {
 
     // ---------- 私有 ----------
 
-    /**
-     * 频控:同 IP 1 分钟 N 次,全局 1 分钟 M 次。
-     * 超出 → 429 等价的 BizException。
-     */
+    /** 按 IP 和全局的短周期、长周期额度共同保护账号创建写入。 */
     private void checkRateLimit(String ip) {
-        String ipKey = "test-login:ip:" + ip;
-        String globalKey = "test-login:global";
-        Duration window = Duration.ofMinutes(1);
+        checkQuota("test-login:ip:10m:" + ip, Duration.ofMinutes(10), ipRatePerTenMinutes, "IP/10m", ip);
+        checkQuota("test-login:ip:day:" + ip, Duration.ofDays(1), ipRatePerDay, "IP/day", ip);
+        checkQuota("test-login:global:hour", Duration.ofHours(1), globalRatePerHour, "global/hour", ip);
+        checkQuota("test-login:global:day", Duration.ofDays(1), globalRatePerDay, "global/day", ip);
+    }
 
-        Long ipCount = redisTemplate.opsForValue().increment(ipKey);
-        if (ipCount != null && ipCount == 1L) {
-            redisTemplate.expire(ipKey, window);
+    private void checkQuota(String key, Duration window, int limit, String dimension, String ip) {
+        if (limit <= 0) {
+            throw new FeatureDisabledException(UserErrorCode.TEST_LOGIN_DISABLED, "体验登录暂未开放");
         }
-        if (ipCount != null && ipCount > ipRatePerMinute) {
-            log.warn("[test-login] 频控触发 IP={}, count={}/min", ip, ipCount);
-            throw new BizException(UserErrorCode.TEST_LOGIN_RATE_LIMIT,
-                    "测试登录太频繁,请稍后再试(同 IP 1 分钟最多 " + ipRatePerMinute + " 次)");
+        Long count = redisTemplate.opsForValue().increment(key);
+        if (count != null && count == 1L) {
+            redisTemplate.expire(key, window);
         }
-
-        Long globalCount = redisTemplate.opsForValue().increment(globalKey);
-        if (globalCount != null && globalCount == 1L) {
-            redisTemplate.expire(globalKey, window);
-        }
-        if (globalCount != null && globalCount > globalRatePerMinute) {
-            log.warn("[test-login] 全局频控触发, count={}/min", globalCount);
-            throw new BizException(UserErrorCode.TEST_LOGIN_RATE_LIMIT,
-                    "测试登录服务繁忙,请稍后再试");
+        if (count != null && count > limit) {
+            log.warn("[test-login] 配额触发 dimension={}, ip={}, count={}, limit={}", dimension, ip, count, limit);
+            throw new RequestRateLimitException(UserErrorCode.TEST_LOGIN_RATE_LIMIT,
+                    "访问过于频繁，请稍后再试");
         }
     }
 

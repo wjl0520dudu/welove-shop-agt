@@ -16,9 +16,13 @@ function readToken(data = {}) {
 function applyAuth(data = {}) {
   state.token = readToken(data)
   state.refreshToken = data.refreshToken || ''
-  state.user = data.user || null
   setToken(state.token)
   setRefreshToken(state.refreshToken)
+  setCurrentUser(data.user || null)
+}
+
+function setCurrentUser(user) {
+  state.user = user || null
   setStoredUser(state.user)
 }
 
@@ -34,7 +38,9 @@ export default {
   },
   async login(payload) {
     const data = await loginApi(payload)
+    cartStore.beginSession()
     applyAuth(data)
+    cartStore.refreshAndSyncBadge().catch(() => {})
     return data
   },
   /**
@@ -42,14 +48,25 @@ export default {
    * 与 login() 区别:不调用 loginApi,不走短信验证码。
    */
   async handleTestLogin(data) {
+    cartStore.beginSession()
     applyAuth(data)
+    cartStore.refreshAndSyncBadge().catch(() => {})
     return data
   },
   async loadProfile() {
     const user = await getProfile()
-    state.user = user
-    setStoredUser(user)
+    setCurrentUser(user)
     return user
+  },
+  setUser(user) {
+    setCurrentUser(user)
+    return state.user
+  },
+  needsProfileSetup(user = state.user) {
+    const profile = user || {}
+    const noGender = profile.gender === null || profile.gender === undefined || profile.gender === 0
+    const noTags = !Array.isArray(profile.preferenceTags) || profile.preferenceTags.length === 0
+    return noGender && noTags
   },
   logout() {
     state.token = ''

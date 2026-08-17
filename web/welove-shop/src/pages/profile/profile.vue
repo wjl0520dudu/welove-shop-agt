@@ -46,6 +46,7 @@
 
 <script>
 import userStore from '../../store/user'
+import cartStore from '../../store/cart'
 import { getOrderList } from '../../api/order'
 import { getFavoriteList, getBrowseHistory } from '../../api/recommend'
 import { requireLogin } from '../../utils/routeGuard'
@@ -77,6 +78,8 @@ export default {
   },
   onShow() {
     this.refreshLocalUser()
+    // Tab 页面重新显示后再同步一次，确保退出登录时旧会话的购物车徽标已移除。
+    cartStore.flushBadge()
     if (this.loggedIn) {
       this.validateAndLoad()
     } else {

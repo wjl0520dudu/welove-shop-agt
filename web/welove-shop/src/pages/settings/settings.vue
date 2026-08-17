@@ -33,6 +33,7 @@
 
 <script>
 import userStore from '../../store/user'
+import cartStore from '../../store/cart'
 import { requireLogin, toLogin } from '../../utils/routeGuard'
 
 export default {
@@ -63,7 +64,13 @@ export default {
           if (!res.confirm) return
           userStore.logout()
           this.loggedIn = false
-          uni.switchTab({ url: '/pages/profile/profile' })
+          uni.switchTab({
+            url: '/pages/profile/profile',
+            complete: () => {
+              // 切回 TabBar 后再执行一次，覆盖部分 H5 运行时的延迟挂载。
+              cartStore.flushBadge()
+            }
+          })
         }
       })
     }

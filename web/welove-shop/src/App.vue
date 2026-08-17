@@ -1,11 +1,21 @@
 ﻿<script>
 import userStore from './store/user'
+import cartStore from './store/cart'
 
 export default {
   onLaunch() {
     userStore.restore()
+    if (userStore.isLoggedIn()) {
+      cartStore.beginSession()
+      cartStore.refreshAndSyncBadge().catch(() => {})
+    } else {
+      cartStore.reset()
+    }
   },
-  onShow() {},
+  onShow() {
+    // 首次写入发生在 TabBar 未就绪时，恢复到前台时再同步一次。
+    cartStore.flushBadge()
+  },
   onHide() {}
 }
 </script>

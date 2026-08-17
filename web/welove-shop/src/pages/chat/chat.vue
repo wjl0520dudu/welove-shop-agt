@@ -125,6 +125,7 @@
     <ProductSkuSheet
       :visible="showSkuSheet"
       :skus="skuList"
+      :above-tab-bar="true"
       @close="showSkuSheet = false"
       @confirm="onSkuConfirm"
     />
@@ -220,6 +221,7 @@ export default {
   },
   onShow() {
     if (!requireLoginFromProtectedTab('/pages/chat/chat')) return
+    cartStore.flushBadge()
     userStore.restore()
     this.buildRecommended()
     // 快照会话内存缓存到响应式副本

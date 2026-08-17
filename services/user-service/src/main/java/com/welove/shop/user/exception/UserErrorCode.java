@@ -27,4 +27,8 @@ public final class UserErrorCode {
 
     // ---------- 测试登录 ----------
     public static final int TEST_LOGIN_RATE_LIMIT = 20201;
+    public static final int TEST_LOGIN_DISABLED = 20202;
+
+    // ---------- 演示环境功能开关 ----------
+    public static final int SMS_LOGIN_DISABLED = 20301;
 }

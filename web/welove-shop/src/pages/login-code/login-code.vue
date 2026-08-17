@@ -18,6 +18,7 @@
           v-model="code"
           type="number"
           maxlength="6"
+          :disabled="!smsLoginEnabled"
           :focus="inputFocused"
           @input="onCodeInput"
           @paste="onCodePaste"
@@ -27,14 +28,14 @@
       <button
         class="login-button"
         :loading="loading"
-        :disabled="loading || code.length !== 6"
-        :class="{ disabled: loading || code.length !== 6 }"
+        :disabled="!smsLoginEnabled || loading || code.length !== 6"
+        :class="{ disabled: !smsLoginEnabled || loading || code.length !== 6 }"
         @tap="verifyCode"
       >登录</button>
 
       <view class="resend-row">
         <text v-if="seconds > 0">{{ seconds }} 秒后可重新发送</text>
-        <text v-else class="resend" @tap="resendCode">重新发送验证码</text>
+        <text v-else class="resend" :class="{ disabled: !smsLoginEnabled }" @tap="resendCode">重新发送验证码</text>
       </view>
     </view>
   </view>
@@ -42,11 +43,12 @@
 
 <script>
 import { sendCode } from '../../api/auth'
+import { SMS_LOGIN_ENABLED } from '../../config/env'
 import userStore from '../../store/user'
 
 export default {
   data() {
-    return { phone: '', code: '', seconds: 60, timer: null, loading: false, resending: false, inputFocused: true, redirect: '' }
+    return { phone: '', code: '', seconds: 60, timer: null, loading: false, resending: false, inputFocused: true, redirect: '', smsLoginEnabled: SMS_LOGIN_ENABLED }
   },
   computed: {
     maskedPhone() {
@@ -57,6 +59,11 @@ export default {
   onLoad(query) {
     this.phone = decodeURIComponent(query.phone || '')
     this.redirect = decodeURIComponent(query.redirect || '')
+    if (!this.smsLoginEnabled) {
+      uni.showToast({ title: '短信登录暂未开放，请使用体验登录', icon: 'none' })
+      setTimeout(() => uni.redirectTo({ url: `/pages/login/login?redirect=${encodeURIComponent(this.redirect)}` }), 0)
+      return
+    }
     this.startTimer()
   },
   onUnload() {
@@ -95,6 +102,7 @@ export default {
       }, 1000)
     },
     async resendCode() {
+      if (!this.smsLoginEnabled) return
       if (this.resending || this.seconds > 0) return
       this.resending = true
       try {
@@ -130,6 +138,7 @@ export default {
       return noGender && noTags
     },
     async verifyCode() {
+      if (!this.smsLoginEnabled) return
       if (this.loading || this.code.length !== 6) return
       this.loading = true
       try {
@@ -159,4 +168,5 @@ export default {
 .login-button.disabled { opacity: 0.45; box-shadow: none; }
 .resend-row { margin-top: 28rpx; text-align: center; color: #667085; font-size: 26rpx; }
 .resend { color: #f97316; font-weight: 800; }
+.resend.disabled { color: #98a2b3; }
 </style>
