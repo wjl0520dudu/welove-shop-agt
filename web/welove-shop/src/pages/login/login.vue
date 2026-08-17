@@ -19,11 +19,19 @@
           class="field-input"
           type="number"
           maxlength="11"
-          placeholder="请输入手机号"
+          :disabled="!smsLoginEnabled"
+          :placeholder="smsLoginEnabled ? '请输入手机号' : '短信登录暂未开放'"
         />
       </view>
 
-      <button class="login-button" :loading="loading" :disabled="loading" @tap="handleGetCode">获取短信验证码</button>
+      <button
+        class="login-button"
+        :class="{ disabled: !smsLoginEnabled }"
+        :loading="loading"
+        :disabled="!smsLoginEnabled || loading"
+        @tap="handleGetCode"
+      >获取短信验证码</button>
+      <text v-if="!smsLoginEnabled" class="sms-disabled-tip">短信登录暂未开放，请使用体验登录</text>
 
       <view class="divider-row">
         <view class="line"></view>
@@ -45,11 +53,12 @@
 
 <script>
 import { sendCode, testLogin } from '../../api/auth'
+import { SMS_LOGIN_ENABLED } from '../../config/env'
 import userStore from '../../store/user'
 
 export default {
   data() {
-    return { loading: false, phone: '', redirect: '', testLoading: false }
+    return { loading: false, phone: '', redirect: '', testLoading: false, smsLoginEnabled: SMS_LOGIN_ENABLED }
   },
   onLoad(query) {
     this.redirect = decodeURIComponent(query.redirect || '')
@@ -59,6 +68,7 @@ export default {
       return /^1\d{10}$/.test(phone)
     },
     async handleGetCode() {
+      if (!this.smsLoginEnabled) return
       if (this.loading) return
       if (!this.isValidPhone(this.phone)) {
         uni.showToast({ title: '请输入正确的手机号', icon: 'none' })
@@ -87,18 +97,24 @@ export default {
         // data 结构:{ token, refreshToken, user, tokenType } — 同 /auth/login
         await userStore.handleTestLogin(data)
         uni.showToast({ title: '登录成功', icon: 'success' })
-        // 跳转到 redirect 或首页
-        const target = this.redirect || '/pages/product-list/product-list'
-        const tabPages = ['/pages/chat/chat', '/pages/product-list/product-list', '/pages/cart/cart', '/pages/profile/profile']
-        if (tabPages.includes(target.split('?')[0])) {
-          uni.switchTab({ url: target })
-        } else {
-          uni.redirectTo({ url: target })
-        }
+        this.goAfterLogin()
       } catch (error) {
         // request 工具已经弹过 toast 了
       } finally {
         this.testLoading = false
+      }
+    },
+    goAfterLogin() {
+      const target = this.redirect || '/pages/product-list/product-list'
+      if (userStore.needsProfileSetup()) {
+        uni.redirectTo({ url: `/pages/profile-setup/profile-setup?redirect=${encodeURIComponent(target)}` })
+        return
+      }
+      const tabPages = ['/pages/chat/chat', '/pages/product-list/product-list', '/pages/cart/cart', '/pages/profile/profile']
+      if (tabPages.includes(target.split('?')[0])) {
+        uni.switchTab({ url: target })
+      } else {
+        uni.redirectTo({ url: target })
       }
     }
   }
@@ -125,6 +141,8 @@ export default {
 .field { display: flex; align-items: center; gap: 14rpx; height: 96rpx; margin-bottom: 26rpx; padding: 0 24rpx; border: 1rpx solid #dbe5e3; border-radius: 20rpx; background: #f8fbfb; }
 .field-input { flex: 1; height: 96rpx; font-size: 32rpx; font-weight: 700; color: #1f2937; }
 .login-button { height: 94rpx; border-radius: 999rpx; background: linear-gradient(135deg, #14b8a6, #0f766e); color: #ffffff; font-size: 31rpx; font-weight: 900; line-height: 94rpx; box-shadow: 0 16rpx 34rpx rgba(20, 184, 166, 0.24); }
+.login-button.disabled { opacity: 0.45; box-shadow: none; }
+.sms-disabled-tip { display: block; margin-top: 14rpx; color: #98a2b3; font-size: 23rpx; text-align: center; }
 .divider-row { display: flex; align-items: center; gap: 18rpx; margin: 28rpx 0 22rpx; }
 .divider-row .line { flex: 1; height: 1rpx; background: #dbe5e3; }
 .divider-row .or { color: #98a2b3; font-size: 24rpx; }

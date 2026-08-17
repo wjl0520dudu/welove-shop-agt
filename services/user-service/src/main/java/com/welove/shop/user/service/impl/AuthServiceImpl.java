@@ -6,6 +6,7 @@ import com.welove.shop.common.core.exception.ErrorCode;
 import com.welove.shop.common.security.jwt.JwtUtil;
 import com.welove.shop.user.dto.UpdateUserRequest;
 import com.welove.shop.user.entity.User;
+import com.welove.shop.user.exception.FeatureDisabledException;
 import com.welove.shop.user.exception.UserErrorCode;
 import com.welove.shop.user.mapper.UserMapper;
 import com.welove.shop.user.service.AuthService;
@@ -48,10 +49,15 @@ public class AuthServiceImpl implements AuthService {
     @Value("${user-service.sms.code-ttl-seconds:300}")
     private long codeTtlSeconds;
 
+    /** 演示环境关闭手机号登录，避免 mock 短信接口成为额外公开注册入口。 */
+    @Value("${user-service.sms-login.enabled:false}")
+    private boolean smsLoginEnabled;
+
     // ---------- 短信验证码 ----------
 
     @Override
     public void sendSmsCode(String phone) {
+        ensureSmsLoginEnabled();
         if (!isValidPhone(phone)) {
             throw new BizException(UserErrorCode.INVALID_PHONE_FORMAT, "手机号格式错误");
         }
@@ -69,6 +75,7 @@ public class AuthServiceImpl implements AuthService {
 
     @Override
     public Map<String, Object> login(String phone, String code) {
+        ensureSmsLoginEnabled();
         if (!isValidPhone(phone)) {
             throw new BizException(UserErrorCode.INVALID_PHONE_FORMAT, "手机号格式错误");
         }
@@ -199,5 +206,12 @@ public class AuthServiceImpl implements AuthService {
 
     private boolean isValidPhone(String phone) {
         return phone != null && PHONE_PATTERN.matcher(phone).matches();
+    }
+
+    private void ensureSmsLoginEnabled() {
+        if (!smsLoginEnabled) {
+            throw new FeatureDisabledException(UserErrorCode.SMS_LOGIN_DISABLED,
+                    "短信登录暂未开放，请使用体验登录");
+        }
     }
 }

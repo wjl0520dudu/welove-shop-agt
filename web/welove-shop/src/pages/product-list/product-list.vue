@@ -95,6 +95,7 @@ import { getCategories } from '../../api/category'
 import { addFavorite, removeFavorite, getFavoriteList } from '../../api/recommend'
 import { isLoggedIn } from '../../utils/auth'
 import { toLogin } from '../../utils/routeGuard'
+import cartStore from '../../store/cart'
 
 export default {
   components: { ProductCard, EmptyState },
@@ -148,6 +149,7 @@ export default {
     this.initPage()
   },
   onShow() {
+    cartStore.flushBadge()
     if (isLoggedIn()) this.loadFavoriteList()
   },
   onPullDownRefresh() {

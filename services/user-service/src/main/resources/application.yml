@@ -99,6 +99,16 @@ user-service:
   sms:
     mock: true                                   # true=控制台打印验证码,不真发短信
     code-ttl-seconds: 300                        # 5 分钟
+  # 演示环境默认关闭短信入口；真实短信接入后通过环境变量启用。
+  sms-login:
+    enabled: ${SMS_LOGIN_ENABLED:false}
+  # 每次体验登录都会创建独立账号，须使用 Redis 配额限制写入量。
+  test-login:
+    enabled: ${TEST_LOGIN_ENABLED:true}
+    ip-rate-per-10-minutes: ${TEST_LOGIN_IP_RATE_PER_10_MINUTES:3}
+    ip-rate-per-day: ${TEST_LOGIN_IP_RATE_PER_DAY:10}
+    global-rate-per-hour: ${TEST_LOGIN_GLOBAL_RATE_PER_HOUR:100}
+    global-rate-per-day: ${TEST_LOGIN_GLOBAL_RATE_PER_DAY:500}
 
 # ---------- 管理端点 ----------
 management:

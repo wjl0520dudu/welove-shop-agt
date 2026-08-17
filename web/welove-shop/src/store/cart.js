@@ -9,6 +9,11 @@ const state = reactive({
   items: []
 })
 
+// 切换登录用户或退出时递增，旧请求返回后不能把旧用户购物车写回。
+let sessionVersion = 0
+// 购物车内容发生改变后，之前已经发出的列表/数量请求不能再覆盖新状态。
+let cartRevision = 0
+
 function normalizeCount(value) {
   const n = Number(value)
   return Number.isFinite(n) && n > 0 ? n : 0
@@ -17,7 +22,12 @@ function normalizeCount(value) {
 export default {
   state,
   async refreshCount() {
-    state.count = normalizeCount(await getCartCount())
+    const version = sessionVersion
+    const revision = cartRevision
+    const count = normalizeCount(await getCartCount())
+    if (version !== sessionVersion || revision !== cartRevision) return state.count
+    state.count = count
+    this.syncBadge(state.count)
     return state.count
   },
   async refreshAndSyncBadge() {
@@ -25,14 +35,19 @@ export default {
     return state.count
   },
   async loadCart() {
+    const version = sessionVersion
+    const revision = cartRevision
     const data = await getCartList()
-    state.items = Array.isArray(data) ? data : (data?.records || data?.items || data?.list || [])
-    state.count = state.items.reduce((sum, item) => sum + Number(item.quantity || 0), 0)
+    const items = Array.isArray(data) ? data : (data?.records || data?.items || data?.list || [])
+    if (version !== sessionVersion || revision !== cartRevision) return state.items
+    state.items = items
+    state.count = items.reduce((sum, item) => sum + Number(item.quantity || 0), 0)
     this.syncBadge(state.count)
     return state.items
   },
   /** 乐观更新：取数接口失败时也能让角标先动起来，返回更新后的值 */
   bump(delta = 1) {
+    cartRevision += 1
     state.count = Math.max(0, Number(state.count || 0) + delta)
     this.syncBadge(state.count)
     return state.count
@@ -41,24 +56,44 @@ export default {
     const c = normalizeCount(count)
     state.count = c
     if (typeof uni === 'undefined') return c
-    try {
-      if (c > 0) {
-        uni.setTabBarBadge({ index: TAB_BAR_CART_INDEX, text: String(c > 99 ? '99+' : c) })
-      } else {
-        uni.removeTabBarBadge({ index: TAB_BAR_CART_INDEX })
+    const apply = () => new Promise((resolve, reject) => {
+      const options = {
+        index: TAB_BAR_CART_INDEX,
+        success: resolve,
+        fail: reject
       }
-    } catch (e) {
-      // 部分运行端在 tabBar 尚未就绪时会抛错，状态仍先保持最新。
+      if (c > 0) {
+        uni.setTabBarBadge({ ...options, text: String(c > 99 ? '99+' : c) })
+      } else {
+        uni.removeTabBarBadge(options)
+      }
+    })
+    const retry = (attempt = 0) => {
+      try {
+        Promise.resolve(apply())
+          .catch(() => {
+            if (attempt < 2 && c === state.count) setTimeout(() => retry(attempt + 1), 120)
+          })
+      } catch (error) {
+        if (attempt < 2 && c === state.count) setTimeout(() => retry(attempt + 1), 120)
+      }
     }
+    retry()
     return c
   },
-  reset() {
+  flushBadge() {
+    // 即使没有待刷标记也同步一次，避免 H5 TabBar 重建后遗失徽标。
+    return this.syncBadge(state.count)
+  },
+  beginSession() {
+    sessionVersion += 1
+    cartRevision += 1
     state.count = 0
     state.items = []
-    try {
-      uni.removeTabBarBadge({ index: TAB_BAR_CART_INDEX })
-    } catch (e) {
-      // ignore
-    }
+    this.syncBadge(0)
+    return sessionVersion
+  },
+  reset() {
+    return this.beginSession()
   }
 }

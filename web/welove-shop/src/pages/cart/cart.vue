@@ -151,6 +151,7 @@ export default {
     }
   },
   onShow() {
+    cartStore.flushBadge()
     if (!requireLoginFromProtectedTab('/pages/cart/cart')) return
     this.loadCartItems()
   },
